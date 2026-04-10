@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      4.3
+// @version      4.4
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -64,7 +64,38 @@
         if (!hasSelection) return;
         e.preventDefault();
         e.stopImmediatePropagation();
-        triggerContextMenu('添加术语表', 'TB 추가');
+
+        // 드래그한 원문과 같은 행의 번역문을 미리 가져옴
+        const selection = window.getSelection();
+        const originEl = selection.anchorNode.parentElement?.closest('.origin_string')
+          || selection.anchorNode.parentElement;
+        let translationText = '';
+
+        if (originEl) {
+          // 같은 세그먼트 행에서 번역 textarea 찾기
+          const row = originEl.closest('[data-v-9a359d1f]')
+            || originEl.parentElement;
+          if (row) {
+            const textarea = row.querySelector('textarea.n-input__textarea-el');
+            if (textarea && textarea.value.trim()) {
+              translationText = textarea.value.trim();
+            }
+          }
+
+          // row 기반으로 못 찾으면 인덱스 기반 탐색
+          if (!translationText) {
+            const allOrigins = document.querySelectorAll('.origin_string');
+            const allTextareas = document.querySelectorAll('textarea.n-input__textarea-el');
+            const idx = Array.from(allOrigins).indexOf(
+              originEl.classList.contains('origin_string') ? originEl : originEl.closest('.origin_string')
+            );
+            if (idx >= 0 && idx < allTextareas.length && allTextareas[idx].value.trim()) {
+              translationText = allTextareas[idx].value.trim();
+            }
+          }
+        }
+
+        triggerContextMenu('添加术语表', 'TB 추가', translationText);
         return;
       }
 
@@ -119,8 +150,11 @@
 
   /**
    * 우클릭 메뉴를 열고 특정 항목 클릭
+   * @param {string} menuText - 클릭할 메뉴 텍스트
+   * @param {string} label - 로그용 라벨
+   * @param {string} [autoFillTranslation] - TB 팝업에 자동 입력할 번역문
    */
-  function triggerContextMenu(menuText, label) {
+  function triggerContextMenu(menuText, label, autoFillTranslation) {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed) {
       console.log(`[CAT 단축키] ${label}: 선택된 텍스트가 없습니다.`);
@@ -153,10 +187,53 @@
       if (btn) {
         btn.click();
         console.log(`[CAT 단축키] ${menuText} 클릭 완료`);
+
+        // TB 추가 팝업인 경우 자동 입력
+        if (menuText === '添加术语表') {
+          fillTbPopup(autoFillTranslation);
+        }
       } else {
         console.log(`[CAT 단축키] ${menuText} 버튼을 찾지 못했습니다.`);
       }
     });
+  }
+
+  /**
+   * TB 추가 팝업에 术语备注(용어)와 Korean(번역문) 자동 입력
+   */
+  function fillTbPopup(translationText) {
+    // 팝업이 렌더링될 때까지 대기
+    const checkPopup = (attempts = 0) => {
+      const inputs = document.querySelectorAll('.n-modal-container input.n-input__input-el, .n-modal input.n-input__input-el');
+
+      if (inputs.length < 3 && attempts < 20) {
+        setTimeout(() => checkPopup(attempts + 1), 100);
+        return;
+      }
+
+      if (inputs.length < 3) {
+        console.log('[CAT 단축키] TB 팝업 입력 필드를 찾지 못했습니다.');
+        return;
+      }
+
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, 'value'
+      ).set;
+
+      // 1번째: 术语备注 → '용어' 고정 입력
+      nativeSetter.call(inputs[0], '용어');
+      inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+      console.log('[CAT 단축키] 术语备注 → "용어" 입력 완료');
+
+      // 3번째: Korean → 번역문 자동 입력
+      if (translationText) {
+        nativeSetter.call(inputs[2], translationText);
+        inputs[2].dispatchEvent(new Event('input', { bubbles: true }));
+        console.log(`[CAT 단축키] Korean → "${translationText}" 입력 완료`);
+      }
+    };
+
+    setTimeout(() => checkPopup(), 300);
   }
 
   /**
