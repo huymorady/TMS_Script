@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      4.4
+// @version      4.5
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -351,6 +351,19 @@
   }
 
   /**
+   * 문자열 내에서 특정 부분 문자열의 등장 횟수를 세기
+   */
+  function countOccurrences(str, substr) {
+    let count = 0;
+    let pos = 0;
+    while ((pos = str.indexOf(substr, pos)) !== -1) {
+      count++;
+      pos += substr.length;
+    }
+    return count;
+  }
+
+  /**
    * 원문 텍스트에서 태그를 정규식으로 추출
    */
   function extractTags(text) {
@@ -421,6 +434,30 @@
     if (tagIndex >= tagQueue.length) {
       console.log('[CAT 단축키] 모든 태그를 삽입했습니다. 처음부터 다시 시작합니다.');
       tagIndex = 0;
+    }
+
+    // 번역문에 이미 존재하는 태그는 건너뛰기
+    const currentValue = active.value;
+    let skipped = 0;
+    while (tagIndex < tagQueue.length && skipped < tagQueue.length) {
+      const candidate = tagQueue[tagIndex];
+      // 번역문에서 해당 태그가 이미 몇 개 있는지 vs 원문에서 몇 개 있어야 하는지 비교
+      const countInTranslation = countOccurrences(currentValue, candidate);
+      const countInSource = countOccurrences(tagQueue.slice(0, tagIndex + 1).join('||'), candidate);
+      // 원문에서의 N번째까지 이미 번역문에 존재하면 건너뛰기
+      if (countInTranslation >= countInSource) {
+        console.log(`[CAT 단축키] "${candidate}" 이미 존재 → 건너뛰기`);
+        tagIndex++;
+        skipped++;
+        if (tagIndex >= tagQueue.length) tagIndex = 0;
+      } else {
+        break;
+      }
+    }
+
+    if (skipped >= tagQueue.length) {
+      console.log('[CAT 단축키] 모든 태그가 이미 번역문에 존재합니다.');
+      return;
     }
 
     // 태그 삽입
