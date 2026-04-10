@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      4.7
+// @version      4.8
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -26,7 +26,7 @@
   let tagIndex = 0;        // 현재 삽입할 태그 인덱스
   let tagSourceEl = null;  // 태그를 추출한 원문 요소 (세그먼트 변경 감지용)
 
-  // ─── Ctrl+Enter 저장 시 IME 조합 확정 ───
+  // ─── Ctrl+Enter 저장 시 IME 조합 확정 + 줄 끝 공백 제거 ───
   let imeFixInProgress = false;
 
   document.addEventListener(
@@ -35,13 +35,24 @@
       if (e.ctrlKey && e.key === 'Enter' && !imeFixInProgress) {
         const active = document.activeElement;
         if (active && active.tagName === 'TEXTAREA') {
-          // IME 조합 중인지 확인
           e.preventDefault();
           e.stopImmediatePropagation();
 
           // blur → focus로 IME 조합 확정
           active.blur();
           active.focus();
+
+          // 각 줄 끝의 공백(스페이스만) 제거
+          const original = active.value;
+          const cleaned = original.replace(/ +$/gm, '');
+          if (original !== cleaned) {
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+              window.HTMLTextAreaElement.prototype, 'value'
+            ).set;
+            nativeSetter.call(active, cleaned);
+            active.dispatchEvent(new Event('input', { bubbles: true }));
+            console.log('[CAT 단축키] 줄 끝 공백 제거 완료');
+          }
 
           console.log('[CAT 단축키] IME 조합 확정 후 저장 실행');
 
