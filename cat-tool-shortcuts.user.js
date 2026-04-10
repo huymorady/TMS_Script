@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      4.5
+// @version      4.6
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -67,6 +67,7 @@
 
         // 드래그한 원문과 같은 행의 번역문을 미리 가져옴
         const selection = window.getSelection();
+        const selectedText = selection.toString().trim(); // 드래그한 원문 텍스트
         const originEl = selection.anchorNode.parentElement?.closest('.origin_string')
           || selection.anchorNode.parentElement;
         let translationText = '';
@@ -95,7 +96,7 @@
           }
         }
 
-        triggerContextMenu('添加术语表', 'TB 추가', translationText);
+        triggerContextMenu('添加术语表', 'TB 추가', translationText, selectedText);
         return;
       }
 
@@ -153,8 +154,9 @@
    * @param {string} menuText - 클릭할 메뉴 텍스트
    * @param {string} label - 로그용 라벨
    * @param {string} [autoFillTranslation] - TB 팝업에 자동 입력할 번역문
+   * @param {string} [autoFillSource] - TB 팝업에 자동 입력할 원문
    */
-  function triggerContextMenu(menuText, label, autoFillTranslation) {
+  function triggerContextMenu(menuText, label, autoFillTranslation, autoFillSource) {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed) {
       console.log(`[CAT 단축키] ${label}: 선택된 텍스트가 없습니다.`);
@@ -190,7 +192,7 @@
 
         // TB 추가 팝업인 경우 자동 입력
         if (menuText === '添加术语表') {
-          fillTbPopup(autoFillTranslation);
+          fillTbPopup(autoFillTranslation, autoFillSource);
         }
       } else {
         console.log(`[CAT 단축키] ${menuText} 버튼을 찾지 못했습니다.`);
@@ -199,9 +201,9 @@
   }
 
   /**
-   * TB 추가 팝업에 术语备注(용어)와 Korean(번역문) 자동 입력
+   * TB 추가 팝업에 术语备注(용어), Chinese Simplified(원문), Korean(번역문) 자동 입력
    */
-  function fillTbPopup(translationText) {
+  function fillTbPopup(translationText, sourceText) {
     // 팝업이 렌더링될 때까지 대기
     const checkPopup = (attempts = 0) => {
       const inputs = document.querySelectorAll('.n-modal-container input.n-input__input-el, .n-modal input.n-input__input-el');
@@ -224,6 +226,13 @@
       nativeSetter.call(inputs[0], '용어');
       inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
       console.log('[CAT 단축키] 术语备注 → "용어" 입력 완료');
+
+      // 2번째: Chinese Simplified → 드래그한 원문 입력 (이미 있어도 동일값 덮어쓰기)
+      if (sourceText) {
+        nativeSetter.call(inputs[1], sourceText);
+        inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
+        console.log(`[CAT 단축키] Chinese Simplified → "${sourceText}" 입력 완료`);
+      }
 
       // 3번째: Korean → 번역문 자동 입력
       if (translationText) {
