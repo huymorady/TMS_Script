@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      4.6
+// @version      4.7
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -13,17 +13,55 @@
 (function () {
   'use strict';
 
-  console.log('[CAT 단축키] v4.3 로드 완료');
+  console.log('[CAT 단축키] v4.7 로드 완료');
   console.log('  Alt+`       → TB 추가 (드래그 필수)');
   console.log('  Alt+1~6     → 드래그 O: TM 검색 / 드래그 X: CAT 목록 N번 체크');
   console.log('  Alt+S       → 현재 세그먼트 맞춤법 검사');
   console.log('  Alt+Shift+S → 전체 세그먼트 맞춤법 검사');
   console.log('  Alt+T       → 원문 태그 순서대로 삽입');
+  console.log('  Ctrl+Enter  → IME 조합 확정 후 저장');
 
   // ─── 태그 삽입용 상태 관리 ───
   let tagQueue = [];       // 추출된 태그 배열
   let tagIndex = 0;        // 현재 삽입할 태그 인덱스
   let tagSourceEl = null;  // 태그를 추출한 원문 요소 (세그먼트 변경 감지용)
+
+  // ─── Ctrl+Enter 저장 시 IME 조합 확정 ───
+  let imeFixInProgress = false;
+
+  document.addEventListener(
+    'keydown',
+    function (e) {
+      if (e.ctrlKey && e.key === 'Enter' && !imeFixInProgress) {
+        const active = document.activeElement;
+        if (active && active.tagName === 'TEXTAREA') {
+          // IME 조합 중인지 확인
+          e.preventDefault();
+          e.stopImmediatePropagation();
+
+          // blur → focus로 IME 조합 확정
+          active.blur();
+          active.focus();
+
+          console.log('[CAT 단축키] IME 조합 확정 후 저장 실행');
+
+          // 짧은 딜레이 후 Ctrl+Enter를 다시 발생시켜 저장 실행
+          imeFixInProgress = true;
+          setTimeout(() => {
+            active.dispatchEvent(new KeyboardEvent('keydown', {
+              key: 'Enter',
+              code: 'Enter',
+              ctrlKey: true,
+              bubbles: true,
+              cancelable: true,
+            }));
+            imeFixInProgress = false;
+          }, 50);
+        }
+      }
+    },
+    true
+  );
 
   document.addEventListener(
     'keydown',
