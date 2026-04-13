@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      5.2
+// @version      5.5
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -174,8 +174,8 @@
           const isFromTextarea = (active && active.tagName === 'TEXTAREA');
 
           switch (num) {
-            case 1: // TM 검색
-              triggerContextMenu('搜索记忆库', 'TM 검색', null, null, selectedText, isFromTextarea);
+            case 1: // TM 검색 (全局搜索 탭 방식)
+              triggerGlobalSearch(selectedText, isFromTextarea);
               break;
             case 2: // 중국어 사전
               window.open('https://zh.dict.naver.com/#/search?query=' + encodeURIComponent(selectedText), '_blank');
@@ -310,15 +310,14 @@
         return;
       }
 
-      // ko->zh-Hans 라디오 버튼 선택 (번역문에서 검색한 경우)
-      if (reverseDirection) {
-        const radios = document.querySelectorAll('.n-radio-group input.n-radio-input');
-        for (const radio of radios) {
-          if (radio.value === '1') {
-            radio.closest('label').click();
-            console.log('[CAT 단축키] ko->zh-Hans 방향 선택');
-            break;
-          }
+      // 검색 방향 라디오 버튼 선택
+      const radios = document.querySelectorAll('.n-radio-group input.n-radio-input');
+      const targetValue = reverseDirection ? '1' : '0'; // 1=ko->zh-Hans, 0=zh-Hans->ko
+      for (const radio of radios) {
+        if (radio.value === targetValue && !radio.checked) {
+          radio.closest('label').click();
+          console.log(`[CAT 단축키] ${reverseDirection ? 'ko->zh-Hans' : 'zh-Hans->ko'} 방향 선택`);
+          break;
         }
       }
 
@@ -346,6 +345,34 @@
     };
 
     setTimeout(() => checkSearch(), 300);
+  }
+
+  /**
+   * 全局搜索 탭을 통한 TM 검색 (원문/번역문 공용)
+   * @param {string} searchText - 검색어
+   * @param {boolean} reverseDirection - true면 ko->zh-Hans, false면 zh-Hans->ko
+   */
+  function triggerGlobalSearch(searchText, reverseDirection) {
+    // 全局搜索 탭 클릭
+    const tabs = document.querySelectorAll('.n-tabs-tab');
+    let globalSearchTab = null;
+    for (const tab of tabs) {
+      if (tab.getAttribute('data-name') === 'globalSearch' || tab.textContent.trim() === '全局搜索') {
+        globalSearchTab = tab;
+        break;
+      }
+    }
+
+    if (!globalSearchTab) {
+      console.log('[CAT 단축키] 全局搜索 탭을 찾지 못했습니다.');
+      return;
+    }
+
+    globalSearchTab.click();
+    console.log(`[CAT 단축키] 全局搜索 탭 클릭 완료 (방향: ${reverseDirection ? 'ko->zh-Hans' : 'zh-Hans->ko'})`);
+
+    // 검색 패널이 열린 후 방향 선택 + 검색어 입력
+    fillTmSearch(searchText, reverseDirection);
   }
 
   /**
