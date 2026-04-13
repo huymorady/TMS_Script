@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  console.log('[CAT 단축키] v4.9 로드 완료');
+  console.log('[CAT 단축키] v5.5 로드 완료');
   console.log('  Alt+`       → TB 추가 (드래그 필수)');
   console.log('  Alt+1       → 드래그 O: TM 검색 / 드래그 X: CAT 1번 체크');
   console.log('  Alt+2       → 드래그 O: 중국어 사전 / 드래그 X: CAT 2번 체크');
