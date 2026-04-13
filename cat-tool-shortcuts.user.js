@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      4.8
+// @version      4.9
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -13,9 +13,13 @@
 (function () {
   'use strict';
 
-  console.log('[CAT 단축키] v4.7 로드 완료');
+  console.log('[CAT 단축키] v4.9 로드 완료');
   console.log('  Alt+`       → TB 추가 (드래그 필수)');
-  console.log('  Alt+1~6     → 드래그 O: TM 검색 / 드래그 X: CAT 목록 N번 체크');
+  console.log('  Alt+1       → 드래그 O: TM 검색 / 드래그 X: CAT 1번 체크');
+  console.log('  Alt+2       → 드래그 O: 중국어 사전 / 드래그 X: CAT 2번 체크');
+  console.log('  Alt+3       → 드래그 O: 영어 사전 / 드래그 X: CAT 3번 체크');
+  console.log('  Alt+4       → 드래그 O: 한국어 사전 / 드래그 X: CAT 4번 체크');
+  console.log('  Alt+5~6     → 드래그 X: CAT 5~6번 체크');
   console.log('  Alt+S       → 현재 세그먼트 맞춤법 검사');
   console.log('  Alt+Shift+S → 전체 세그먼트 맞춤법 검사');
   console.log('  Alt+T       → 원문 태그 순서대로 삽입');
@@ -156,8 +160,27 @@
         e.stopImmediatePropagation();
 
         if (hasSelection) {
-          // 드래그 상태 → TM 검색
-          triggerContextMenu('搜索记忆库', 'TM 검색');
+          const selectedText = window.getSelection().toString().trim();
+
+          switch (num) {
+            case 1: // TM 검색
+              triggerContextMenu('搜索记忆库', 'TM 검색');
+              break;
+            case 2: // 중국어 사전
+              window.open('https://zh.dict.naver.com/#/search?query=' + encodeURIComponent(selectedText), '_blank');
+              console.log(`[CAT 단축키] 중국어 사전 검색: "${selectedText}"`);
+              break;
+            case 3: // 영어 사전
+              window.open('https://en.dict.naver.com/#/search?query=' + encodeURIComponent(selectedText), '_blank');
+              console.log(`[CAT 단축키] 영어 사전 검색: "${selectedText}"`);
+              break;
+            case 4: // 한국어 사전
+              window.open('https://ko.dict.naver.com/#/search?query=' + encodeURIComponent(selectedText), '_blank');
+              console.log(`[CAT 단축키] 한국어 사전 검색: "${selectedText}"`);
+              break;
+            default:
+              break;
+          }
         } else {
           // 미드래그 → CAT 목록 N번째 체크 버튼 클릭
           clickCatCheckButton(num);
