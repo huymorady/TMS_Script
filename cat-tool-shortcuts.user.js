@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      5.1
+// @version      5.2
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -170,9 +170,12 @@
             selectedText = active.value.substring(active.selectionStart, active.selectionEnd).trim();
           }
 
+          // 번역문 입력창에서 검색한 건지 여부
+          const isFromTextarea = (active && active.tagName === 'TEXTAREA');
+
           switch (num) {
             case 1: // TM 검색
-              triggerContextMenu('搜索记忆库', 'TM 검색', null, null, selectedText);
+              triggerContextMenu('搜索记忆库', 'TM 검색', null, null, selectedText, isFromTextarea);
               break;
             case 2: // 중국어 사전
               window.open('https://zh.dict.naver.com/#/search?query=' + encodeURIComponent(selectedText), '_blank');
@@ -236,8 +239,9 @@
    * @param {string} [autoFillTranslation] - TB 팝업에 자동 입력할 번역문
    * @param {string} [autoFillSource] - TB 팝업에 자동 입력할 원문
    * @param {string} [searchText] - TM 검색 입력란에 자동 입력할 텍스트
+   * @param {boolean} [reverseDirection] - TM 검색 시 ko->zh-Hans 방향 선택
    */
-  function triggerContextMenu(menuText, label, autoFillTranslation, autoFillSource, searchText) {
+  function triggerContextMenu(menuText, label, autoFillTranslation, autoFillSource, searchText, reverseDirection) {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed) {
       console.log(`[CAT 단축키] ${label}: 선택된 텍스트가 없습니다.`);
@@ -278,7 +282,7 @@
 
         // TM 검색인 경우 검색어 자동 입력
         if (menuText === '搜索记忆库' && searchText) {
-          fillTmSearch(searchText);
+          fillTmSearch(searchText, reverseDirection);
         }
       } else {
         console.log(`[CAT 단축키] ${menuText} 버튼을 찾지 못했습니다.`);
@@ -288,8 +292,10 @@
 
   /**
    * TM 검색(搜索记忆库) 팝업의 검색 입력란에 텍스트 자동 입력 + 검색 실행
+   * @param {string} searchText - 검색어
+   * @param {boolean} [reverseDirection] - true면 ko->zh-Hans 라디오 버튼 선택
    */
-  function fillTmSearch(searchText) {
+  function fillTmSearch(searchText, reverseDirection) {
     const checkSearch = (attempts = 0) => {
       // 搜索记忆库 패널의 검색 입력란 찾기
       const searchInputs = document.querySelectorAll('.n-input-group input.n-input__input-el');
@@ -302,6 +308,18 @@
       if (searchInputs.length === 0) {
         console.log('[CAT 단축키] TM 검색 입력란을 찾지 못했습니다.');
         return;
+      }
+
+      // ko->zh-Hans 라디오 버튼 선택 (번역문에서 검색한 경우)
+      if (reverseDirection) {
+        const radios = document.querySelectorAll('.n-radio-group input.n-radio-input');
+        for (const radio of radios) {
+          if (radio.value === '1') {
+            radio.closest('label').click();
+            console.log('[CAT 단축키] ko->zh-Hans 방향 선택');
+            break;
+          }
+        }
       }
 
       // 마지막으로 나타난 검색 입력란 사용 (搜索记忆库 패널)
