@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      4.9
+// @version      5.1
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -83,7 +83,10 @@
     function (e) {
       if (!e.altKey || e.ctrlKey) return;
 
-      const hasSelection = !window.getSelection().isCollapsed;
+      // textarea 내부 선택도 감지
+      const active = document.activeElement;
+      const textareaSelection = (active && active.tagName === 'TEXTAREA' && active.selectionStart !== active.selectionEnd);
+      const hasSelection = !window.getSelection().isCollapsed || textareaSelection;
 
       // ─── Alt+Shift+S : 전체 세그먼트 맞춤법 검사 ───
       if (e.shiftKey && (e.key === 'S' || e.key === 's')) {
@@ -160,11 +163,16 @@
         e.stopImmediatePropagation();
 
         if (hasSelection) {
-          const selectedText = window.getSelection().toString().trim();
+          let selectedText = window.getSelection().toString().trim();
+
+          // textarea 내부 선택인 경우
+          if (!selectedText && active && active.tagName === 'TEXTAREA') {
+            selectedText = active.value.substring(active.selectionStart, active.selectionEnd).trim();
+          }
 
           switch (num) {
             case 1: // TM 검색
-              triggerContextMenu('搜索记忆库', 'TM 검색');
+              triggerContextMenu('搜索记忆库', 'TM 검색', null, null, selectedText);
               break;
             case 2: // 중국어 사전
               window.open('https://zh.dict.naver.com/#/search?query=' + encodeURIComponent(selectedText), '_blank');
@@ -227,8 +235,9 @@
    * @param {string} label - 로그용 라벨
    * @param {string} [autoFillTranslation] - TB 팝업에 자동 입력할 번역문
    * @param {string} [autoFillSource] - TB 팝업에 자동 입력할 원문
+   * @param {string} [searchText] - TM 검색 입력란에 자동 입력할 텍스트
    */
-  function triggerContextMenu(menuText, label, autoFillTranslation, autoFillSource) {
+  function triggerContextMenu(menuText, label, autoFillTranslation, autoFillSource, searchText) {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed) {
       console.log(`[CAT 단축키] ${label}: 선택된 텍스트가 없습니다.`);
@@ -266,10 +275,59 @@
         if (menuText === '添加术语表') {
           fillTbPopup(autoFillTranslation, autoFillSource);
         }
+
+        // TM 검색인 경우 검색어 자동 입력
+        if (menuText === '搜索记忆库' && searchText) {
+          fillTmSearch(searchText);
+        }
       } else {
         console.log(`[CAT 단축키] ${menuText} 버튼을 찾지 못했습니다.`);
       }
     });
+  }
+
+  /**
+   * TM 검색(搜索记忆库) 팝업의 검색 입력란에 텍스트 자동 입력 + 검색 실행
+   */
+  function fillTmSearch(searchText) {
+    const checkSearch = (attempts = 0) => {
+      // 搜索记忆库 패널의 검색 입력란 찾기
+      const searchInputs = document.querySelectorAll('.n-input-group input.n-input__input-el');
+
+      if (searchInputs.length === 0 && attempts < 20) {
+        setTimeout(() => checkSearch(attempts + 1), 100);
+        return;
+      }
+
+      if (searchInputs.length === 0) {
+        console.log('[CAT 단축키] TM 검색 입력란을 찾지 못했습니다.');
+        return;
+      }
+
+      // 마지막으로 나타난 검색 입력란 사용 (搜索记忆库 패널)
+      const searchInput = searchInputs[searchInputs.length - 1];
+
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, 'value'
+      ).set;
+      nativeSetter.call(searchInput, searchText);
+      searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+      console.log(`[CAT 단축키] TM 검색어 → "${searchText}" 입력 완료`);
+
+      // 검색 버튼 클릭
+      const buttons = searchInput.closest('.n-input-group')?.querySelectorAll('button');
+      if (buttons) {
+        for (const btn of buttons) {
+          if (btn.textContent.trim() === '搜索') {
+            btn.click();
+            console.log('[CAT 단축키] TM 검색 버튼 클릭 완료');
+            break;
+          }
+        }
+      }
+    };
+
+    setTimeout(() => checkSearch(), 300);
   }
 
   /**
