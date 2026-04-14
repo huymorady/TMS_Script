@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      6.1
+// @version      6.2
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/사전/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 / Alt+H → 도움말
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -27,6 +27,8 @@
     DROPDOWN_LABEL: '.n-dropdown-option-body_label, [class*="dropdown-option"] [class*="label"]',
     DROPDOWN_OPTION: '[data-dropdown-option]',
     BUTTON_ICON: 'span.n-button__icon',
+    CAT_CONTAINER: '#resultList',
+    CAT_CHECK_BTN: 'tbody td.\\!px-\\[2px\\] button.n-button--default-type',
     MODAL_INPUT: '.n-modal-container input.n-input__input-el, .n-modal input.n-input__input-el',
     SEARCH_INPUT: '.n-input-group input.n-input__input-el',
     RADIO_INPUT: '.n-radio-group input.n-radio-input',
@@ -55,9 +57,6 @@
 
   // 맞춤법 검사기 URL
   const SPELLER_URL = 'https://nara-speller.co.kr/speller/?auto=true';
-
-  // 체크마크 SVG 패턴
-  const CHECK_SVG_PATTERN = { a: '352', b: '176', c: '336' };
 
   // 태그 추출 정규식
   const TAG_PATTERN = new RegExp(
@@ -546,28 +545,14 @@
   function clickCatCheckButton(n) {
     console.log(`${LOG_PREFIX} CAT 목록 ${n}번 체크 버튼 클릭 시도`);
 
-    const allButtons = document.querySelectorAll(SEL.BUTTON_ICON);
-    const checkButtons = [];
-
-    for (const span of allButtons) {
-      const svg = span.querySelector('svg');
-      if (!svg) continue;
-
-      const paths = svg.querySelectorAll('path');
-      let isCheck = false;
-      for (const path of paths) {
-        const d = path.getAttribute('d') || '';
-        if (d.includes(CHECK_SVG_PATTERN.a) && d.includes(CHECK_SVG_PATTERN.b) && d.includes(CHECK_SVG_PATTERN.c)) {
-          isCheck = true;
-          break;
-        }
-      }
-
-      if (isCheck) {
-        const button = span.closest('button');
-        if (button && button.offsetParent !== null) checkButtons.push(button);
-      }
+    // #resultList 내의 tbody에서 td.!px-[2px] 안의 default-type 버튼만 수집
+    const container = document.getElementById('resultList');
+    if (!container) {
+      console.log(`${LOG_PREFIX} CAT 목록(#resultList)을 찾지 못했습니다.`);
+      return;
     }
+
+    const checkButtons = container.querySelectorAll(SEL.CAT_CHECK_BTN);
 
     if (checkButtons.length === 0) {
       console.log(`${LOG_PREFIX} 체크 버튼을 찾지 못했습니다.`);
@@ -579,6 +564,7 @@
     }
 
     checkButtons[n - 1].click();
+    showToast(`✓ CAT ${n}번 적용`);
     console.log(`${LOG_PREFIX} CAT 목록 ${n}번 체크 버튼 클릭 완료`);
   }
 
@@ -869,7 +855,7 @@
   //  로드 완료 로그
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v6.1 로드 완료`);
+  console.log(`${LOG_PREFIX} v6.2 로드 완료`);
   console.log('  Alt+`       → TB 추가 (드래그 필수)');
   console.log('  Alt+1       → 드래그 O: TM 검색 / 드래그 X: CAT 1번 체크');
   console.log('  Alt+2       → 드래그 O: 중국어 사전 / 드래그 X: CAT 2번 체크');
