@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 번역 조회 팝업
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Alt+Q → 팝업 열기/닫기 / Alt+W → 현재 세그먼트 매칭 삽입 / Alt+Shift+W → 전체 세그먼트 일괄 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-lookup.user.js
@@ -16,6 +16,18 @@
   // ─── 데이터 저장소 ───
   let lookupData = {}; // { '원문': '번역문', ... }
   let dataCount = 0;
+
+  // ─── sessionStorage에서 데이터 복원 ───
+  try {
+    const saved = sessionStorage.getItem('cat-lookup-data');
+    if (saved) {
+      lookupData = JSON.parse(saved);
+      dataCount = Object.keys(lookupData).length;
+      console.log(`[번역 조회] sessionStorage에서 ${dataCount}건 복원`);
+    }
+  } catch (e) {
+    console.log('[번역 조회] sessionStorage 복원 실패');
+  }
 
   // ─── 팝업 UI 생성 ───
   const panel = document.createElement('div');
@@ -170,6 +182,7 @@
   document.getElementById('cat-lookup-clear').addEventListener('click', () => {
     lookupData = {};
     dataCount = 0;
+    saveToSession();
     document.getElementById('cat-lookup-input').value = '';
     document.getElementById('cat-lookup-count').textContent = '0';
     document.getElementById('cat-lookup-status').textContent = '데이터가 초기화되었습니다.';
@@ -265,6 +278,9 @@
     Object.assign(lookupData, newData);
     dataCount = Object.keys(lookupData).length;
 
+    // sessionStorage에 저장
+    saveToSession();
+
     document.getElementById('cat-lookup-count').textContent = dataCount;
     document.getElementById('cat-lookup-status').textContent =
       `✅ ${parsed}건 파싱 완료 (총 ${dataCount}건 저장)`;
@@ -298,6 +314,23 @@
 
   function escapeHtml(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // ─── sessionStorage 저장 ───
+  function saveToSession() {
+    try {
+      sessionStorage.setItem('cat-lookup-data', JSON.stringify(lookupData));
+    } catch (e) {
+      console.log('[번역 조회] sessionStorage 저장 실패');
+    }
+  }
+
+  // ─── 복원된 데이터가 있으면 UI 업데이트 ───
+  if (dataCount > 0) {
+    document.getElementById('cat-lookup-count').textContent = dataCount;
+    document.getElementById('cat-lookup-status').textContent =
+      `🔄 이전 세션에서 ${dataCount}건 복원됨`;
+    updatePreview();
   }
 
   // ─── 단축키 처리 ───
@@ -462,7 +495,7 @@
     textarea.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  console.log('[번역 조회] v1.5 로드 완료');
+  console.log('[번역 조회] v1.6 로드 완료');
   console.log('  Alt+Q       → 팝업 열기/닫기');
   console.log('  Alt+W       → 현재 세그먼트 매칭 삽입');
   console.log('  Alt+Shift+W → 전체 세그먼트 일괄 삽입');
