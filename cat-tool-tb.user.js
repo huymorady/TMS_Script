@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - TB 도구
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Alt+B → TB 목록/검수 팝업 (접기, 드래그 이동, 검수 항목 클릭 시 이동+복사)
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-tb.user.js
@@ -277,6 +277,7 @@
     contentEl.innerHTML = html;
     statusEl.textContent = `총 ${count}건의 TB 용어가 추출되었습니다.`;
     console.log(`[TB 도구] ${count}건 TB 용어 추출 완료`);
+    if (window.catToast) window.catToast(`📖 TB 용어 ${count}건 추출`);
   }
 
   // ═══════════════════════════════════════
@@ -324,6 +325,7 @@
     if (issueCount === 0) {
       contentEl.innerHTML = '<div class="cat-tb-all-good">✅ 모든 TB 용어가 올바르게 반영되었습니다!</div>';
       console.log('[TB 도구] 검수 완료: 문제 없음');
+      if (window.catToast) window.catToast('✅ TB 검수: 모든 용어 반영 완료');
       return;
     }
 
@@ -355,6 +357,7 @@
           document.getElementById('cat-tb-status').textContent =
             `✅ "${issue.expectedTarget}" 클립보드에 복사됨 → Ctrl+V로 붙여넣기`;
           console.log(`[TB 도구] "${issue.expectedTarget}" 클립보드 복사`);
+          if (window.catToast) window.catToast(`📋 "${issue.expectedTarget}" 복사됨 → Ctrl+V`);
 
           // 플래시 효과
           row.classList.add('cat-tb-copied-flash');
@@ -364,6 +367,7 @@
     });
 
     console.log(`[TB 도구] 검수 완료: ${issueCount}건 미반영`);
+    if (window.catToast) window.catToast(`⚠ TB 검수: ${issueCount}건 미반영`);
   }
 
   // ═══════════════════════════════════════
@@ -425,7 +429,7 @@
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  console.log('[TB 도구] v3.0 로드 완료');
+  console.log('[TB 도구] v3.1 로드 완료');
   console.log('  Alt+B → TB 도구 팝업 열기/닫기 (목록 + 검수)');
   console.log('  헤더 제목 클릭 → 접기/펼치기');
   console.log('  헤더 드래그 → 위치 이동');
