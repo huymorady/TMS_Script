@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      5.5
-// @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 삽입
+// @version      5.6
+// @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/사전/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 / Alt+H → 도움말
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
 // @downloadURL  https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -13,7 +13,7 @@
 (function () {
   'use strict';
 
-  console.log('[CAT 단축키] v5.5 로드 완료');
+  console.log('[CAT 단축키] v5.6 로드 완료');
   console.log('  Alt+`       → TB 추가 (드래그 필수)');
   console.log('  Alt+1       → 드래그 O: TM 검색 / 드래그 X: CAT 1번 체크');
   console.log('  Alt+2       → 드래그 O: 중국어 사전 / 드래그 X: CAT 2번 체크');
@@ -24,6 +24,7 @@
   console.log('  Alt+Shift+S → 전체 세그먼트 맞춤법 검사');
   console.log('  Alt+T       → 원문 태그 순서대로 삽입');
   console.log('  Ctrl+Enter  → IME 조합 확정 후 저장');
+  console.log('  Alt+H       → 단축키 도움말');
 
   // ─── 태그 삽입용 상태 관리 ───
   let tagQueue = [];       // 추출된 태그 배열
@@ -98,6 +99,15 @@
 
       // 이하 Shift 미사용 단축키
       if (e.shiftKey) return;
+
+      // ─── Alt+H : 도움말 팝업 ───
+      if (e.key === 'h' || e.key === 'H') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        initHelpPanel();
+        helpPanel.classList.toggle('visible');
+        return;
+      }
 
       // ─── Alt+S : 현재 세그먼트 맞춤법 검사 ───
       if (e.key === 's' || e.key === 'S') {
@@ -698,4 +708,179 @@
       window.open('https://nara-speller.co.kr/speller/?auto=true', '_blank');
     });
   }
+
+  // ═══════════════════════════════════════
+  //  도움말 팝업 (Alt+H)
+  // ═══════════════════════════════════════
+
+  let helpPanel = null;
+
+  function initHelpPanel() {
+    if (helpPanel) return; // 이미 생성됨
+
+    helpPanel = document.createElement('div');
+    helpPanel.id = 'cat-help-panel';
+    helpPanel.innerHTML = `
+    <div id="cat-help-header">
+      <span id="cat-help-title">❓ 단축키 도움말</span>
+      <button id="cat-help-close" title="닫기">✕</button>
+    </div>
+    <div id="cat-help-body">
+      <table>
+        <tr><th colspan="3" class="cat-help-section">📌 단축키 모음 스크립트</th></tr>
+        <tr><td>Alt + \`</td><td>드래그 필수</td><td>TB 추가 (비고/원문/번역문 자동 입력)</td></tr>
+        <tr><td>Alt + 1</td><td>드래그 O</td><td>TM 검색 (원문: zh→ko / 번역문: ko→zh)</td></tr>
+        <tr><td>Alt + 2</td><td>드래그 O</td><td>네이버 중국어 사전 검색</td></tr>
+        <tr><td>Alt + 3</td><td>드래그 O</td><td>네이버 영어 사전 검색</td></tr>
+        <tr><td>Alt + 4</td><td>드래그 O</td><td>네이버 한국어 사전 검색</td></tr>
+        <tr><td>Alt + 1~6</td><td>드래그 X</td><td>CAT 목록 N번 체크 버튼 클릭</td></tr>
+        <tr><td>Alt + T</td><td>입력창 포커스</td><td>원문 태그 순서대로 삽입 (중복 건너뛰기)</td></tr>
+        <tr><td>Alt + S</td><td>입력창 포커스</td><td>현재 세그먼트 맞춤법 검사</td></tr>
+        <tr><td>Alt + Shift + S</td><td>-</td><td>전체 세그먼트 맞춤법 검사</td></tr>
+        <tr><td>Ctrl + Enter</td><td>입력창 포커스</td><td>IME 조합 확정 + 줄 끝 공백 제거 후 저장</td></tr>
+        <tr><th colspan="3" class="cat-help-section">📋 번역 조회 스크립트</th></tr>
+        <tr><td>Alt + Q</td><td>-</td><td>번역 조회 팝업 열기/닫기</td></tr>
+        <tr><td>Alt + W</td><td>입력창 포커스</td><td>현재 세그먼트 매칭 삽입</td></tr>
+        <tr><td>Alt + Shift + W</td><td>-</td><td>전체 세그먼트 일괄 매칭 삽입</td></tr>
+        <tr><th colspan="3" class="cat-help-section">📖 TB 도구 스크립트</th></tr>
+        <tr><td>Alt + B</td><td>-</td><td>TB 도구 팝업 열기/닫기 (목록 + 검수)</td></tr>
+        <tr><th colspan="3" class="cat-help-section">💡 팝업 공통</th></tr>
+        <tr><td colspan="2">헤더 제목 클릭</td><td>접기/펼치기</td></tr>
+        <tr><td colspan="2">헤더 드래그</td><td>위치 이동</td></tr>
+      </table>
+    </div>
+  `;
+
+  const helpStyle = document.createElement('style');
+  helpStyle.textContent = `
+    #cat-help-panel {
+      display: none;
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 520px;
+      max-height: 80vh;
+      background: #2a2a2e;
+      border: 1px solid #555;
+      border-radius: 8px;
+      z-index: 100000;
+      font-family: -apple-system, sans-serif;
+      font-size: 13px;
+      color: #e0e0e0;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+      flex-direction: column;
+    }
+    #cat-help-panel.visible { display: flex; }
+    #cat-help-panel.collapsed #cat-help-body { display: none; }
+    #cat-help-panel.collapsed { max-height: none; transform: none; }
+    #cat-help-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 14px;
+      background: #3a3a3e;
+      border-radius: 8px 8px 0 0;
+      font-weight: bold;
+      font-size: 14px;
+      cursor: grab;
+      user-select: none;
+    }
+    #cat-help-header:active { cursor: grabbing; }
+    #cat-help-panel.collapsed #cat-help-header { border-radius: 8px; }
+    #cat-help-title { cursor: pointer; }
+    #cat-help-close {
+      background: none;
+      border: none;
+      color: #e0e0e0;
+      cursor: pointer;
+      font-size: 16px;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    #cat-help-close:hover { background: #555; }
+    #cat-help-body {
+      overflow-y: auto;
+      max-height: calc(80vh - 50px);
+      padding: 10px 14px 14px;
+    }
+    #cat-help-body table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    #cat-help-body th, #cat-help-body td {
+      padding: 5px 8px;
+      border: 1px solid #444;
+      font-size: 12px;
+      text-align: left;
+    }
+    .cat-help-section {
+      background: #333 !important;
+      color: #5ac8a0;
+      font-size: 13px !important;
+      padding: 8px !important;
+    }
+    #cat-help-body td:first-child {
+      color: #d9d95a;
+      white-space: nowrap;
+      font-weight: bold;
+    }
+    #cat-help-body td:nth-child(2) {
+      color: #aaa;
+      white-space: nowrap;
+      font-size: 11px;
+    }
+  `;
+    document.head.appendChild(helpStyle);
+    document.body.appendChild(helpPanel);
+
+    // 닫기 버튼
+    document.getElementById('cat-help-close').addEventListener('click', () => {
+      helpPanel.classList.remove('visible');
+    });
+
+    // 제목 클릭 → 접기/펼치기
+    document.getElementById('cat-help-title').addEventListener('click', () => {
+      helpPanel.classList.toggle('collapsed');
+    });
+
+    // 헤더 드래그
+    const helpHeader = document.getElementById('cat-help-header');
+    let helpDragging = false;
+    let helpDragStartX, helpDragStartY, helpPanelStartX, helpPanelStartY;
+
+    helpHeader.addEventListener('mousedown', (e) => {
+      if (e.target.closest('button')) return;
+      helpDragging = true;
+      helpDragStartX = e.clientX;
+      helpDragStartY = e.clientY;
+      const rect = helpPanel.getBoundingClientRect();
+      helpPanelStartX = rect.left;
+      helpPanelStartY = rect.top;
+      helpPanel.style.transform = 'none';
+      helpPanel.style.left = helpPanelStartX + 'px';
+      helpPanel.style.top = helpPanelStartY + 'px';
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (!helpDragging) return;
+      helpPanel.style.left = (helpPanelStartX + e.clientX - helpDragStartX) + 'px';
+      helpPanel.style.top = (helpPanelStartY + e.clientY - helpDragStartY) + 'px';
+    });
+
+    document.addEventListener('mouseup', () => {
+      helpDragging = false;
+    });
+
+    console.log('[CAT 단축키] 도움말 패널 초기화 완료');
+  }
+
+  // DOM이 준비되면 도움말 패널 생성
+  if (document.body) {
+    initHelpPanel();
+  } else {
+    document.addEventListener('DOMContentLoaded', initHelpPanel);
+  }
+
 })();
