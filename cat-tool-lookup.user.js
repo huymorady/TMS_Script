@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 번역 조회 팝업
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.7
 // @description  Alt+Q → 팝업 열기/닫기 / Alt+W → 현재 세그먼트 매칭 삽입 / Alt+Shift+W → 전체 세그먼트 일괄 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-lookup.user.js
@@ -289,6 +289,7 @@
     updatePreview();
 
     console.log(`[번역 조회] ${parsed}건 파싱, 총 ${dataCount}건 저장`);
+    if (window.catToast) window.catToast(`📋 ${parsed}건 파싱 완료 (총 ${dataCount}건)`);
   }
 
   // ─── 미리보기 테이블 업데이트 ───
@@ -418,12 +419,14 @@
     const translation = findTranslation(sourceText);
     if (!translation) {
       console.log(`[번역 조회] 매칭 실패: "${sourceText}"`);
+      if (window.catToast) window.catToast(`❌ 매칭 실패: "${sourceText.substring(0, 20)}..."`);
       return;
     }
 
     // 번역문 삽입
     setTextareaValue(active, translation);
     console.log(`[번역 조회] 매칭 삽입: "${sourceText}" → "${translation}"`);
+    if (window.catToast) window.catToast(`✅ 매칭 삽입 완료`);
   }
 
   // ─── 전체 세그먼트 일괄 삽입 ───
@@ -458,6 +461,7 @@
     }
 
     console.log(`[번역 조회] 일괄 삽입 완료: ${matched}건 매칭, ${skipped}건 건너뛰기 (이미 입력됨)`);
+    if (window.catToast) window.catToast(`✅ 일괄 삽입: ${matched}건 매칭, ${skipped}건 건너뛰기`);
   }
 
   // ─── textarea에서 같은 행의 원문 찾기 ───
@@ -495,7 +499,7 @@
     textarea.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  console.log('[번역 조회] v1.6 로드 완료');
+  console.log('[번역 조회] v1.7 로드 완료');
   console.log('  Alt+Q       → 팝업 열기/닫기');
   console.log('  Alt+W       → 현재 세그먼트 매칭 삽입');
   console.log('  Alt+Shift+W → 전체 세그먼트 일괄 삽입');
