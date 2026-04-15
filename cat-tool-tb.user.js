@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - TB 도구
 // @namespace    http://tampermonkey.net/
-// @version      4.0
+// @version      4.1
 // @description  Alt+B → TB 목록/검수/QA 팝업 (상수 정의, 공통 함수, 접기/드래그)
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-tb.user.js
@@ -151,7 +151,7 @@
   panel.id = 'cat-tb-panel';
   panel.innerHTML = `
     <div id="cat-tb-header">
-      <span id="cat-tb-title">📖 TB/QA 도구</span>
+      <span id="cat-tb-title">📖 TB/QA 도구 (<span id="cat-tb-count">0</span>건)</span>
       <div>
         <button id="cat-tb-refresh" title="새로고침">🔄</button>
         <button id="cat-tb-copy" title="클립보드 복사">📋</button>
@@ -616,6 +616,6 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v4.0 로드 완료`);
+  console.log(`${LOG_PREFIX} v4.1 로드 완료`);
   console.log('  Alt+B → TB/QA 도구 팝업 열기/닫기 (목록 + TB검수 + QA)');
 })();
