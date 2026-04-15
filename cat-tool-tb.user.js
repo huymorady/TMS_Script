@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CAT Tool - TB 도구
 // @namespace    http://tampermonkey.net/
-// @version      3.1
-// @description  Alt+B → TB 목록/검수 팝업 (접기, 드래그 이동, 검수 항목 클릭 시 이동+복사)
+// @version      4.0
+// @description  Alt+B → TB 목록/검수/QA 팝업 (상수 정의, 공통 함수, 접기/드래그)
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-tb.user.js
 // @downloadURL  https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-tb.user.js
@@ -13,12 +13,145 @@
 (function () {
   'use strict';
 
-  // ─── 팝업 UI ───
+  // ═══════════════════════════════════════
+  //  상수 정의
+  // ═══════════════════════════════════════
+
+  const LOG_PREFIX = '[TB 도구]';
+
+  // DOM 셀렉터
+  const SEL = {
+    ORIGIN: '.origin_string',
+    TEXTAREA: 'textarea.n-input__textarea-el',
+    TB_SPAN: '.origin_string span.vb[data-tooltip]',
+  };
+
+  // 태그 추출 정규식 (단축키 스크립트와 동일)
+  const TAG_PATTERN = new RegExp(
+    '\\{\\d+\\}'
+    + '|\\{[a-zA-Z_][a-zA-Z0-9_]*\\}'
+    + '|%[sd]'
+    + '|%\\d+\\$[sd]'
+    + '|<br\\s*/?>'
+    + '|</?[a-zA-Z][^>]*>'
+    + '|\\\\n'
+    + '|\\[/?[a-zA-Z][^\\]]*\\]'
+  , 'g');
+
+  // 숫자 추출 정규식 (태그 내부 제외를 위해 태그를 먼저 제거 후 사용)
+  const NUMBER_PATTERN = /\d+(?:\.\d+)?/g;
+
+  // 괄호 짝 정의
+  const BRACKET_PAIRS = [
+    ['(', ')'],
+    ['[', ']'],
+    ['（', '）'],
+    ['【', '】'],
+    ['「', '」'],
+    ['『', '』'],
+  ];
+
+  // 반복 문자 패턴 (한글 2자 이상 반복)
+  const REPEAT_PATTERN = /(.{2,})\1/g;
+
+  // QA 오류 유형 라벨
+  const QA_LABELS = {
+    UNTRANSLATED: '미번역',
+    IDENTICAL: '원문동일',
+    LEADING_SPACE: '앞 공백',
+    TRAILING_SPACE: '뒤 공백',
+    CONSECUTIVE_SPACE: '연속 공백',
+    NUMBER_MISMATCH: '숫자 불일치',
+    BRACKET_MISMATCH: '괄호 불일치',
+    TAG_MISMATCH: '태그 불일치',
+    NEWLINE_MISMATCH: '줄바꿈 불일치',
+    PERIOD_MISMATCH: '마침표 불일치',
+    REPEAT_CHAR: '반복 문자',
+  };
+
+  // ═══════════════════════════════════════
+  //  공통 유틸리티 함수
+  // ═══════════════════════════════════════
+
+  function escapeHtml(str) {
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  /** 세그먼트로 스크롤 이동 + 포커스 */
+  function navigateToSegment(originEl, textarea) {
+    originEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setTimeout(() => { textarea.focus(); textarea.click(); }, 300);
+  }
+
+  /** 드래그 가능 패널 설정 */
+  function makeDraggable(headerEl, panelEl) {
+    let dragging = false, startX, startY, panelX, panelY;
+    headerEl.addEventListener('mousedown', (e) => {
+      if (e.target.closest('button')) return;
+      dragging = true;
+      startX = e.clientX; startY = e.clientY;
+      const rect = panelEl.getBoundingClientRect();
+      panelX = rect.left; panelY = rect.top;
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      panelEl.style.left = (panelX + e.clientX - startX) + 'px';
+      panelEl.style.top = (panelY + e.clientY - startY) + 'px';
+      panelEl.style.right = 'auto';
+    });
+    document.addEventListener('mouseup', () => { dragging = false; });
+  }
+
+  /** 원문/번역문 쌍 배열 가져오기 */
+  function getSegmentPairs() {
+    const origins = document.querySelectorAll(SEL.ORIGIN);
+    const textareas = document.querySelectorAll(SEL.TEXTAREA);
+    const pairs = [];
+    const count = Math.min(origins.length, textareas.length);
+    for (let i = 0; i < count; i++) {
+      pairs.push({
+        index: i,
+        segNum: i + 1,
+        originEl: origins[i],
+        textarea: textareas[i],
+        sourceText: origins[i].textContent.trim(),
+        targetText: textareas[i].value,
+      });
+    }
+    return pairs;
+  }
+
+  /** 텍스트에서 태그를 제거한 순수 텍스트 반환 */
+  function stripTags(text) {
+    return text.replace(TAG_PATTERN, '');
+  }
+
+  /** 텍스트에서 숫자 배열 추출 (태그 내부 제외) */
+  function extractNumbers(text) {
+    const stripped = stripTags(text);
+    return (stripped.match(NUMBER_PATTERN) || []).sort();
+  }
+
+  /** 텍스트에서 태그 배열 추출 */
+  function extractTags(text) {
+    return (text.match(TAG_PATTERN) || []).sort();
+  }
+
+  /** 줄바꿈 개수 세기 */
+  function countNewlines(text) {
+    return (text.match(/\n/g) || []).length;
+  }
+
+  // ═══════════════════════════════════════
+  //  팝업 UI
+  // ═══════════════════════════════════════
+
   const panel = document.createElement('div');
   panel.id = 'cat-tb-panel';
   panel.innerHTML = `
     <div id="cat-tb-header">
-      <span id="cat-tb-title">📖 TB 도구 (<span id="cat-tb-count">0</span>건)</span>
+      <span id="cat-tb-title">📖 TB/QA 도구</span>
       <div>
         <button id="cat-tb-refresh" title="새로고침">🔄</button>
         <button id="cat-tb-copy" title="클립보드 복사">📋</button>
@@ -28,10 +161,12 @@
     <div id="cat-tb-body">
       <div id="cat-tb-tabs">
         <button class="cat-tb-tab active" data-tab="list">목록</button>
-        <button class="cat-tb-tab" data-tab="validate">검수 (<span id="cat-tb-issue-count">0</span>)</button>
+        <button class="cat-tb-tab" data-tab="validate">TB검수 (<span id="cat-tb-issue-count">0</span>)</button>
+        <button class="cat-tb-tab" data-tab="qa">QA (<span id="cat-tb-qa-count">0</span>)</button>
       </div>
       <div id="cat-tb-tab-list" class="cat-tb-tab-content active"></div>
       <div id="cat-tb-tab-validate" class="cat-tb-tab-content"></div>
+      <div id="cat-tb-tab-qa" class="cat-tb-tab-content"></div>
       <div id="cat-tb-status"></div>
     </div>
   `;
@@ -40,81 +175,44 @@
   const style = document.createElement('style');
   style.textContent = `
     #cat-tb-panel {
-      display: none;
-      position: fixed;
-      top: 60px;
-      left: 20px;
-      width: 420px;
-      max-height: 75vh;
-      background: #2a2a2e;
-      border: 1px solid #555;
-      border-radius: 8px;
-      z-index: 99999;
-      font-family: -apple-system, sans-serif;
-      font-size: 13px;
-      color: #e0e0e0;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+      display: none; position: fixed; top: 60px; left: 20px;
+      width: 480px; max-height: 75vh; background: #2a2a2e;
+      border: 1px solid #555; border-radius: 8px; z-index: 99999;
+      font-family: -apple-system, sans-serif; font-size: 13px;
+      color: #e0e0e0; box-shadow: 0 4px 20px rgba(0,0,0,0.5);
       flex-direction: column;
     }
     #cat-tb-panel.visible { display: flex; }
     #cat-tb-panel.collapsed #cat-tb-body { display: none; }
     #cat-tb-panel.collapsed { max-height: none; }
-
     #cat-tb-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 10px 14px;
-      background: #3a3a3e;
-      border-radius: 8px 8px 0 0;
-      font-weight: bold;
-      font-size: 14px;
-      cursor: grab;
-      user-select: none;
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 10px 14px; background: #3a3a3e; border-radius: 8px 8px 0 0;
+      font-weight: bold; font-size: 14px; cursor: grab; user-select: none;
     }
     #cat-tb-header:active { cursor: grabbing; }
     #cat-tb-panel.collapsed #cat-tb-header { border-radius: 8px; }
     #cat-tb-title { cursor: pointer; }
     #cat-tb-header button {
-      background: none;
-      border: none;
-      color: #e0e0e0;
-      cursor: pointer;
-      font-size: 15px;
-      padding: 2px 6px;
-      border-radius: 4px;
+      background: none; border: none; color: #e0e0e0; cursor: pointer;
+      font-size: 15px; padding: 2px 6px; border-radius: 4px;
     }
     #cat-tb-header button:hover { background: #555; }
-
     #cat-tb-body { display: flex; flex-direction: column; overflow: hidden; }
-
     #cat-tb-tabs {
-      display: flex;
-      border-bottom: 1px solid #444;
-      padding: 0 14px;
-      background: #333;
+      display: flex; border-bottom: 1px solid #444; padding: 0 14px; background: #333;
     }
     .cat-tb-tab {
-      background: none;
-      border: none;
-      color: #aaa;
-      padding: 8px 16px;
-      cursor: pointer;
-      font-size: 13px;
-      border-bottom: 2px solid transparent;
+      background: none; border: none; color: #aaa; padding: 8px 12px;
+      cursor: pointer; font-size: 13px; border-bottom: 2px solid transparent;
       transition: all 0.2s;
     }
     .cat-tb-tab:hover { color: #e0e0e0; }
     .cat-tb-tab.active { color: #5ac8a0; border-bottom-color: #5ac8a0; font-weight: bold; }
-
     .cat-tb-tab-content {
-      display: none;
-      overflow-y: auto;
-      max-height: calc(75vh - 120px);
-      padding: 8px 14px;
+      display: none; overflow-y: auto; max-height: calc(75vh - 120px); padding: 8px 14px;
     }
     .cat-tb-tab-content.active { display: block; }
-
     .cat-tb-tab-content table { width: 100%; border-collapse: collapse; }
     .cat-tb-tab-content th {
       padding: 6px 8px; border: 1px solid #444; background: #3a3a3e;
@@ -124,18 +222,15 @@
       padding: 5px 8px; border: 1px solid #444; font-size: 12px; word-break: break-all;
     }
     .cat-tb-tab-content tr:hover td { background: #3a3a3e; }
-
     .cat-tb-issue-row { cursor: pointer; }
     .cat-tb-issue-row:hover td { background: #2d4a3e !important; }
     .cat-tb-seg-num { color: #4a90d9; font-weight: bold; white-space: nowrap; }
     .cat-tb-missing { color: #e06060; }
+    .cat-tb-warn { color: #d9a94e; }
     .cat-tb-copied-flash { animation: cat-tb-flash 0.6s ease; }
     @keyframes cat-tb-flash {
-      0% { background: #2d4a3e; }
-      50% { background: #3d6a5e; }
-      100% { background: transparent; }
+      0% { background: #2d4a3e; } 50% { background: #3d6a5e; } 100% { background: transparent; }
     }
-
     #cat-tb-status { padding: 6px 14px 10px; font-size: 11px; color: #aaa; }
     .cat-tb-no-data { padding: 20px; text-align: center; color: #888; }
     .cat-tb-all-good { padding: 20px; text-align: center; color: #5ac8a0; font-size: 14px; }
@@ -144,53 +239,18 @@
   document.body.appendChild(panel);
 
   // ═══════════════════════════════════════
-  //  헤더 드래그 이동
+  //  UI 이벤트
   // ═══════════════════════════════════════
 
-  const header = document.getElementById('cat-tb-header');
-  let isDragging = false;
-  let dragStartX, dragStartY, panelStartX, panelStartY;
+  // 드래그
+  makeDraggable(document.getElementById('cat-tb-header'), panel);
 
-  header.addEventListener('mousedown', (e) => {
-    // 버튼 클릭은 드래그로 처리하지 않음
-    if (e.target.closest('button')) return;
-
-    isDragging = true;
-    dragStartX = e.clientX;
-    dragStartY = e.clientY;
-    const rect = panel.getBoundingClientRect();
-    panelStartX = rect.left;
-    panelStartY = rect.top;
-    e.preventDefault();
+  // 접기/펼치기
+  document.getElementById('cat-tb-title').addEventListener('click', () => {
+    panel.classList.toggle('collapsed');
   });
 
-  document.addEventListener('mousemove', (e) => {
-    if (!isDragging) return;
-    const dx = e.clientX - dragStartX;
-    const dy = e.clientY - dragStartY;
-    panel.style.left = (panelStartX + dx) + 'px';
-    panel.style.top = (panelStartY + dy) + 'px';
-    panel.style.right = 'auto';
-  });
-
-  document.addEventListener('mouseup', () => {
-    isDragging = false;
-  });
-
-  // ═══════════════════════════════════════
-  //  헤더 제목 클릭 → 접기/펼치기
-  // ═══════════════════════════════════════
-
-  let clickTimer = null;
-  document.getElementById('cat-tb-title').addEventListener('click', (e) => {
-    // 드래그 후 클릭 방지 (이동 거리가 작을 때만 토글)
-    if (clickTimer) clearTimeout(clickTimer);
-    clickTimer = setTimeout(() => {
-      panel.classList.toggle('collapsed');
-    }, 200);
-  });
-
-  // ─── 탭 전환 ───
+  // 탭 전환
   document.querySelectorAll('.cat-tb-tab').forEach(tab => {
     tab.addEventListener('click', () => {
       document.querySelectorAll('.cat-tb-tab').forEach(t => t.classList.remove('active'));
@@ -200,40 +260,31 @@
     });
   });
 
-  // ─── 버튼 이벤트 ───
+  // 버튼 이벤트
   document.getElementById('cat-tb-close').addEventListener('click', () => {
     panel.classList.remove('visible');
   });
-  document.getElementById('cat-tb-refresh').addEventListener('click', () => {
-    runAll();
-  });
-  document.getElementById('cat-tb-copy').addEventListener('click', () => {
-    copyToClipboard();
-  });
+  document.getElementById('cat-tb-refresh').addEventListener('click', runAll);
+  document.getElementById('cat-tb-copy').addEventListener('click', copyToClipboard);
 
-  // ─── 단축키: Alt+B ───
-  document.addEventListener(
-    'keydown',
-    function (e) {
-      if (!e.altKey || e.ctrlKey || e.shiftKey) return;
-      if (e.key === 'b' || e.key === 'B') {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        if (panel.classList.contains('visible')) {
-          panel.classList.remove('visible');
-        } else {
-          runAll();
-          panel.classList.add('visible');
-        }
-        return;
+  // 단축키: Alt+B
+  document.addEventListener('keydown', function (e) {
+    if (!e.altKey || e.ctrlKey || e.shiftKey) return;
+    if (e.key === 'b' || e.key === 'B') {
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (panel.classList.contains('visible')) {
+        panel.classList.remove('visible');
+      } else {
+        runAll();
+        panel.classList.add('visible');
       }
-    },
-    true
-  );
+    }
+  }, true);
 
   function runAll() {
     displayList();
     displayValidation();
+    displayQA();
   }
 
   // ═══════════════════════════════════════
@@ -241,7 +292,7 @@
   // ═══════════════════════════════════════
 
   function extractTbTerms() {
-    const spans = document.querySelectorAll('.origin_string span.vb[data-tooltip]');
+    const spans = document.querySelectorAll(SEL.TB_SPAN);
     const terms = {};
     for (const span of spans) {
       const source = span.textContent.trim();
@@ -267,7 +318,6 @@
     }
 
     entries.sort((a, b) => a[0].localeCompare(b[0], 'zh'));
-
     let html = '<table><tr><th>원문</th><th>TB 번역어</th></tr>';
     for (const [src, tgt] of entries) {
       html += `<tr><td>${escapeHtml(src)}</td><td>${escapeHtml(tgt)}</td></tr>`;
@@ -276,42 +326,33 @@
 
     contentEl.innerHTML = html;
     statusEl.textContent = `총 ${count}건의 TB 용어가 추출되었습니다.`;
-    console.log(`[TB 도구] ${count}건 TB 용어 추출 완료`);
+    console.log(`${LOG_PREFIX} ${count}건 TB 용어 추출 완료`);
     if (window.catToast) window.catToast(`📖 TB 용어 ${count}건 추출`);
   }
 
   // ═══════════════════════════════════════
-  //  검수 탭
+  //  TB 검수 탭
   // ═══════════════════════════════════════
 
   function displayValidation() {
-    const origins = document.querySelectorAll('.origin_string');
-    const textareas = document.querySelectorAll('textarea.n-input__textarea-el');
+    const pairs = getSegmentPairs();
     const issues = [];
 
-    const cnt = Math.min(origins.length, textareas.length);
-    for (let i = 0; i < cnt; i++) {
-      const originEl = origins[i];
-      const textarea = textareas[i];
-      const translationText = textarea.value;
+    for (const seg of pairs) {
+      if (!seg.targetText.trim()) continue;
 
-      if (!translationText.trim()) continue;
-
-      const tbSpans = originEl.querySelectorAll('span.vb[data-tooltip]');
+      const tbSpans = seg.originEl.querySelectorAll('span.vb[data-tooltip]');
       if (tbSpans.length === 0) continue;
 
       for (const span of tbSpans) {
         const source = span.textContent.trim();
         const target = span.getAttribute('data-tooltip');
 
-        if (source && target && !translationText.includes(target)) {
+        if (source && target && !seg.targetText.includes(target)) {
           issues.push({
-            segIndex: i,
-            segNum: i + 1,
-            source: source,
-            expectedTarget: target,
-            originEl: originEl,
-            textarea: textarea,
+            segNum: seg.segNum,
+            source, expectedTarget: target,
+            originEl: seg.originEl, textarea: seg.textarea,
           });
         }
       }
@@ -319,13 +360,10 @@
 
     const issueCount = issues.length;
     document.getElementById('cat-tb-issue-count').textContent = issueCount;
-
     const contentEl = document.getElementById('cat-tb-tab-validate');
 
     if (issueCount === 0) {
       contentEl.innerHTML = '<div class="cat-tb-all-good">✅ 모든 TB 용어가 올바르게 반영되었습니다!</div>';
-      console.log('[TB 도구] 검수 완료: 문제 없음');
-      if (window.catToast) window.catToast('✅ TB 검수: 모든 용어 반영 완료');
       return;
     }
 
@@ -336,50 +374,181 @@
       html += `<td class="cat-tb-seg-num">${issue.segNum}</td>`;
       html += `<td>${escapeHtml(issue.source)}</td>`;
       html += `<td>${escapeHtml(issue.expectedTarget)}</td>`;
-      html += `<td class="cat-tb-missing">미반영</td>`;
-      html += `</tr>`;
+      html += `<td class="cat-tb-missing">미반영</td></tr>`;
     }
     html += '</table>';
-
     contentEl.innerHTML = html;
 
-    // 클릭 시 세그먼트 이동 + TB 번역어 클립보드 복사
+    // 클릭 이벤트
     contentEl.querySelectorAll('.cat-tb-issue-row').forEach(row => {
       row.addEventListener('click', () => {
-        const idx = parseInt(row.dataset.issueIdx);
-        const issue = issues[idx];
-
-        // 세그먼트로 이동
+        const issue = issues[parseInt(row.dataset.issueIdx)];
         navigateToSegment(issue.originEl, issue.textarea);
-
-        // TB 번역어를 클립보드에 복사
         navigator.clipboard.writeText(issue.expectedTarget).then(() => {
           document.getElementById('cat-tb-status').textContent =
             `✅ "${issue.expectedTarget}" 클립보드에 복사됨 → Ctrl+V로 붙여넣기`;
-          console.log(`[TB 도구] "${issue.expectedTarget}" 클립보드 복사`);
           if (window.catToast) window.catToast(`📋 "${issue.expectedTarget}" 복사됨 → Ctrl+V`);
-
-          // 플래시 효과
           row.classList.add('cat-tb-copied-flash');
           setTimeout(() => row.classList.remove('cat-tb-copied-flash'), 600);
         });
       });
     });
 
-    console.log(`[TB 도구] 검수 완료: ${issueCount}건 미반영`);
-    if (window.catToast) window.catToast(`⚠ TB 검수: ${issueCount}건 미반영`);
+    console.log(`${LOG_PREFIX} TB 검수: ${issueCount}건 미반영`);
   }
 
   // ═══════════════════════════════════════
-  //  세그먼트 이동
+  //  QA 탭
   // ═══════════════════════════════════════
 
-  function navigateToSegment(originEl, textarea) {
-    originEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    setTimeout(() => {
-      textarea.focus();
-      textarea.click();
-    }, 300);
+  function runQAChecks() {
+    const pairs = getSegmentPairs();
+    const issues = [];
+
+    for (const seg of pairs) {
+      const src = seg.sourceText;
+      const tgt = seg.targetText;
+
+      // 1. 미번역 (원문이 있는데 번역문이 비어있음)
+      if (src && !tgt.trim()) {
+        issues.push({ ...seg, type: QA_LABELS.UNTRANSLATED, detail: '번역문이 비어있습니다.' });
+        continue; // 미번역이면 나머지 체크 의미 없음
+      }
+
+      if (!tgt.trim()) continue; // 원문도 번역문도 비어있으면 건너뛰기
+
+      // 2. 원문과 번역문 동일
+      if (src === tgt) {
+        issues.push({ ...seg, type: QA_LABELS.IDENTICAL, detail: '원문과 번역문이 동일합니다.' });
+      }
+
+      // 3. 앞 공백
+      if (tgt !== tgt.trimStart()) {
+        issues.push({ ...seg, type: QA_LABELS.LEADING_SPACE, detail: '번역문 앞에 불필요한 공백이 있습니다.' });
+      }
+
+      // 4. 뒤 공백
+      if (tgt !== tgt.trimEnd()) {
+        issues.push({ ...seg, type: QA_LABELS.TRAILING_SPACE, detail: '번역문 뒤에 불필요한 공백이 있습니다.' });
+      }
+
+      // 5. 연속 공백 (줄바꿈 제외한 공백이 2개 이상)
+      if (/[^\S\n]{2,}/.test(tgt)) {
+        issues.push({ ...seg, type: QA_LABELS.CONSECUTIVE_SPACE, detail: '연속 공백이 포함되어 있습니다.' });
+      }
+
+      // 6. 숫자 불일치 (태그 내부 숫자 제외)
+      const srcNums = extractNumbers(src);
+      const tgtNums = extractNumbers(tgt);
+      if (srcNums.join(',') !== tgtNums.join(',')) {
+        const missing = srcNums.filter(n => !tgtNums.includes(n));
+        const extra = tgtNums.filter(n => !srcNums.includes(n));
+        let detail = '';
+        if (missing.length) detail += `누락: ${missing.join(', ')}`;
+        if (extra.length) detail += `${detail ? ' / ' : ''}추가: ${extra.join(', ')}`;
+        if (!detail) detail = `원문: [${srcNums.join(', ')}] → 번역문: [${tgtNums.join(', ')}]`;
+        issues.push({ ...seg, type: QA_LABELS.NUMBER_MISMATCH, detail });
+      }
+
+      // 7. 괄호 짝 불일치
+      for (const [open, close] of BRACKET_PAIRS) {
+        const openCount = (tgt.match(new RegExp('\\' + open, 'g')) || []).length;
+        const closeCount = (tgt.match(new RegExp('\\' + close, 'g')) || []).length;
+        if (openCount !== closeCount) {
+          issues.push({
+            ...seg, type: QA_LABELS.BRACKET_MISMATCH,
+            detail: `${open}${close} 짝 불일치: ${open}=${openCount}개, ${close}=${closeCount}개`,
+          });
+        }
+      }
+
+      // 8. 태그 불일치
+      const srcTags = extractTags(src);
+      const tgtTags = extractTags(tgt);
+      if (srcTags.join(',') !== tgtTags.join(',')) {
+        const missingTags = srcTags.filter(t => !tgtTags.includes(t));
+        const extraTags = tgtTags.filter(t => !srcTags.includes(t));
+        let detail = '';
+        if (missingTags.length) detail += `누락: ${missingTags.join(', ')}`;
+        if (extraTags.length) detail += `${detail ? ' / ' : ''}추가: ${extraTags.join(', ')}`;
+        if (!detail) detail = '태그 순서 또는 개수가 다릅니다.';
+        issues.push({ ...seg, type: QA_LABELS.TAG_MISMATCH, detail });
+      }
+
+      // 9. 줄바꿈 개수 불일치
+      const srcNewlines = countNewlines(src);
+      const tgtNewlines = countNewlines(tgt);
+      if (srcNewlines !== tgtNewlines) {
+        issues.push({
+          ...seg, type: QA_LABELS.NEWLINE_MISMATCH,
+          detail: `원문: ${srcNewlines}개 → 번역문: ${tgtNewlines}개`,
+        });
+      }
+
+      // 10. 문장 끝 마침표 불일치
+      const srcEndsWithPeriod = /[。.]\s*$/.test(src);
+      const tgtEndsWithPeriod = /[。.]\s*$/.test(tgt);
+      if (srcEndsWithPeriod !== tgtEndsWithPeriod) {
+        issues.push({
+          ...seg, type: QA_LABELS.PERIOD_MISMATCH,
+          detail: srcEndsWithPeriod ? '원문은 마침표로 끝나지만 번역문은 아닙니다.' : '번역문만 마침표로 끝납니다.',
+        });
+      }
+
+      // 11. 반복 문자
+      const repeats = tgt.match(REPEAT_PATTERN);
+      if (repeats) {
+        // 태그나 의도적 반복이 아닌 것만 필터
+        const realRepeats = repeats.filter(r => !TAG_PATTERN.test(r) && r.length <= 10);
+        if (realRepeats.length > 0) {
+          issues.push({
+            ...seg, type: QA_LABELS.REPEAT_CHAR,
+            detail: `반복: "${realRepeats.join('", "')}"`,
+          });
+        }
+      }
+    }
+
+    return issues;
+  }
+
+  function displayQA() {
+    const issues = runQAChecks();
+    const issueCount = issues.length;
+
+    document.getElementById('cat-tb-qa-count').textContent = issueCount;
+    const contentEl = document.getElementById('cat-tb-tab-qa');
+
+    if (issueCount === 0) {
+      contentEl.innerHTML = '<div class="cat-tb-all-good">✅ QA 체크 완료: 문제가 발견되지 않았습니다!</div>';
+      console.log(`${LOG_PREFIX} QA 체크 완료: 문제 없음`);
+      return;
+    }
+
+    let html = '<table><tr><th>#</th><th>유형</th><th>상세</th></tr>';
+    for (let i = 0; i < issues.length; i++) {
+      const issue = issues[i];
+      html += `<tr class="cat-tb-issue-row" data-qa-idx="${i}">`;
+      html += `<td class="cat-tb-seg-num">${issue.segNum}</td>`;
+      html += `<td class="cat-tb-warn">${escapeHtml(issue.type)}</td>`;
+      html += `<td>${escapeHtml(issue.detail)}</td>`;
+      html += `</tr>`;
+    }
+    html += '</table>';
+    contentEl.innerHTML = html;
+
+    // 클릭 시 세그먼트 이동
+    contentEl.querySelectorAll('.cat-tb-issue-row').forEach(row => {
+      row.addEventListener('click', () => {
+        const issue = issues[parseInt(row.dataset.qaIdx)];
+        navigateToSegment(issue.originEl, issue.textarea);
+        row.classList.add('cat-tb-copied-flash');
+        setTimeout(() => row.classList.remove('cat-tb-copied-flash'), 600);
+      });
+    });
+
+    console.log(`${LOG_PREFIX} QA 체크: ${issueCount}건 발견`);
+    if (window.catToast) window.catToast(`⚠ QA: ${issueCount}건 발견`);
   }
 
   // ═══════════════════════════════════════
@@ -389,6 +558,7 @@
   function copyToClipboard() {
     const activeTab = document.querySelector('.cat-tb-tab.active')?.dataset.tab;
     if (activeTab === 'validate') copyValidation();
+    else if (activeTab === 'qa') copyQA();
     else copyList();
   }
 
@@ -409,7 +579,7 @@
   }
 
   function copyValidation() {
-    const rows = document.querySelectorAll('.cat-tb-issue-row');
+    const rows = document.querySelectorAll('#cat-tb-tab-validate .cat-tb-issue-row');
     if (rows.length === 0) {
       document.getElementById('cat-tb-status').textContent = '⚠ 복사할 검수 결과가 없습니다.';
       return;
@@ -425,13 +595,27 @@
     });
   }
 
-  function escapeHtml(str) {
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  function copyQA() {
+    const rows = document.querySelectorAll('#cat-tb-tab-qa .cat-tb-issue-row');
+    if (rows.length === 0) {
+      document.getElementById('cat-tb-status').textContent = '⚠ 복사할 QA 결과가 없습니다.';
+      return;
+    }
+    let text = '세그먼트\t유형\t상세\n';
+    rows.forEach(row => {
+      const cells = row.querySelectorAll('td');
+      text += `${cells[0].textContent}\t${cells[1].textContent}\t${cells[2].textContent}\n`;
+    });
+    navigator.clipboard.writeText(text).then(() => {
+      document.getElementById('cat-tb-status').textContent =
+        `✅ ${rows.length}건 QA 결과가 클립보드에 복사되었습니다.`;
+    });
   }
 
-  console.log('[TB 도구] v3.1 로드 완료');
-  console.log('  Alt+B → TB 도구 팝업 열기/닫기 (목록 + 검수)');
-  console.log('  헤더 제목 클릭 → 접기/펼치기');
-  console.log('  헤더 드래그 → 위치 이동');
-  console.log('  검수 항목 클릭 → 세그먼트 이동 + TB 번역어 클립보드 복사');
+  // ═══════════════════════════════════════
+  //  로드 완료
+  // ═══════════════════════════════════════
+
+  console.log(`${LOG_PREFIX} v4.0 로드 완료`);
+  console.log('  Alt+B → TB/QA 도구 팝업 열기/닫기 (목록 + TB검수 + QA)');
 })();
