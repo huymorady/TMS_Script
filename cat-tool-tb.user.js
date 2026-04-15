@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - TB 도구
 // @namespace    http://tampermonkey.net/
-// @version      4.2
+// @version      4.3
 // @description  Alt+B → TB 목록/검수/QA 팝업 (상수 정의, 공통 함수, 접기/드래그)
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-tb.user.js
@@ -51,9 +51,6 @@
     ['『', '』'],
   ];
 
-  // 반복 문자 패턴 (한글 2자 이상 반복)
-  const REPEAT_PATTERN = /(.{2,})\1/g;
-
   // QA 오류 유형 라벨
   const QA_LABELS = {
     UNTRANSLATED: '미번역',
@@ -83,9 +80,12 @@
     setTimeout(() => {
       textarea.focus();
       textarea.click();
-      // 문제 위치 하이라이트 (선택)
+      // 문제 위치 하이라이트 — click 후 웹앱이 포커스를 잡은 뒤 다시 선택
       if (selectStart !== undefined && selectEnd !== undefined) {
-        textarea.setSelectionRange(selectStart, selectEnd);
+        setTimeout(() => {
+          textarea.focus();
+          textarea.setSelectionRange(selectStart, selectEnd);
+        }, 150);
       }
     }, 300);
   }
@@ -110,13 +110,16 @@
     document.addEventListener('mouseup', () => { dragging = false; });
   }
 
-  /** 원문/번역문 쌍 배열 가져오기 */
+  /** 원문/번역문 쌍 배열 가져오기 (같은 행에서 짝을 맞춤) */
   function getSegmentPairs() {
     const origins = document.querySelectorAll(SEL.ORIGIN);
     const textareas = document.querySelectorAll(SEL.TEXTAREA);
     const pairs = [];
-    const count = Math.min(origins.length, textareas.length);
+
+    // textarea 개수 기준으로 매칭 (origin이 더 많을 수 있음)
+    const count = textareas.length;
     for (let i = 0; i < count; i++) {
+      if (i >= origins.length) break;
       pairs.push({
         index: i,
         segNum: i + 1,
@@ -447,17 +450,30 @@
         issues.push({ ...seg, type: QA_LABELS.CONSECUTIVE_SPACE, detail: '연속 공백이 포함되어 있습니다.', selectStart: consMatch.index, selectEnd: consMatch.index + consMatch[0].length });
       }
 
-      // 6. 숫자 불일치 (태그 내부 숫자 제외)
+      // 6. 숫자 불일치 (태그 내부 숫자 제외, 빈도 기반 비교)
       const srcNums = extractNumbers(src);
       const tgtNums = extractNumbers(tgt);
-      if (srcNums.join(',') !== tgtNums.join(',')) {
-        const missing = srcNums.filter(n => !tgtNums.includes(n));
-        const extra = tgtNums.filter(n => !srcNums.includes(n));
-        let detail = '';
-        if (missing.length) detail += `누락: ${missing.join(', ')}`;
-        if (extra.length) detail += `${detail ? ' / ' : ''}추가: ${extra.join(', ')}`;
-        if (!detail) detail = `원문: [${srcNums.join(', ')}] → 번역문: [${tgtNums.join(', ')}]`;
-        issues.push({ ...seg, type: QA_LABELS.NUMBER_MISMATCH, detail });
+
+      // 빈도 맵 생성
+      const srcFreq = {};
+      const tgtFreq = {};
+      for (const n of srcNums) srcFreq[n] = (srcFreq[n] || 0) + 1;
+      for (const n of tgtNums) tgtFreq[n] = (tgtFreq[n] || 0) + 1;
+
+      const allKeys = new Set([...Object.keys(srcFreq), ...Object.keys(tgtFreq)]);
+      const diffs = [];
+      for (const key of allKeys) {
+        const sCount = srcFreq[key] || 0;
+        const tCount = tgtFreq[key] || 0;
+        if (sCount !== tCount) {
+          if (tCount === 0) diffs.push(`"${key}" 누락`);
+          else if (sCount === 0) diffs.push(`"${key}" 추가됨`);
+          else diffs.push(`"${key}" 원문${sCount}개→번역문${tCount}개`);
+        }
+      }
+
+      if (diffs.length > 0) {
+        issues.push({ ...seg, type: QA_LABELS.NUMBER_MISMATCH, detail: diffs.join(', ') });
       }
 
       // 7. 괄호 짝 불일치
@@ -505,17 +521,18 @@
         });
       }
 
-      // 11. 반복 문자
-      const repeatMatch = REPEAT_PATTERN.exec(tgt);
-      REPEAT_PATTERN.lastIndex = 0; // 정규식 상태 초기화
-      if (repeatMatch) {
-        const r = repeatMatch[0];
-        if (!TAG_PATTERN.test(r) && r.length <= 10) {
+      // 11. 반복 문자 (한글 오타성 반복: 합니다다, 을을, 는는 등)
+      const repeatRegex = /([가-힣]{1,4})\1/g;
+      let repMatch;
+      while ((repMatch = repeatRegex.exec(tgt)) !== null) {
+        const repeated = repMatch[1];
+        // 의도적 반복 제외 (예: 하하, 빙빙, 각각, 점점, 반반 등 1글자 반복은 의도적일 수 있음)
+        if (repeated.length >= 2) {
           issues.push({
             ...seg, type: QA_LABELS.REPEAT_CHAR,
-            detail: `반복: "${r}"`,
-            selectStart: repeatMatch.index,
-            selectEnd: repeatMatch.index + r.length,
+            detail: `"${repeated}" 반복됨 → "${repMatch[0]}"`,
+            selectStart: repMatch.index,
+            selectEnd: repMatch.index + repMatch[0].length,
           });
         }
       }
@@ -628,6 +645,6 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v4.2 로드 완료`);
+  console.log(`${LOG_PREFIX} v4.3 로드 완료`);
   console.log('  Alt+B → TB/QA 도구 팝업 열기/닫기 (목록 + TB검수 + QA)');
 })();
