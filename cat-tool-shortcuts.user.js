@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      6.2
+// @version      6.3
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/사전/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 / Alt+H → 도움말
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -545,21 +545,32 @@
   function clickCatCheckButton(n) {
     console.log(`${LOG_PREFIX} CAT 목록 ${n}번 체크 버튼 클릭 시도`);
 
-    // #resultList 내의 tbody에서 td.!px-[2px] 안의 default-type 버튼만 수집
     const container = document.getElementById('resultList');
     if (!container) {
       console.log(`${LOG_PREFIX} CAT 목록(#resultList)을 찾지 못했습니다.`);
       return;
     }
 
-    const checkButtons = container.querySelectorAll(SEL.CAT_CHECK_BTN);
+    // 각 행의 td.!px-[2px] 안에서 마지막 n-button--default-type 버튼을 수집
+    // (X 버튼이 첫 번째, 체크/적용 버튼이 마지막에 위치)
+    const actionCells = container.querySelectorAll('tbody td.\\!px-\\[2px\\]');
+    const checkButtons = [];
+
+    for (const td of actionCells) {
+      const defaultBtns = td.querySelectorAll('button.n-button--default-type');
+      if (defaultBtns.length > 0) {
+        checkButtons.push(defaultBtns[defaultBtns.length - 1]); // 마지막 default-type 버튼
+      }
+    }
 
     if (checkButtons.length === 0) {
       console.log(`${LOG_PREFIX} 체크 버튼을 찾지 못했습니다.`);
+      showToast('⚠ 체크 버튼을 찾지 못했습니다.');
       return;
     }
     if (n > checkButtons.length) {
       console.log(`${LOG_PREFIX} ${n}번 체크 버튼이 없습니다. (총 ${checkButtons.length}개)`);
+      showToast(`⚠ ${n}번 항목이 없습니다. (총 ${checkButtons.length}개)`);
       return;
     }
 
@@ -855,7 +866,7 @@
   //  로드 완료 로그
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v6.2 로드 완료`);
+  console.log(`${LOG_PREFIX} v6.3 로드 완료`);
   console.log('  Alt+`       → TB 추가 (드래그 필수)');
   console.log('  Alt+1       → 드래그 O: TM 검색 / 드래그 X: CAT 1번 체크');
   console.log('  Alt+2       → 드래그 O: 중국어 사전 / 드래그 X: CAT 2번 체크');
