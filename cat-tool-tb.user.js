@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - TB 도구
 // @namespace    http://tampermonkey.net/
-// @version      4.1
+// @version      4.2
 // @description  Alt+B → TB 목록/검수/QA 팝업 (상수 정의, 공통 함수, 접기/드래그)
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-tb.user.js
@@ -21,9 +21,9 @@
 
   // DOM 셀렉터
   const SEL = {
-    ORIGIN: '.origin_string',
+    ORIGIN: 'div.origin_string[data-type="origin_string"]',
     TEXTAREA: 'textarea.n-input__textarea-el',
-    TB_SPAN: '.origin_string span.vb[data-tooltip]',
+    TB_SPAN: 'div.origin_string[data-type="origin_string"] span.vb[data-tooltip]',
   };
 
   // 태그 추출 정규식 (단축키 스크립트와 동일)
@@ -77,10 +77,17 @@
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  /** 세그먼트로 스크롤 이동 + 포커스 */
-  function navigateToSegment(originEl, textarea) {
+  /** 세그먼트로 스크롤 이동 + 포커스 + 선택적 텍스트 하이라이트 */
+  function navigateToSegment(originEl, textarea, selectStart, selectEnd) {
     originEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    setTimeout(() => { textarea.focus(); textarea.click(); }, 300);
+    setTimeout(() => {
+      textarea.focus();
+      textarea.click();
+      // 문제 위치 하이라이트 (선택)
+      if (selectStart !== undefined && selectEnd !== undefined) {
+        textarea.setSelectionRange(selectStart, selectEnd);
+      }
+    }, 300);
   }
 
   /** 드래그 가능 패널 설정 */
@@ -424,17 +431,20 @@
 
       // 3. 앞 공백
       if (tgt !== tgt.trimStart()) {
-        issues.push({ ...seg, type: QA_LABELS.LEADING_SPACE, detail: '번역문 앞에 불필요한 공백이 있습니다.' });
+        const spaceLen = tgt.length - tgt.trimStart().length;
+        issues.push({ ...seg, type: QA_LABELS.LEADING_SPACE, detail: '번역문 앞에 불필요한 공백이 있습니다.', selectStart: 0, selectEnd: spaceLen });
       }
 
       // 4. 뒤 공백
       if (tgt !== tgt.trimEnd()) {
-        issues.push({ ...seg, type: QA_LABELS.TRAILING_SPACE, detail: '번역문 뒤에 불필요한 공백이 있습니다.' });
+        const trimmed = tgt.trimEnd();
+        issues.push({ ...seg, type: QA_LABELS.TRAILING_SPACE, detail: '번역문 뒤에 불필요한 공백이 있습니다.', selectStart: trimmed.length, selectEnd: tgt.length });
       }
 
       // 5. 연속 공백 (줄바꿈 제외한 공백이 2개 이상)
-      if (/[^\S\n]{2,}/.test(tgt)) {
-        issues.push({ ...seg, type: QA_LABELS.CONSECUTIVE_SPACE, detail: '연속 공백이 포함되어 있습니다.' });
+      const consMatch = /[^\S\n]{2,}/.exec(tgt);
+      if (consMatch) {
+        issues.push({ ...seg, type: QA_LABELS.CONSECUTIVE_SPACE, detail: '연속 공백이 포함되어 있습니다.', selectStart: consMatch.index, selectEnd: consMatch.index + consMatch[0].length });
       }
 
       // 6. 숫자 불일치 (태그 내부 숫자 제외)
@@ -496,14 +506,16 @@
       }
 
       // 11. 반복 문자
-      const repeats = tgt.match(REPEAT_PATTERN);
-      if (repeats) {
-        // 태그나 의도적 반복이 아닌 것만 필터
-        const realRepeats = repeats.filter(r => !TAG_PATTERN.test(r) && r.length <= 10);
-        if (realRepeats.length > 0) {
+      const repeatMatch = REPEAT_PATTERN.exec(tgt);
+      REPEAT_PATTERN.lastIndex = 0; // 정규식 상태 초기화
+      if (repeatMatch) {
+        const r = repeatMatch[0];
+        if (!TAG_PATTERN.test(r) && r.length <= 10) {
           issues.push({
             ...seg, type: QA_LABELS.REPEAT_CHAR,
-            detail: `반복: "${realRepeats.join('", "')}"`,
+            detail: `반복: "${r}"`,
+            selectStart: repeatMatch.index,
+            selectEnd: repeatMatch.index + r.length,
           });
         }
       }
@@ -537,11 +549,11 @@
     html += '</table>';
     contentEl.innerHTML = html;
 
-    // 클릭 시 세그먼트 이동
+    // 클릭 시 세그먼트 이동 + 문제 위치 하이라이트
     contentEl.querySelectorAll('.cat-tb-issue-row').forEach(row => {
       row.addEventListener('click', () => {
         const issue = issues[parseInt(row.dataset.qaIdx)];
-        navigateToSegment(issue.originEl, issue.textarea);
+        navigateToSegment(issue.originEl, issue.textarea, issue.selectStart, issue.selectEnd);
         row.classList.add('cat-tb-copied-flash');
         setTimeout(() => row.classList.remove('cat-tb-copied-flash'), 600);
       });
@@ -616,6 +628,6 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v4.1 로드 완료`);
+  console.log(`${LOG_PREFIX} v4.2 로드 완료`);
   console.log('  Alt+B → TB/QA 도구 팝업 열기/닫기 (목록 + TB검수 + QA)');
 })();
