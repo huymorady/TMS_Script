@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - TB 도구
 // @namespace    http://tampermonkey.net/
-// @version      4.4
+// @version      4.5
 // @description  Alt+B → TB 목록/검수/QA 팝업 (14개 QA 체크 항목, 접기/드래그)
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-tb.user.js
@@ -53,8 +53,8 @@
 
   // 따옴표 짝 정의
   const QUOTE_PAIRS = [
-    ['"', '"'],
-    [''', '''],
+    ['\u201C', '\u201D'],  // " "
+    ['\u2018', '\u2019'],  // ' '
     ['「', '」'],
     ['『', '』'],
   ];
@@ -710,6 +710,6 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v4.4 로드 완료`);
+  console.log(`${LOG_PREFIX} v4.5 로드 완료`);
   console.log('  Alt+B → TB/QA 도구 팝업 열기/닫기 (목록 + TB검수 + QA)');
 })();
