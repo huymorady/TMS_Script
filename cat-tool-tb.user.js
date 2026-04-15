@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CAT Tool - TB 도구
 // @namespace    http://tampermonkey.net/
-// @version      4.3
-// @description  Alt+B → TB 목록/검수/QA 팝업 (상수 정의, 공통 함수, 접기/드래그)
+// @version      4.4
+// @description  Alt+B → TB 목록/검수/QA 팝업 (14개 QA 체크 항목, 접기/드래그)
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-tb.user.js
 // @downloadURL  https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-tb.user.js
@@ -51,6 +51,14 @@
     ['『', '』'],
   ];
 
+  // 따옴표 짝 정의
+  const QUOTE_PAIRS = [
+    ['"', '"'],
+    [''', '''],
+    ['「', '」'],
+    ['『', '』'],
+  ];
+
   // QA 오류 유형 라벨
   const QA_LABELS = {
     UNTRANSLATED: '미번역',
@@ -60,10 +68,13 @@
     CONSECUTIVE_SPACE: '연속 공백',
     NUMBER_MISMATCH: '숫자 불일치',
     BRACKET_MISMATCH: '괄호 불일치',
+    QUOTE_MISMATCH: '따옴표 불일치',
     TAG_MISMATCH: '태그 불일치',
+    TAG_ORDER: '태그 순서',
     NEWLINE_MISMATCH: '줄바꿈 불일치',
     PERIOD_MISMATCH: '마침표 불일치',
     REPEAT_CHAR: '반복 문자',
+    PLACEHOLDER_SPACE: '플레이스홀더 공백',
   };
 
   // ═══════════════════════════════════════
@@ -488,20 +499,48 @@
         }
       }
 
-      // 8. 태그 불일치
+      // 8. 따옴표 짝 불일치
+      for (const [open, close] of QUOTE_PAIRS) {
+        if (open === close) continue; // 같은 문자 쌍은 건너뛰기
+        const openCount = (tgt.match(new RegExp(open.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+        const closeCount = (tgt.match(new RegExp(close.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+        if (openCount !== closeCount) {
+          issues.push({
+            ...seg, type: QA_LABELS.QUOTE_MISMATCH,
+            detail: `${open}${close} 짝 불일치: ${open}=${openCount}개, ${close}=${closeCount}개`,
+          });
+        }
+      }
+
+      // 9. 태그 개수 불일치
       const srcTags = extractTags(src);
       const tgtTags = extractTags(tgt);
-      if (srcTags.join(',') !== tgtTags.join(',')) {
-        const missingTags = srcTags.filter(t => !tgtTags.includes(t));
-        const extraTags = tgtTags.filter(t => !srcTags.includes(t));
+      const srcTagsSorted = [...srcTags].sort();
+      const tgtTagsSorted = [...tgtTags].sort();
+      if (srcTagsSorted.join(',') !== tgtTagsSorted.join(',')) {
+        const missingTags = [...srcTagsSorted];
+        const extraTags = [...tgtTagsSorted];
+        // 빈도 기반 차이 계산
+        for (const t of srcTagsSorted) {
+          const idx = extraTags.indexOf(t);
+          if (idx >= 0) { extraTags.splice(idx, 1); missingTags.splice(missingTags.indexOf(t), 1); }
+        }
         let detail = '';
         if (missingTags.length) detail += `누락: ${missingTags.join(', ')}`;
         if (extraTags.length) detail += `${detail ? ' / ' : ''}추가: ${extraTags.join(', ')}`;
-        if (!detail) detail = '태그 순서 또는 개수가 다릅니다.';
+        if (!detail) detail = '태그 개수가 다릅니다.';
         issues.push({ ...seg, type: QA_LABELS.TAG_MISMATCH, detail });
       }
 
-      // 9. 줄바꿈 개수 불일치
+      // 10. 태그 순서 불일치 (개수는 같지만 순서가 다른 경우)
+      if (srcTagsSorted.join(',') === tgtTagsSorted.join(',') && srcTags.join(',') !== tgtTags.join(',')) {
+        issues.push({
+          ...seg, type: QA_LABELS.TAG_ORDER,
+          detail: `원문: ${srcTags.join(' ')} → 번역문: ${tgtTags.join(' ')}`,
+        });
+      }
+
+      // 11. 줄바꿈 개수 불일치
       const srcNewlines = countNewlines(src);
       const tgtNewlines = countNewlines(tgt);
       if (srcNewlines !== tgtNewlines) {
@@ -511,7 +550,7 @@
         });
       }
 
-      // 10. 문장 끝 마침표 불일치
+      // 12. 문장 끝 마침표 불일치
       const srcEndsWithPeriod = /[。.]\s*$/.test(src);
       const tgtEndsWithPeriod = /[。.]\s*$/.test(tgt);
       if (srcEndsWithPeriod !== tgtEndsWithPeriod) {
@@ -521,18 +560,44 @@
         });
       }
 
-      // 11. 반복 문자 (한글 오타성 반복: 합니다다, 을을, 는는 등)
+      // 13. 반복 문자 (한글 1글자 이상 반복)
       const repeatRegex = /([가-힣]{1,4})\1/g;
       let repMatch;
       while ((repMatch = repeatRegex.exec(tgt)) !== null) {
-        const repeated = repMatch[1];
-        // 의도적 반복 제외 (예: 하하, 빙빙, 각각, 점점, 반반 등 1글자 반복은 의도적일 수 있음)
-        if (repeated.length >= 2) {
+        issues.push({
+          ...seg, type: QA_LABELS.REPEAT_CHAR,
+          detail: `"${repMatch[1]}" 반복 → "${repMatch[0]}"`,
+          selectStart: repMatch.index,
+          selectEnd: repMatch.index + repMatch[0].length,
+        });
+      }
+
+      // 14. 플레이스홀더 앞뒤 공백 불일치
+      const placeholderPattern = /\{[^}]+\}|%[sd]|%\d+\$[sd]/g;
+      let phMatch;
+      while ((phMatch = placeholderPattern.exec(src)) !== null) {
+        const ph = phMatch[0];
+        const phIdx = tgt.indexOf(ph);
+        if (phIdx < 0) continue; // 태그 누락은 별도 체크
+
+        // 원문에서 플레이스홀더 앞뒤 공백 확인
+        const srcBefore = phMatch.index > 0 ? src[phMatch.index - 1] === ' ' : false;
+        const srcAfter = phMatch.index + ph.length < src.length ? src[phMatch.index + ph.length] === ' ' : false;
+
+        // 번역문에서 플레이스홀더 앞뒤 공백 확인
+        const tgtBefore = phIdx > 0 ? tgt[phIdx - 1] === ' ' : false;
+        const tgtAfter = phIdx + ph.length < tgt.length ? tgt[phIdx + ph.length] === ' ' : false;
+
+        const diffs = [];
+        if (srcBefore !== tgtBefore) diffs.push(`앞 공백 ${srcBefore ? '있음→없음' : '없음→있음'}`);
+        if (srcAfter !== tgtAfter) diffs.push(`뒤 공백 ${srcAfter ? '있음→없음' : '없음→있음'}`);
+
+        if (diffs.length > 0) {
           issues.push({
-            ...seg, type: QA_LABELS.REPEAT_CHAR,
-            detail: `"${repeated}" 반복됨 → "${repMatch[0]}"`,
-            selectStart: repMatch.index,
-            selectEnd: repMatch.index + repMatch[0].length,
+            ...seg, type: QA_LABELS.PLACEHOLDER_SPACE,
+            detail: `${ph}: ${diffs.join(', ')}`,
+            selectStart: phIdx,
+            selectEnd: phIdx + ph.length,
           });
         }
       }
@@ -645,6 +710,6 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v4.3 로드 완료`);
+  console.log(`${LOG_PREFIX} v4.4 로드 완료`);
   console.log('  Alt+B → TB/QA 도구 팝업 열기/닫기 (목록 + TB검수 + QA)');
 })();
