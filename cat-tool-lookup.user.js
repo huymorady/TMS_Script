@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 번역 조회 팝업
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Alt+Q → 팝업 열기/닫기 / Alt+W → 현재 세그먼트 매칭 삽입 / Alt+Shift+W → 전체 세그먼트 일괄 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-lookup.user.js
@@ -264,8 +264,10 @@
       if (cells.some(c => /^[-:]+$/.test(c))) continue;
 
       if (cells.length > Math.max(srcIdx, tgtIdx)) {
-        const source = cells[srcIdx];
-        const target = cells[tgtIdx];
+        // 앞뒤 따옴표 제거 ("..." 또는 '...')
+        const stripQuotes = (s) => s.replace(/^["']|["']$/g, '');
+        const source = stripQuotes(cells[srcIdx]);
+        const target = stripQuotes(cells[tgtIdx]);
 
         if (source && target) {
           newData[source] = target;
@@ -499,7 +501,7 @@
     textarea.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  console.log('[번역 조회] v1.7 로드 완료');
+  console.log('[번역 조회] v1.8 로드 완료');
   console.log('  Alt+Q       → 팝업 열기/닫기');
   console.log('  Alt+W       → 현재 세그먼트 매칭 삽입');
   console.log('  Alt+Shift+W → 전체 세그먼트 일괄 삽입');
