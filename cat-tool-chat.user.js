@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.2.1
+// @version      0.3.3
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @run-at       document-end
@@ -21,6 +21,8 @@
         MODEL: 'tms_workflow_model_v1',
         MODAL_POS: 'tms_workflow_modal_pos_v1',
         MODAL_SIZE: 'tms_workflow_modal_size_v1',
+        BATCH_RUNS: 'tms_workflow_batch_runs_v1',
+        ACTIVE_BATCH_RUN: 'tms_workflow_active_batch_run_v1',
     };
 
     const DEFAULT_PROMPT = {
@@ -34,6 +36,28 @@
     // 세션 관리 설정
     const SESSION_TTL_DAYS = 30;        // 30일 지난 세션은 자동 삭제
     const SESSION_CHECK_INTERVAL = 500; // ms, 세그먼트 변경 감지 폴링 주기
+    const BATCH_DEFAULT_PAGE_SIZE = 50;
+    const BATCH_POLL_INTERVAL_MS = 5000;
+    const BATCH_MAX_POLL_ATTEMPTS = 90;
+    const BATCH_RESULT_RETRY_INTERVAL_MS = 2000;
+    const BATCH_RESULT_RETRY_ATTEMPTS = 30;
+    const BATCH_STATUS_LABELS = {
+        idle: '대기 중',
+        collecting: '수집 중',
+        ready: '수집 완료',
+        phase12_running: 'Phase 1+2 실행 중',
+        phase12_ready: 'Phase 1+2 완료',
+        phase3_running: 'Phase 3 실행 중',
+        phase3_ready: 'Phase 3 완료',
+        phase45_running: 'Phase 4+5 실행 중',
+        phase45_ready: 'Phase 4+5 완료',
+        reviewing: '검토 중',
+        apply_ready: '적용 대기',
+        failed: '오류',
+        stale: '저장본 불일치',
+        bedrock_timeout: 'Bedrock timeout',
+        model_endpoint_error: '모델 엔드포인트 오류',
+    };
 
     // 번역 입력창 셀렉터 후보 (TMS UI에 맞게 여러 패턴 시도)
     // 현재 포커스 된 textarea를 "번역 입력창"으로 간주하는 정책
@@ -76,7 +100,17 @@
             languageId: p.get('languageId'),
             projectName: p.get('projectName'),
             fileName: p.get('fileName'),
+            page: p.get('page') || '1',
+            pageSize: p.get('pageSize') || p.get('page_size') || String(BATCH_DEFAULT_PAGE_SIZE),
         };
+    }
+
+    function parseRequiredInt(value, label) {
+        const n = parseInt(value, 10);
+        if (!Number.isFinite(n)) {
+            throw new Error(`${label} 값을 URL에서 확인하지 못했습니다.`);
+        }
+        return n;
     }
 
     function lsGet(key, def = null) {
@@ -146,12 +180,13 @@
     }
 
     async function callPrefixPromptTran(projectId, stringId, prefixPrompt, model) {
+        const languageId = parseRequiredInt(getUrlParams().languageId, 'languageId');
         const data = await apiJson(
             `/api/translate/projects/${projectId}/prefix_prompt_tran/`,
             {
                 method: 'POST',
                 body: JSON.stringify({
-                    language_id_list: [parseInt(getUrlParams().languageId, 10)],
+                    language_id_list: [languageId],
                     string_id_list: [parseInt(stringId, 10)],
                     prefix_prompt: prefixPrompt,
                     is_associated: true,
@@ -180,36 +215,419 @@
     }
 
     // ========================================================================
+    // Batch compact workflow helpers
+    // ========================================================================
+    function normalizeSegmentListResponse(listData) {
+        const payload = listData?.data;
+
+        if (Array.isArray(payload)) {
+            return {
+                segments: payload,
+                meta: { shape: 'data[]', count: payload.length },
+            };
+        }
+
+        if (payload && typeof payload === 'object') {
+            const items = Array.isArray(payload.items)
+                ? payload.items
+                : Array.isArray(payload.results)
+                    ? payload.results
+                    : [];
+            return {
+                segments: items,
+                meta: {
+                    shape: Array.isArray(payload.items)
+                        ? 'data.items[]'
+                        : Array.isArray(payload.results)
+                            ? 'data.results[]'
+                            : 'data{}',
+                    count: payload.count ?? items.length,
+                    page: payload.page,
+                    totalPage: payload.total_page,
+                },
+            };
+        }
+
+        return {
+            segments: [],
+            meta: { shape: typeof payload, count: 0 },
+        };
+    }
+
+    function normalizeId(id) {
+        const n = Number(id);
+        return Number.isFinite(n) ? n : id;
+    }
+
+    function analyzeIdCoverage(expectedIds, actualIds) {
+        const expected = expectedIds.map(normalizeId);
+        const actual = actualIds.map(normalizeId);
+        const expectedSet = new Set(expected);
+        const actualSet = new Set(actual);
+        const seen = new Set();
+        const duplicates = [];
+
+        for (const id of actual) {
+            if (seen.has(id) && !duplicates.includes(id)) duplicates.push(id);
+            seen.add(id);
+        }
+
+        return {
+            ok: expected.length === actual.length &&
+                expected.every(id => actualSet.has(id)) &&
+                actual.every(id => expectedSet.has(id)) &&
+                duplicates.length === 0,
+            missing: expected.filter(id => !actualSet.has(id)),
+            extra: actual.filter(id => !expectedSet.has(id)),
+            duplicates,
+            expectedCount: expected.length,
+            actualCount: actual.length,
+        };
+    }
+
+    function extractPlaceholders(text) {
+        return Array.from(new Set(String(text || '').match(/\{[^{}]+\}|%[@sd]/g) || []));
+    }
+
+    function stripCodeFence(text) {
+        return String(text || '')
+            .trim()
+            .replace(/^```json\s*/i, '')
+            .replace(/^```\s*/i, '')
+            .replace(/\s*```\s*$/i, '')
+            .trim();
+    }
+
+    function parseWorkflowJson(rawText, expectedPhase) {
+        const cleaned = stripCodeFence(rawText);
+        const parsed = JSON.parse(cleaned);
+        if (expectedPhase && parsed.phase !== expectedPhase) {
+            throw new Error(`phase 불일치: 기대=${expectedPhase}, 실제=${parsed.phase}`);
+        }
+        return parsed;
+    }
+
+    function getJsonErrorContext(text, error) {
+        const message = error?.message || '';
+        const match = message.match(/position\s+(\d+)/i);
+        if (!match) {
+            return { message, position: null, before: '', after: '' };
+        }
+
+        const position = Number(match[1]);
+        return {
+            message,
+            position,
+            before: text.slice(Math.max(0, position - 140), position),
+            after: text.slice(position, position + 140),
+        };
+    }
+
+    function inspectSavedJson(rawText, expectedPhase) {
+        const cleaned = stripCodeFence(rawText);
+        try {
+            const parsed = parseWorkflowJson(cleaned, expectedPhase);
+            return { ok: true, cleaned, parsed };
+        } catch (error) {
+            return {
+                ok: false,
+                cleaned,
+                error,
+                context: getJsonErrorContext(cleaned, error),
+            };
+        }
+    }
+
+    function classifySavedResult(rawText) {
+        const text = String(rawText || '');
+        if (/Read timeout/i.test(text) && /bedrock-runtime/i.test(text)) {
+            return {
+                type: 'BEDROCK_READ_TIMEOUT',
+                message: 'Bedrock 모델 호출이 TMS 백엔드의 대기 시간 안에 끝나지 않았습니다.',
+            };
+        }
+        if (/endpoint URL/i.test(text) && /invoke/i.test(text)) {
+            return {
+                type: 'MODEL_ENDPOINT_ERROR',
+                message: '모델 엔드포인트 호출 오류 문자열이 결과 칸에 저장되었습니다.',
+            };
+        }
+        return null;
+    }
+
+    function makeWorkflowError(message, code) {
+        const error = new Error(message);
+        error.workflowCode = code;
+        return error;
+    }
+
+    function validatePhase12Compact(phase12Compact, segmentSource) {
+        const expectedIds = segmentSource.map(seg => normalizeId(seg.id));
+        const groups = Array.isArray(phase12Compact?.groups) ? phase12Compact.groups : [];
+        const groupedIds = groups.flatMap(group => Array.isArray(group.ids) ? group.ids.map(normalizeId) : []);
+        const coverage = analyzeIdCoverage(expectedIds, groupedIds);
+        const invalidGroups = groups
+            .map((group, index) => ({ group, index }))
+            .filter(({ group }) =>
+                !group.gid ||
+                !Array.isArray(group.ids) ||
+                !Array.isArray(group.rules)
+            )
+            .map(({ group, index }) => ({ index, gid: group.gid || null }));
+
+        return {
+            ok: phase12Compact?.phase === '1+2' &&
+                groups.length > 0 &&
+                coverage.ok &&
+                invalidGroups.length === 0,
+            coverage,
+            invalidGroups,
+            groupsCount: groups.length,
+        };
+    }
+
+    function buildExpectedGroupMap(phase12Compact) {
+        const expectedGroupById = new Map();
+        for (const group of (phase12Compact?.groups || [])) {
+            for (const id of (group.ids || [])) {
+                expectedGroupById.set(normalizeId(id), group.gid);
+            }
+        }
+        return expectedGroupById;
+    }
+
+    function validatePhase3Compact(phase12Compact, phase3Compact, segmentSource) {
+        const expectedIds = segmentSource.map(seg => normalizeId(seg.id));
+        const expectedGroupById = buildExpectedGroupMap(phase12Compact);
+        const translations = Array.isArray(phase3Compact?.translations) ? phase3Compact.translations : [];
+        const actualIds = translations.map(item => normalizeId(item.id));
+        const coverage = analyzeIdCoverage(expectedIds, actualIds);
+
+        const wrongGroups = translations
+            .filter(item => expectedGroupById.get(normalizeId(item.id)) !== item.gid)
+            .map(item => ({
+                id: normalizeId(item.id),
+                expected: expectedGroupById.get(normalizeId(item.id)),
+                actual: item.gid,
+            }));
+
+        const sourceById = new Map(segmentSource.map(seg => [normalizeId(seg.id), seg]));
+        const invalidTranslationType = translations
+            .filter(item => typeof item.t !== 'string')
+            .map(item => normalizeId(item.id));
+
+        const emptyTranslations = translations
+            .filter(item => typeof item.t === 'string' && !item.t.trim())
+            .map(item => normalizeId(item.id));
+
+        const missingPlaceholders = [];
+        for (const item of translations) {
+            const src = sourceById.get(normalizeId(item.id))?.origin_string || '';
+            const placeholders = extractPlaceholders(src);
+            const translated = typeof item.t === 'string' ? item.t : '';
+            const missing = placeholders.filter(token => !translated.includes(token));
+            if (missing.length) {
+                missingPlaceholders.push({ id: normalizeId(item.id), missing });
+            }
+        }
+
+        const hanjaLike = translations
+            .filter(item => typeof item.t === 'string' && /[\u4e00-\u9fff]/.test(item.t))
+            .map(item => normalizeId(item.id));
+
+        return {
+            ok: phase3Compact?.phase === '3' &&
+                coverage.ok &&
+                wrongGroups.length === 0 &&
+                invalidTranslationType.length === 0 &&
+                emptyTranslations.length === 0 &&
+                missingPlaceholders.length === 0 &&
+                hanjaLike.length === 0,
+            coverage,
+            wrongGroups,
+            invalidTranslationType,
+            emptyTranslations,
+            missingPlaceholders,
+            hanjaLike,
+        };
+    }
+
+    function validatePhase45Compact(phase3Compact, phase45Compact, segmentSource) {
+        const translations = Array.isArray(phase3Compact?.translations) ? phase3Compact.translations : [];
+        const expectedIds = translations.map(item => normalizeId(item.id));
+        const phase3ById = new Map(translations.map(item => [normalizeId(item.id), item]));
+        const revisions = Array.isArray(phase45Compact?.revisions) ? phase45Compact.revisions : [];
+        const actualIds = revisions.map(item => normalizeId(item.id));
+        const coverage = analyzeIdCoverage(expectedIds, actualIds);
+
+        const wrongGroups = revisions
+            .filter(item => phase3ById.get(normalizeId(item.id))?.gid !== item.gid)
+            .map(item => ({
+                id: normalizeId(item.id),
+                expected: phase3ById.get(normalizeId(item.id))?.gid,
+                actual: item.gid,
+            }));
+
+        const missingTField = revisions
+            .filter(item => !Object.prototype.hasOwnProperty.call(item, 't'))
+            .map(item => normalizeId(item.id));
+
+        const invalidTType = revisions
+            .filter(item => Object.prototype.hasOwnProperty.call(item, 't') && item.t !== null && typeof item.t !== 'string')
+            .map(item => normalizeId(item.id));
+
+        const invalidReasons = revisions
+            .filter(item => !Array.isArray(item.r) || (typeof item.t === 'string' && item.r.length === 0))
+            .map(item => normalizeId(item.id));
+
+        const finalTextById = new Map();
+        const emptyFinals = [];
+        for (const item of revisions) {
+            const id = normalizeId(item.id);
+            const phase3Text = phase3ById.get(id)?.t || '';
+            const finalText = item.t === null ? phase3Text : (typeof item.t === 'string' ? item.t : '');
+            finalTextById.set(id, finalText);
+            if (!finalText.trim()) emptyFinals.push(id);
+        }
+
+        const sourceById = new Map(segmentSource.map(seg => [normalizeId(seg.id), seg]));
+        const missingPlaceholders = [];
+        for (const item of revisions) {
+            const id = normalizeId(item.id);
+            const src = sourceById.get(id)?.origin_string || '';
+            const placeholders = extractPlaceholders(src);
+            const finalText = finalTextById.get(id) || '';
+            const missing = placeholders.filter(token => !finalText.includes(token));
+            if (missing.length) {
+                missingPlaceholders.push({ id, missing });
+            }
+        }
+
+        const hanjaLike = revisions
+            .filter(item => /[\u4e00-\u9fff]/.test(finalTextById.get(normalizeId(item.id)) || ''))
+            .map(item => normalizeId(item.id));
+
+        const changedCount = revisions.filter(item => item.t !== null).length;
+
+        return {
+            ok: phase45Compact?.phase === '4+5' &&
+                coverage.ok &&
+                wrongGroups.length === 0 &&
+                missingTField.length === 0 &&
+                invalidTType.length === 0 &&
+                invalidReasons.length === 0 &&
+                emptyFinals.length === 0 &&
+                missingPlaceholders.length === 0 &&
+                hanjaLike.length === 0,
+            coverage,
+            wrongGroups,
+            missingTField,
+            invalidTType,
+            invalidReasons,
+            emptyFinals,
+            missingPlaceholders,
+            hanjaLike,
+            changedCount,
+        };
+    }
+
+    function extractVisibleTbTerms() {
+        const terms = new Map();
+        const spans = document.querySelectorAll('div.origin_string[data-type="origin_string"] span.vb[data-tooltip]');
+        for (const span of spans) {
+            const source = span.textContent?.trim();
+            const target = span.getAttribute('data-tooltip')?.trim();
+            if (source && target) terms.set(source, target);
+        }
+        return terms;
+    }
+
+    function extractBatchApiTerms(segments) {
+        const terms = new Map();
+        for (const seg of (segments || [])) {
+            for (const term of (seg.match_terms || [])) {
+                const source = term.trans?.['zh-Hans'] || term.trans?.zh || '';
+                const target = term.trans?.ko || '';
+                if (source && target) terms.set(source, target);
+            }
+        }
+        return terms;
+    }
+
+    function buildBatchTbSummary(segments) {
+        const merged = new Map();
+        for (const [source, target] of extractBatchApiTerms(segments)) merged.set(source, target);
+        for (const [source, target] of extractVisibleTbTerms()) merged.set(source, target);
+        return Array.from(merged.entries())
+            .sort((a, b) => a[0].localeCompare(b[0], 'zh-Hans'))
+            .map(([source, target]) => ({ source, target }));
+    }
+
+    function formatBatchTbSummary(tbSummary) {
+        if (!tbSummary?.length) return '';
+        const lines = tbSummary.map(term => `- ${term.source} → ${term.target}`);
+        return [
+            '# 파일 전체 TB 용어',
+            '아래 TB 용어는 현재 배치 전체에서 반드시 동일하게 적용하세요.',
+            ...lines,
+        ].join('\n');
+    }
+
+    // ========================================================================
     // 번역 입력창 탐색 & 값 주입 (SPA가 변경을 감지하도록)
     // ========================================================================
 
-    // 현재 활성/선택된 세그먼트 row의 번역 입력 textarea 찾기
-    // TMS는 Vue 기반으로 textarea가 동적으로 렌더됨. 여러 전략 시도.
+    // 현재 활성 세그먼트의 번역 입력 textarea 찾기
+    // TMS Naive UI 구조에 맞춤 (v0.3.0)
+    function findStringItemByStringId(stringId) {
+        const targetId = normalizeId(stringId);
+        return $$('.string-item')
+            .find(item => normalizeId(extractStringIdFromItem(item)) === targetId) || null;
+    }
+
+    function findTranslationTextareaInItem(item) {
+        if (!item) return null;
+        const preferred = item.querySelector('textarea[placeholder="请输入译文"]');
+        if (preferred && !preferred.readOnly && !preferred.disabled) return preferred;
+
+        return [...item.querySelectorAll('textarea')]
+            .find(ta => !ta.readOnly && !ta.disabled) || null;
+    }
+
+    function findTranslationTextareaForStringId(stringId) {
+        const item = findStringItemByStringId(stringId);
+        return findTranslationTextareaInItem(item);
+    }
+
     function findTranslationTextarea(stringId) {
-        // 전략 1: 힌트 셀렉터로 직접 찾기
-        for (const sel of TRANSLATION_TEXTAREA_HINTS) {
-            const el = document.querySelector(sel);
-            if (el && el.tagName === 'TEXTAREA') return el;
+        if (stringId) {
+            const explicitTextarea = findTranslationTextareaForStringId(stringId);
+            if (explicitTextarea) {
+                console.log(`[TMS-WF] #${stringId} string-item에서 번역 textarea 발견`);
+                return explicitTextarea;
+            }
         }
 
-        // 전략 2: 현재 포커스된 textarea (가장 확실)
+        // 1순위: 활성 string-item 내부의 번역 textarea
+        const activeItem = findActiveStringItem();
+        if (activeItem) {
+            // .info-row 안의 번역 textarea (우측 번역 패널)
+            const ta = findTranslationTextareaInItem(activeItem);
+            if (ta) {
+                console.log('[TMS-WF] 활성 string-item에서 번역 textarea 발견');
+                return ta;
+            }
+        }
+
+        // 2순위: 현재 포커스된 textarea (사용자가 방금 클릭한 것)
         const focused = document.activeElement;
         if (focused && focused.tagName === 'TEXTAREA' &&
-            !modalEl?.contains(focused)) {
+            !modalEl?.contains(focused) && !focused.readOnly && !focused.disabled) {
+            console.log('[TMS-WF] 포커스된 textarea 사용');
             return focused;
         }
 
-        // 전략 3: 화면에 보이는 textarea 중 원문이 아닌 것 (편집 가능한 것)
-        const allTextareas = document.querySelectorAll('textarea');
-        for (const ta of allTextareas) {
-            if (modalEl?.contains(ta)) continue; // 우리 모달 내부는 제외
-            if (ta.disabled || ta.readOnly) continue;
-            // 화면에 보이는지 확인
-            const rect = ta.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) continue;
-            return ta;
-        }
-
+        console.warn('[TMS-WF] 활성 번역 textarea를 찾지 못함');
         return null;
     }
 
@@ -224,6 +642,12 @@
         // 변경 이벤트 연쇄 발생 (프레임워크가 반응하도록)
         textarea.dispatchEvent(new Event('input', { bubbles: true }));
         textarea.dispatchEvent(new Event('change', { bubbles: true }));
+
+        // Vue Naive UI를 위한 추가 처리: 해당 textarea를 감싸는 wrapper에도 이벤트
+        const wrapper = textarea.closest('.n-input');
+        if (wrapper) {
+            wrapper.dispatchEvent(new Event('input', { bubbles: true }));
+        }
 
         // 포커스 이동 (사용자가 바로 편집할 수 있도록)
         textarea.focus();
@@ -377,41 +801,73 @@
         return prompts.find(p => p.id === id) || prompts[0];
     }
 
-    // ========================================================================
-    // 현재 세그먼트 ID 추출
-    // ========================================================================
-    function getCurrentStringId() {
-        // 전략 1: URL에서 active 세그먼트 힌트가 있으면 사용 (없는 듯)
-        // 전략 2: DOM에서 '선택된' 세그먼트 찾기
-        // TMS UI는 현재 선택된 세그먼트 row에 특정 클래스가 붙음.
-        // 일반적으로 'active' 또는 'selected' 혹은 hover 상태.
-        // 정확한 셀렉터는 기존 shortcuts 스크립트의 SEL 상수 참고.
+    function getSelectedModel() {
+        return $('.tw-model-select', modalEl)?.value || lsGet(LS_KEYS.MODEL, MODELS[0]);
+    }
 
-        // 전략 3: 현재 focus된 textarea(번역 입력)의 속성 추적
+    // ========================================================================
+    // 활성 세그먼트 식별 (TMS Naive UI 기반, API Logger 독립)
+    // ========================================================================
+    function findActiveStringItem() {
+        // 1순위: .string-item.active (포커스된 세그먼트)
+        const active = document.querySelector('.string-item.active');
+        if (active) return active;
+
+        // 2순위: 포커스된 textarea의 조상 .string-item
         const focused = document.activeElement;
-        if (focused && focused.tagName === 'TEXTAREA') {
-            // textarea의 상위 row에서 string_id 추출 시도
-            let row = focused.closest('tr, [data-string-id], [data-id]');
-            while (row) {
-                const id = row.dataset?.stringId || row.dataset?.id || row.id;
-                if (id && /^\d+$/.test(id)) return parseInt(id, 10);
-                // id가 'string-5829127' 같은 형태일 수도
-                const m = (row.id || '').match(/(\d{5,})/);
-                if (m) return parseInt(m[1], 10);
-                row = row.parentElement?.closest('tr, [data-string-id], [data-id]');
+        if (focused && focused.tagName === 'TEXTAREA' && !modalEl?.contains(focused)) {
+            const item = focused.closest('.string-item');
+            if (item) return item;
+        }
+
+        // 3순위: 화면 상단에 보이는 첫 .string-item (스크롤 위치 기반)
+        const items = document.querySelectorAll('.string-item');
+        for (const item of items) {
+            const rect = item.getBoundingClientRect();
+            if (rect.top >= 0 && rect.top < window.innerHeight / 2) {
+                return item;
             }
         }
 
-        // 전략 4: 최근 results_history 조회 로그에서 추출 (API Logger 있으면)
-        if (window.tmsLogs) {
-            const recent = window.tmsLogs.all().slice(-50).reverse();
-            for (const log of recent) {
-                const url = log.url || '';
-                const m = url.match(/belong_to=(\d+)/) || url.match(/\/strings\/(\d+)\//);
-                if (m) return parseInt(m[1], 10);
-            }
+        return null;
+    }
+
+    // string-item의 data-key 에서 API string_id 추출
+    // 패턴: "{prefix}stringItem{string_id}" — 끝의 숫자가 API ID
+    function extractStringIdFromItem(item) {
+        if (!item) return null;
+        const key = item.dataset?.key || '';
+        // "stringItem" 토큰 뒤의 숫자 추출
+        const m = key.match(/stringItem(\d+)/);
+        if (m) return parseInt(m[1], 10);
+        // 폴백: 마지막 숫자 덩어리
+        const tail = key.match(/(\d+)$/);
+        if (tail) return parseInt(tail[1], 10);
+        return null;
+    }
+
+    // ========================================================================
+    // 현재 세그먼트 ID 추출 (DOM만 사용, API Logger 불필요)
+    // ========================================================================
+    // 폴링으로 자주 호출되므로 로그는 verbose=false일 때 생략
+    function getCurrentStringId(verbose = false) {
+        const activeItem = findActiveStringItem();
+        if (!activeItem) {
+            if (verbose) console.warn('[TMS-WF] 활성 .string-item을 찾지 못함');
+            return null;
         }
 
+        const stringId = extractStringIdFromItem(activeItem);
+        if (stringId) {
+            if (verbose) {
+                console.log(`[TMS-WF] 활성 세그먼트 string_id: ${stringId} (DOM row#${activeItem.id})`);
+            }
+            return stringId;
+        }
+
+        if (verbose) {
+            console.warn('[TMS-WF] data-key에서 string_id 추출 실패:', activeItem.dataset?.key);
+        }
         return null;
     }
 
@@ -470,9 +926,431 @@
         }
 
         sections.push(`=== 현재 요청 ===\n${userMessage}`);
-        sections.push(OUTPUT_RULE);
+        // v0.3.3: 워크플로우 모드에서는 기본 OUTPUT_RULE 생략
+        // (v3.1 프롬프트 등 JSON 출력을 요구하는 시스템 프롬프트에서 사용)
+        const isWorkflowMode = systemPrompt && (
+            systemPrompt.includes('[WORKFLOW_MODE]') ||
+            systemPrompt.includes('CURRENT_PHASE')
+        );
+        if (!isWorkflowMode) {
+            sections.push(OUTPUT_RULE);
+        }
 
         return sections.join('\n\n---\n\n');
+    }
+
+    // ========================================================================
+    // Batch workflow state + prompt builders
+    // ========================================================================
+    function loadBatchRuns() {
+        return lsGet(LS_KEYS.BATCH_RUNS, {});
+    }
+
+    function saveBatchRuns(runs) {
+        lsSet(LS_KEYS.BATCH_RUNS, runs);
+    }
+
+    function getActiveBatchRunId() {
+        return lsGet(LS_KEYS.ACTIVE_BATCH_RUN, null);
+    }
+
+    function setActiveBatchRunId(runId) {
+        lsSet(LS_KEYS.ACTIVE_BATCH_RUN, runId);
+    }
+
+    function makeBatchRunId(params) {
+        const stamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+        return `${stamp}-file${params.fileId || 'unknown'}`;
+    }
+
+    function batchRunMatchesCurrentUrl(run) {
+        if (!run) return false;
+        const params = getUrlParams();
+        return String(run.projectId) === String(params.projectId || '') &&
+            String(run.fileId) === String(params.fileId || '') &&
+            String(run.languageId) === String(params.languageId || '') &&
+            String(run.page || 1) === String(params.page || '1');
+    }
+
+    function persistBatchRun(run) {
+        if (!run) return;
+        run.updatedAt = new Date().toISOString();
+        const runs = loadBatchRuns();
+        runs[run.runId] = run;
+        saveBatchRuns(runs);
+        setActiveBatchRunId(run.runId);
+    }
+
+    function clearActiveBatchRun() {
+        const runId = batchRun?.runId || getActiveBatchRunId();
+        if (runId) {
+            const runs = loadBatchRuns();
+            delete runs[runId];
+            saveBatchRuns(runs);
+        }
+        lsSet(LS_KEYS.ACTIVE_BATCH_RUN, null);
+        batchRun = null;
+        renderBatchRun();
+    }
+
+    function restoreActiveBatchRun() {
+        const runId = getActiveBatchRunId();
+        if (!runId) return null;
+        const runs = loadBatchRuns();
+        const run = runs[runId] || null;
+        if (run && !batchRunMatchesCurrentUrl(run)) {
+            lsSet(LS_KEYS.ACTIVE_BATCH_RUN, null);
+            return null;
+        }
+        if (run && isBatchBusy(run.status)) {
+            run.status = 'stale';
+            run.lastError = '이전 실행이 진행 중 상태에서 중단되었습니다. 결과 다시 읽기 또는 Phase 재실행을 선택하세요.';
+            run.logs = run.logs || [];
+            run.logs.push({
+                at: new Date().toISOString(),
+                type: 'warn',
+                message: run.lastError,
+            });
+            runs[runId] = run;
+            saveBatchRuns(runs);
+        }
+        return run;
+    }
+
+    function createBatchRunBase() {
+        const params = getUrlParams();
+        const page = parseInt(params.page || '1', 10) || 1;
+        const pageSize = parseInt(params.pageSize || String(BATCH_DEFAULT_PAGE_SIZE), 10) || BATCH_DEFAULT_PAGE_SIZE;
+        const run = {
+            runId: makeBatchRunId(params),
+            projectId: parseRequiredInt(params.projectId, 'projectId'),
+            fileId: parseRequiredInt(params.fileId, 'fileId'),
+            languageId: parseRequiredInt(params.languageId, 'languageId'),
+            page,
+            pageSize,
+            model: getSelectedModel(),
+            scope: 'current_page',
+            status: 'idle',
+            segments: [],
+            notesByStringId: {},
+            storageStringId: null,
+            initialStorageRaw: '',
+            tbSummary: [],
+            phase12: null,
+            phase3: null,
+            phase45: null,
+            validations: {},
+            logs: [],
+            lastExpectedPhase: null,
+            lastError: null,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        };
+        persistBatchRun(run);
+        return run;
+    }
+
+    function ensureBatchRun() {
+        if (!batchRun) {
+            batchRun = restoreActiveBatchRun() || createBatchRunBase();
+        }
+        return batchRun;
+    }
+
+    function appendBatchLog(message, type = 'info') {
+        const run = ensureBatchRun();
+        run.logs.push({
+            at: new Date().toISOString(),
+            type,
+            message,
+        });
+        if (run.logs.length > 300) run.logs = run.logs.slice(-300);
+        persistBatchRun(run);
+        renderBatchRun();
+    }
+
+    function setBatchStatus(status) {
+        const run = ensureBatchRun();
+        run.status = status;
+        persistBatchRun(run);
+        renderBatchRun();
+    }
+
+    async function fetchCurrentPageSegments(run) {
+        const url = `/api/translate/strings/?project=${run.projectId}&target_language=${run.languageId}&file=${run.fileId}&page=${run.page}&page_size=${run.pageSize}`;
+        const data = await apiJson(url);
+        return normalizeSegmentListResponse(data);
+    }
+
+    async function fetchBatchNotes(expectedIds) {
+        if (!expectedIds.length) return {};
+        const query = expectedIds.map(id => `strings=${encodeURIComponent(id)}`).join('&');
+        const noteData = await apiJson(`/api/translate/string_notes/?${query}`);
+        const notesByStringId = {};
+        for (const note of (noteData.data || [])) {
+            for (const sid of (note.strings || [])) {
+                const id = normalizeId(sid);
+                (notesByStringId[id] ||= []).push({ col: note.col, content: note.content });
+            }
+        }
+        return notesByStringId;
+    }
+
+    async function fetchSavedResultSnapshot(storageStringId) {
+        const seg = await fetchSegmentDetail(storageStringId);
+        return {
+            raw: seg?.active_result?.result || '',
+            segment: seg,
+        };
+    }
+
+    function getWorkflowBasePrompt() {
+        const activePrompt = getActivePrompt();
+        const content = activePrompt?.content || '';
+        if (!content.trim()) {
+            throw new Error('배치 실행에는 v3.1 워크플로우 시스템 프롬프트가 필요합니다. 설정에서 프롬프트를 먼저 선택하세요.');
+        }
+        return content.trim();
+    }
+
+    function formatBatchSegmentList(run) {
+        return (run.segments || []).map((seg, index) => {
+            const id = normalizeId(seg.id);
+            const notes = (run.notesByStringId?.[id] || [])
+                .sort((a, b) => a.col - b.col)
+                .map(note => `  - [col${note.col}] ${note.content}`)
+                .join('\n');
+
+            const terms = (seg.match_terms || [])
+                .map(term => {
+                    const src = term.trans?.['zh-Hans'] || term.trans?.zh || '';
+                    const dst = term.trans?.ko || '';
+                    return src && dst ? `  - ${src} → ${dst}` : null;
+                })
+                .filter(Boolean)
+                .join('\n');
+
+            const lines = [
+                `## #${index + 1} (id: ${id})`,
+                `- 원문: "${seg.origin_string || ''}"`,
+            ];
+            if (seg.char_limit > 0) lines.push(`- 글자수 제한: ${seg.char_limit}자`);
+            if (seg.context) lines.push(`- Context: ${seg.context}`);
+            if (terms) lines.push(`- TB 용어:\n${terms}`);
+            if (notes) lines.push(`- 备注:\n${notes}`);
+            return lines.join('\n');
+        }).join('\n\n');
+    }
+
+    function buildBatchPhasePrompt(phaseTag, run, extraBlocks, finalInstruction) {
+        const tbSummaryBlock = formatBatchTbSummary(run.tbSummary || buildBatchTbSummary(run.segments));
+        return [
+            getWorkflowBasePrompt(),
+            '---',
+            '# 파일 정보',
+            `- 프로젝트 ID: ${run.projectId}`,
+            `- 파일 ID: ${run.fileId}`,
+            `- 처리 대상: 현재 페이지 ${run.segments.length}개 세그먼트`,
+            '',
+            ...(tbSummaryBlock ? [tbSummaryBlock, ''] : []),
+            '# 번역 대상 세그먼트 목록',
+            formatBatchSegmentList(run),
+            '',
+            ...(extraBlocks.length ? [...extraBlocks, ''] : []),
+            '---',
+            '',
+            `[CURRENT_PHASE: ${phaseTag}]`,
+            '',
+            finalInstruction,
+        ].join('\n');
+    }
+
+    function getBatchExpectedIds(run) {
+        return (run.segments || []).map(seg => normalizeId(seg.id));
+    }
+
+    function buildPhase12CompactPrompt(run) {
+        const expectedIds = getBatchExpectedIds(run);
+        return buildBatchPhasePrompt(
+            '1+2',
+            run,
+            [
+                '---',
+                '# Compact JSON output contract',
+                '이 UI 실행에서는 상세 Phase 1+2 출력 스키마를 사용하지 않습니다.',
+                '아래 compact 스키마만 사용하세요. 문자열 설명은 짧게 쓰고, reason/next_step_proposal/긴 문장 필드는 만들지 마세요.',
+                '',
+                '# Allowed IDs',
+                'groups[].ids에는 아래 id만 사용할 수 있습니다.',
+                '목록에 없는 인접 id, 추정 id, 숨은 id를 절대 추가하지 마세요.',
+                'ID가 3씩 증가해 보여도 누락된 중간/앞뒤 id를 생성하지 마세요.',
+                JSON.stringify(expectedIds),
+                '',
+                '```json',
+                '{',
+                '  "phase": "1+2",',
+                '  "cats": [13, 2],',
+                '  "note_schema": {"col8": "placeholder_zh", "col9": "placeholder_en"},',
+                '  "groups": [',
+                '    {"gid": "G1", "ids": [5840062], "cats": [13], "tone": "formal_mail", "rules": ["preserve_placeholders", "use_tb_terms"]}',
+                '  ],',
+                '  "global_rules": ["preserve_value_tokens"]',
+                '}',
+                '```',
+            ],
+            [
+                `${run.segments.length}개 전체 세그먼트에 대해 Phase 1+2 분석을 수행하세요.`,
+                '출력은 compact JSON 한 개만 허용합니다.',
+                '모든 Allowed IDs가 정확히 하나의 groups[].ids에 포함되어야 합니다.',
+                'Allowed IDs 밖의 id는 하나도 출력하지 마세요.',
+                '설명형 문장, 마크다운, 추가 필드는 출력하지 마세요.',
+            ].join('\n')
+        );
+    }
+
+    function buildPhase3CompactPrompt(run) {
+        const expectedIds = getBatchExpectedIds(run);
+        return buildBatchPhasePrompt(
+            '3',
+            run,
+            [
+                '---',
+                '# 확정된 Phase 1+2 compact 결과',
+                '아래 JSON은 직전 단계의 확정 결과입니다. gid, ids, cats, tone, rules를 그대로 사용하세요.',
+                '```json',
+                JSON.stringify(run.phase12.parsed, null, 2),
+                '```',
+                '',
+                '# Phase 3 compact output contract',
+                '아래 스키마만 사용하세요. 설명, markdown, summary, warnings, notes 필드는 만들지 마세요.',
+                '번역문 t는 JSON 문자열이어야 하며 줄바꿈은 반드시 \\n으로 이스케이프하세요.',
+                '```json',
+                '{',
+                '  "phase": "3",',
+                '  "translations": [',
+                '    {"id": 5840062, "gid": "G1", "t": "번역문"}',
+                '  ]',
+                '}',
+                '```',
+                '',
+                '# Allowed IDs',
+                'translations[].id에는 아래 id만 사용할 수 있습니다.',
+                JSON.stringify(expectedIds),
+            ],
+            [
+                `${run.segments.length}개 전체 세그먼트에 대해 Phase 3 번역을 수행하세요.`,
+                'Phase 1+2 compact 결과의 그룹 전략을 그대로 따르세요.',
+                '모든 Allowed IDs가 정확히 하나의 translations[] 항목에 포함되어야 합니다.',
+                'translations[].gid는 Phase 1+2 groups[].gid와 반드시 일치해야 합니다.',
+                'Allowed IDs 밖의 id는 하나도 출력하지 마세요.',
+                '번역문에는 한국어 번역만 넣고 설명을 섞지 마세요.',
+                'placeholder와 value token은 원문 그대로 보존하세요.',
+            ].join('\n')
+        );
+    }
+
+    function buildPhase45CompactPrompt(run) {
+        const expectedIds = getBatchExpectedIds(run);
+        return buildBatchPhasePrompt(
+            '4+5',
+            run,
+            [
+                '---',
+                '# 확정된 Phase 1+2 compact 결과',
+                '아래 JSON은 확정된 그룹 전략입니다. 새 분석을 만들지 말고 그대로 따르세요.',
+                '```json',
+                JSON.stringify(run.phase12.parsed, null, 2),
+                '```',
+                '',
+                '# 확정된 Phase 3 compact 결과',
+                '아래 JSON의 translations[].t를 기준으로 검수하세요.',
+                '```json',
+                JSON.stringify(run.phase3.parsed, null, 2),
+                '```',
+                '',
+                '# Phase 4+5 compact output contract',
+                '아래 스키마만 사용하세요. summary, notes, markdown, 긴 설명 필드는 만들지 마세요.',
+                't가 null이면 Phase 3 번역을 그대로 최종안으로 사용한다는 뜻입니다.',
+                '수정이 필요할 때만 t에 수정 번역문을 넣으세요.',
+                'r은 짧은 reason code 배열만 허용합니다. 예: "term", "placeholder", "style", "char_limit", "grammar"',
+                '```json',
+                '{',
+                '  "phase": "4+5",',
+                '  "revisions": [',
+                '    {"id": 5840062, "gid": "G1", "t": null, "r": []}',
+                '  ]',
+                '}',
+                '```',
+                '',
+                '# Allowed IDs',
+                'revisions[].id에는 아래 id만 사용할 수 있습니다.',
+                JSON.stringify(expectedIds),
+            ],
+            [
+                `${run.segments.length}개 전체 세그먼트에 대해 Phase 4+5 검수를 수행하세요.`,
+                'Phase 3 번역을 기준으로 검수만 수행하고, 번역을 처음부터 다시 만들지 마세요.',
+                '모든 Allowed IDs가 정확히 하나의 revisions[] 항목에 포함되어야 합니다.',
+                'revisions[].gid는 Phase 3 translations[].gid와 반드시 일치해야 합니다.',
+                'Allowed IDs 밖의 id는 하나도 출력하지 마세요.',
+                '문제 없으면 반드시 {"t": null, "r": []} 형태로 유지하세요.',
+                '수정 번역문 t에는 한국어 최종 번역만 넣고 설명을 섞지 마세요.',
+                'placeholder와 value token은 원문 그대로 보존하세요.',
+            ].join('\n')
+        );
+    }
+
+    async function waitForExpectedBatchResult(run, expectedPhase, previousRaw) {
+        let lastRaw = '';
+        let lastParsed = null;
+        let lastInspection = null;
+
+        for (let attempt = 1; attempt <= BATCH_RESULT_RETRY_ATTEMPTS; attempt++) {
+            const { raw } = await fetchSavedResultSnapshot(run.storageStringId);
+            lastRaw = raw;
+            let parsed = null;
+            try {
+                parsed = parseWorkflowJson(raw);
+                lastParsed = parsed;
+                lastInspection = { ok: true, parsed };
+            } catch (error) {
+                lastInspection = inspectSavedJson(raw);
+            }
+
+            const changed = raw !== previousRaw;
+            const savedIssue = parsed ? null : classifySavedResult(raw);
+            appendBatchLog(`결과 조회 ${attempt}차: changed=${changed}, phase=${parsed?.phase || '미확인'}, length=${raw.length}, issue=${savedIssue?.type || '-'}`);
+
+            if (savedIssue) {
+                throw makeWorkflowError(`${expectedPhase} 저장 결과가 ${savedIssue.type}입니다. ${savedIssue.message}`, savedIssue.type);
+            }
+
+            if (parsed?.phase === expectedPhase && changed) {
+                return { raw, parsed };
+            }
+
+            await sleep(BATCH_RESULT_RETRY_INTERVAL_MS);
+        }
+
+        if (lastParsed?.phase === expectedPhase) {
+            throw makeWorkflowError(`${expectedPhase} 결과가 기존 저장본과 같아 새 결과 반영 여부를 확인할 수 없습니다. storage string을 정리하거나 결과 다시 읽기를 사용하세요.`, 'STALE_RESULT');
+        }
+
+        if (lastParsed?.phase && lastParsed.phase !== expectedPhase) {
+            throw makeWorkflowError(`${expectedPhase} 대신 ${lastParsed.phase} 저장본이 확인되었습니다.`, 'STALE_RESULT');
+        }
+
+        if (lastRaw === previousRaw) {
+            throw makeWorkflowError(`${expectedPhase} 결과가 저장본에 반영되지 않았습니다. storage string 기존 번역이 유지된 상태일 수 있습니다.`, 'STALE_RESULT');
+        }
+
+        if (lastInspection && !lastInspection.ok) {
+            const context = lastInspection.context?.position != null
+                ? ` 위치=${lastInspection.context.position}`
+                : '';
+            throw makeWorkflowError(`${expectedPhase} 결과 JSON 파싱 실패:${context} ${lastInspection.error.message}`, 'PARSE_ERROR');
+        }
+
+        throw new Error(`${expectedPhase} 결과가 저장본에서 확인되지 않았습니다.`);
     }
 
     // ========================================================================
@@ -481,6 +1359,8 @@
     let modalEl = null;
     let currentStringId = null;
     let currentSegment = null;
+    let currentMainTab = 'chat';
+    let batchRun = null;
 
     function createModal() {
         if (modalEl) return modalEl;
@@ -496,7 +1376,13 @@
         <button class="tw-btn tw-btn-ghost tw-btn-close" title="닫기">✕</button>
     </span>
 </div>
-<div class="tw-body">
+<div class="tw-main-tabs">
+    <button class="tw-main-tab active" data-tab="chat">채팅</button>
+    <button class="tw-main-tab" data-tab="batch">배치 실행</button>
+    <button class="tw-main-tab" data-tab="review">결과 검토</button>
+    <button class="tw-main-tab" data-tab="logs">JSON/로그</button>
+</div>
+<div class="tw-body tw-tab-content active" data-tab-content="chat">
     <div class="tw-context-panel">
         <div class="tw-panel-title">📄 세그먼트 정보</div>
         <div class="tw-context-content tw-muted">세그먼트 정보 로딩 중…</div>
@@ -522,6 +1408,65 @@
             </div>
         </div>
     </div>
+</div>
+<div class="tw-batch-panel tw-tab-content" data-tab-content="batch">
+    <div class="tw-batch-sidebar">
+        <div class="tw-batch-header-row">
+            <div>
+                <div class="tw-panel-title">배치 실행</div>
+                <div class="tw-batch-meta tw-muted">현재 페이지를 수집한 뒤 Phase를 순서대로 실행합니다.</div>
+            </div>
+            <div class="tw-batch-status">대기 중</div>
+        </div>
+        <div class="tw-batch-card">
+            <div class="tw-context-label">파일 정보</div>
+            <div class="tw-batch-file-info tw-context-value">아직 수집 전입니다.</div>
+        </div>
+        <div class="tw-batch-card">
+            <div class="tw-context-label">검증 요약</div>
+            <div class="tw-batch-validation tw-context-value">Phase 결과가 여기에 표시됩니다.</div>
+        </div>
+        <div class="tw-batch-warning tw-muted"></div>
+        <div class="tw-context-label">수집 세그먼트</div>
+        <div class="tw-batch-segments"></div>
+    </div>
+    <div class="tw-batch-chat-panel">
+        <div class="tw-batch-timeline"></div>
+        <div class="tw-batch-input-wrap">
+            <div class="tw-input-controls">
+                <label class="tw-ctrl">
+                    배치 프롬프트:
+                    <select class="tw-prompt-select tw-batch-prompt-select"></select>
+                </label>
+                <label class="tw-ctrl">
+                    배치 모델:
+                    <select class="tw-model-select tw-batch-model-select"></select>
+                </label>
+            </div>
+            <div class="tw-batch-actions">
+                <button class="tw-btn tw-btn-primary tw-btn-batch-collect">현재 페이지 수집</button>
+                <button class="tw-btn tw-btn-primary tw-btn-phase12" disabled>Phase 1+2 실행</button>
+                <button class="tw-btn tw-btn-primary tw-btn-phase3" disabled>Phase 3 실행</button>
+                <button class="tw-btn tw-btn-primary tw-btn-phase45" disabled>Phase 4+5 실행</button>
+                <button class="tw-btn tw-btn-ghost tw-btn-batch-refetch" disabled>결과 다시 읽기</button>
+                <button class="tw-btn tw-btn-danger tw-btn-batch-reset">배치 초기화</button>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="tw-review-panel tw-tab-content" data-tab-content="review">
+    <div class="tw-panel-title">결과 검토</div>
+    <div class="tw-review-summary tw-muted">아직 Phase 3 결과가 없습니다.</div>
+    <div class="tw-review-toolbar">
+        <button class="tw-btn tw-btn-primary tw-btn-review-apply-selected">선택 입력</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-apply-all">전체 입력</button>
+        <span class="tw-review-apply-status tw-muted">입력은 textarea 값 주입까지만 수행합니다.</span>
+    </div>
+    <div class="tw-review-table"></div>
+</div>
+<div class="tw-log-panel tw-tab-content" data-tab-content="logs">
+    <div class="tw-panel-title">JSON/로그</div>
+    <pre class="tw-log-output">아직 로그가 없습니다.</pre>
 </div>
 <div class="tw-resize-handle"></div>
 `;
@@ -558,6 +1503,7 @@
     z-index: 999999;
     display: flex;
     flex-direction: column;
+    container-type: inline-size;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     font-size: 13px;
 }
@@ -572,6 +1518,21 @@
 .tw-seg-info { flex: 1; color: #888; font-size: 12px; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
 .tw-header-right { display: flex; gap: 4px; }
+.tw-main-tabs {
+    display: flex; gap: 4px; padding: 8px 10px 0;
+    background: #202020; border-bottom: 1px solid #333;
+    flex-shrink: 0;
+}
+.tw-main-tab {
+    background: transparent; color: #999; border: 1px solid transparent;
+    border-bottom: none; padding: 7px 12px; border-radius: 6px 6px 0 0;
+    cursor: pointer; font-size: 12px; transition: all 0.15s;
+}
+.tw-main-tab:hover { color: #ddd; background: #282828; }
+.tw-main-tab.active {
+    background: #2a2a2a; color: #4ade80; border-color: #3a3a3a;
+    font-weight: 600;
+}
 .tw-btn {
     cursor: pointer; border: none; border-radius: 4px;
     padding: 6px 12px; font-size: 12px; transition: all 0.15s;
@@ -582,6 +1543,8 @@
 .tw-btn-primary:hover:not(:disabled) { background: #22c55e; }
 .tw-btn-primary:disabled { background: #3a3a3a; color: #666; cursor: not-allowed; }
 .tw-body { flex: 1; display: flex; overflow: hidden; }
+.tw-tab-content { flex: 1; overflow: hidden; display: none; }
+.tw-tab-content.active { display: flex; }
 .tw-context-panel {
     width: 280px; flex-shrink: 0; padding: 12px;
     border-right: 1px solid #3a3a3a; overflow-y: auto;
@@ -605,7 +1568,7 @@
     line-height: 1.5; }
 .tw-msg-user .tw-msg-content { background: #2563eb; color: #fff; }
 .tw-msg-ai .tw-msg-content { background: #2a2a2a; color: #e0e0e0; border: 1px solid #3a3a3a; }
-.tw-msg-system .tw-msg-content { background: transparent; color: #888; font-style: italic; 
+.tw-msg-system .tw-msg-content { background: transparent; color: #888; font-style: italic;
     text-align: center; padding: 4px; font-size: 11px; }
 .tw-msg-system { max-width: 100%; }
 .tw-msg-progress { color: #fbbf24; }
@@ -627,6 +1590,112 @@
 .tw-chat-buttons { display: flex; gap: 8px; justify-content: flex-end;
     margin-top: 8px; align-items: center; }
 .tw-btn-reset { margin-right: auto; }
+.tw-review-panel, .tw-log-panel {
+    flex-direction: column; padding: 14px; gap: 12px; background: #202020;
+}
+.tw-batch-panel {
+    flex-direction: row; padding: 0; gap: 0; background: #202020; min-width: 0;
+}
+.tw-batch-sidebar {
+    width: 290px; flex-shrink: 0; padding: 12px; border-right: 1px solid #3a3a3a;
+    background: #252525; overflow-y: auto; display: flex; flex-direction: column; gap: 12px;
+}
+.tw-batch-chat-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+.tw-batch-timeline { flex: 1; overflow-y: auto; padding: 14px; }
+.tw-batch-event { margin-bottom: 14px; max-width: 92%; }
+.tw-batch-event .tw-msg-role { color: #94a3b8; }
+.tw-batch-event-info .tw-msg-content { background: #242a33; border-color: #334155; }
+.tw-batch-event-success .tw-msg-content { background: #183225; border-color: #256d3d; }
+.tw-batch-event-warn .tw-msg-content { background: #33290f; border-color: #7c5c11; color: #facc15; }
+.tw-batch-event-error .tw-msg-content { background: #3a1d1d; border-color: #7f1d1d; color: #fecaca; }
+.tw-batch-input-wrap {
+    padding: 10px 12px; border-top: 1px solid #3a3a3a;
+    background: #252525; flex-shrink: 0;
+}
+.tw-batch-header-row { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+.tw-batch-status {
+    padding: 5px 10px; border: 1px solid #3a3a3a; border-radius: 999px;
+    color: #4ade80; background: #1a1a1a; font-size: 12px; white-space: nowrap;
+}
+.tw-batch-card { min-width: 0; }
+.tw-batch-file-info, .tw-batch-validation { white-space: pre-wrap; max-height: 150px; overflow: auto; }
+.tw-batch-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.tw-batch-warning {
+    min-height: 20px; color: #fbbf24; background: #2a2212; border: 1px solid #5a4214;
+    border-radius: 6px; padding: 8px 10px;
+}
+.tw-batch-warning:empty { display: none; }
+.tw-batch-segments {
+    flex: 1; overflow: auto; background: #181818; border: 1px solid #333;
+    border-radius: 6px; padding: 10px; font-size: 12px; line-height: 1.5;
+}
+.tw-review-summary { flex-shrink: 0; }
+.tw-review-toolbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px; border: 1px solid #333; border-radius: 8px;
+    background: linear-gradient(135deg, #202820 0%, #181818 70%);
+}
+.tw-review-apply-status { margin-left: auto; font-size: 12px; }
+.tw-review-table {
+    flex: 1; overflow: auto; border: 1px solid #333; border-radius: 10px; background: #151515;
+}
+.tw-review-row {
+    display: grid; grid-template-columns: 34px 78px 54px minmax(120px, 0.8fr) minmax(145px, 1fr) minmax(120px, 0.8fr) minmax(160px, 1fr) 104px;
+    gap: 8px; padding: 10px 12px; border-bottom: 1px solid #303030; align-items: start;
+}
+.tw-review-row:last-child { border-bottom: none; }
+.tw-review-head { color: #4ade80; font-weight: 600; background: #202020; position: sticky; top: 0; z-index: 1; }
+.tw-review-cell { white-space: pre-wrap; word-break: break-word; line-height: 1.45; }
+.tw-review-row:not(.tw-review-head):hover { background: #1d241f; }
+.tw-review-check { display: flex; align-items: center; justify-content: center; }
+.tw-review-select, .tw-review-select-all { accent-color: #4ade80; }
+.tw-review-source { color: #aaa; max-height: 90px; overflow: hidden; }
+.tw-review-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.tw-review-actions .tw-btn { width: 76px; }
+.tw-log-output {
+    flex: 1; margin: 0; overflow: auto; white-space: pre-wrap; word-break: break-word;
+    background: #181818; border: 1px solid #333; border-radius: 6px; padding: 10px;
+    color: #ddd; font-size: 12px; line-height: 1.5;
+}
+@container (max-width: 760px) {
+    .tw-context-panel { width: 220px; }
+    .tw-batch-panel { flex-direction: column; }
+    .tw-batch-sidebar {
+        width: 100%; max-height: 240px; border-right: none; border-bottom: 1px solid #3a3a3a;
+    }
+    .tw-batch-event { max-width: 100%; }
+    .tw-input-controls { flex-direction: column; align-items: stretch; }
+    .tw-ctrl { align-items: flex-start; flex-direction: column; }
+    .tw-prompt-select, .tw-model-select { width: 100%; }
+    .tw-review-toolbar { align-items: stretch; }
+    .tw-review-apply-status { width: 100%; margin-left: 0; }
+    .tw-review-row {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 6px; padding: 12px; margin: 10px;
+        border: 1px solid #303030; border-radius: 10px;
+        background: #181818;
+    }
+    .tw-review-head { display: none; }
+    .tw-review-cell {
+        display: grid; grid-template-columns: 82px minmax(0, 1fr);
+        gap: 8px; align-items: start;
+    }
+    .tw-review-cell::before {
+        content: attr(data-label);
+        color: #4ade80; font-size: 11px; font-weight: 700;
+    }
+    .tw-review-check { justify-content: flex-start; }
+    .tw-review-check::before { content: "선택"; }
+    .tw-review-source { max-height: none; }
+    .tw-review-actions { flex-direction: row; align-items: center; flex-wrap: wrap; }
+    .tw-review-actions .tw-btn { width: auto; }
+}
+@media (max-width: 760px) {
+    #tms-workflow-modal { min-width: 420px; }
+    .tw-main-tabs { overflow-x: auto; }
+    .tw-review-head { display: none; }
+    .tw-review-row { grid-template-columns: minmax(0, 1fr); }
+}
 .tw-resize-handle {
     position: absolute; right: 0; bottom: 0; width: 16px; height: 16px;
     cursor: nwse-resize;
@@ -695,31 +1764,60 @@
     }
 
     function populateSelects(el) {
-        // 프롬프트 셀렉트
-        const promptSelect = $('.tw-prompt-select', el);
-        renderPromptSelect(promptSelect);
+        renderAllPromptSelects(el);
+        renderAllModelSelects(el);
+    }
 
-        // 모델 셀렉트
-        const modelSelect = $('.tw-model-select', el);
+    function renderAllPromptSelects(root = modalEl) {
+        $$('.tw-prompt-select', root).forEach(selectEl => renderPromptSelect(selectEl));
+    }
+
+    function renderAllModelSelects(root = modalEl) {
+        $$('.tw-model-select', root).forEach(selectEl => renderModelSelect(selectEl));
+    }
+
+    function syncPromptSelects(promptId) {
+        setActivePromptId(promptId);
+        if (!modalEl) return;
+        $$('.tw-prompt-select', modalEl).forEach(selectEl => {
+            selectEl.value = promptId;
+        });
+    }
+
+    function syncModelSelects(model) {
+        lsSet(LS_KEYS.MODEL, model);
+        if (!modalEl) return;
+        $$('.tw-model-select', modalEl).forEach(selectEl => {
+            selectEl.value = model;
+        });
+    }
+
+    function renderModelSelect(modelSelect) {
+        if (!modelSelect) return;
         modelSelect.innerHTML = MODELS.map(m =>
             `<option value="${m}">${m}</option>`).join('');
         modelSelect.value = lsGet(LS_KEYS.MODEL, MODELS[0]);
-        modelSelect.addEventListener('change', () => lsSet(LS_KEYS.MODEL, modelSelect.value));
+        modelSelect.onchange = () => syncModelSelects(modelSelect.value);
     }
 
     function renderPromptSelect(selectEl) {
+        if (!selectEl) return;
         const prompts = loadPrompts();
         const activeId = getActivePromptId();
         selectEl.innerHTML = prompts.map(p =>
             `<option value="${p.id}" ${p.id === activeId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
         ).join('');
-        selectEl.onchange = () => setActivePromptId(selectEl.value);
+        selectEl.onchange = () => syncPromptSelects(selectEl.value);
     }
 
     // ========================================================================
     // 이벤트 핸들러
     // ========================================================================
     function attachHandlers(el) {
+        $$('.tw-main-tab', el).forEach(btn => {
+            btn.addEventListener('click', () => setMainTab(btn.dataset.tab));
+        });
+
         // 닫기
         $('.tw-btn-close', el).addEventListener('click', () => hideModal());
 
@@ -748,6 +1846,55 @@
 
         // 설정 버튼
         $('.tw-btn-settings', el).addEventListener('click', showSettingsPanel);
+
+        $('.tw-btn-batch-collect', el).addEventListener('click', onBatchCollect);
+        $('.tw-btn-phase12', el).addEventListener('click', () => onRunBatchPhase('1+2'));
+        $('.tw-btn-phase3', el).addEventListener('click', () => onRunBatchPhase('3'));
+        $('.tw-btn-phase45', el).addEventListener('click', () => onRunBatchPhase('4+5'));
+        $('.tw-btn-batch-refetch', el).addEventListener('click', onBatchRefetchResult);
+        $('.tw-btn-batch-reset', el).addEventListener('click', onBatchReset);
+        $('.tw-btn-review-apply-selected', el).addEventListener('click', () => applyBatchTranslationsByIds(getSelectedReviewIds()));
+        $('.tw-btn-review-apply-all', el).addEventListener('click', () => applyBatchTranslationsByIds(getReviewTranslationIds()));
+
+        $('.tw-review-table', el).addEventListener('click', async (e) => {
+            const copyBtn = e.target.closest('.tw-btn-copy-final');
+            if (copyBtn) {
+                const text = getBatchFinalText(Number(copyBtn.dataset.id));
+                if (!text) return;
+                try {
+                    await navigator.clipboard.writeText(text);
+                    toast('최종 후보를 클립보드에 복사했습니다.', 'success');
+                } catch {
+                    toast('클립보드 복사에 실패했습니다.', 'error');
+                }
+                return;
+            }
+
+            const applyBtn = e.target.closest('.tw-btn-apply-final');
+            if (applyBtn) {
+                await applyBatchTranslationsByIds([Number(applyBtn.dataset.id)]);
+            }
+        });
+
+        $('.tw-review-table', el).addEventListener('change', (e) => {
+            if (!e.target.classList.contains('tw-review-select-all')) return;
+            $$('.tw-review-select', el).forEach(input => {
+                input.checked = e.target.checked;
+            });
+            const count = $$('.tw-review-select:checked', el).length;
+            updateReviewApplyStatus(`${count}개 선택됨`);
+        });
+
+        $('.tw-review-table', el).addEventListener('change', (e) => {
+            if (!e.target.classList.contains('tw-review-select')) return;
+            const count = $$('.tw-review-select:checked', el).length;
+            updateReviewApplyStatus(`${count}개 선택됨`);
+        });
+    }
+
+    function updateReviewApplyStatus(message) {
+        const el = $('.tw-review-apply-status', modalEl);
+        if (el) el.textContent = message;
     }
 
     function makeDraggable(modal, handle) {
@@ -815,6 +1962,513 @@
         }
     }
 
+    function setMainTab(tab) {
+        currentMainTab = tab || 'chat';
+        if (!modalEl) return;
+
+        $$('.tw-main-tab', modalEl).forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.tab === currentMainTab);
+        });
+        $$('.tw-tab-content', modalEl).forEach(panel => {
+            panel.classList.toggle('active', panel.dataset.tabContent === currentMainTab);
+        });
+
+        if (currentMainTab === 'batch') {
+            ensureBatchRun();
+            renderBatchRun();
+        } else if (currentMainTab === 'review') {
+            renderReviewTable();
+        } else if (currentMainTab === 'logs') {
+            renderLogOutput();
+        }
+    }
+
+    function isBatchBusy(status) {
+        return ['collecting', 'phase12_running', 'phase3_running', 'phase45_running'].includes(status);
+    }
+
+    function formatCoverage(coverage) {
+        if (!coverage) return '검증 전';
+        if (coverage.ok) return `OK (${coverage.actualCount}/${coverage.expectedCount})`;
+        return `누락 ${coverage.missing.length}, 추가 ${coverage.extra.length}, 중복 ${coverage.duplicates.length}`;
+    }
+
+    function renderBatchRun() {
+        if (!modalEl) return;
+        const run = batchRun || restoreActiveBatchRun();
+        if (run && !batchRun) batchRun = run;
+
+        const statusEl = $('.tw-batch-status', modalEl);
+        const fileInfoEl = $('.tw-batch-file-info', modalEl);
+        const validationEl = $('.tw-batch-validation', modalEl);
+        const warningEl = $('.tw-batch-warning', modalEl);
+        const segmentsEl = $('.tw-batch-segments', modalEl);
+        if (!statusEl || !fileInfoEl || !validationEl || !warningEl || !segmentsEl) return;
+
+        if (!run) {
+            statusEl.textContent = '대기 중';
+            fileInfoEl.textContent = '아직 수집 전입니다.';
+            validationEl.textContent = 'Phase 결과가 여기에 표시됩니다.';
+            warningEl.textContent = '';
+            segmentsEl.innerHTML = '<span class="tw-muted">현재 페이지 수집을 먼저 실행하세요.</span>';
+            updateBatchButtons(null);
+            renderBatchTimeline(null);
+            renderLogOutput();
+            renderReviewTable();
+            return;
+        }
+
+        statusEl.textContent = BATCH_STATUS_LABELS[run.status] || run.status || '대기 중';
+        fileInfoEl.textContent = [
+            `projectId=${run.projectId} / fileId=${run.fileId} / languageId=${run.languageId}`,
+            `page=${run.page} / pageSize=${run.pageSize}`,
+            `segments=${run.segments?.length || 0}`,
+            `storageStringId=${run.storageStringId || '-'}`,
+            `model=${run.model || '-'}`,
+        ].join('\n');
+
+        validationEl.textContent = [
+            `Phase 1+2: ${formatCoverage(run.phase12?.validation?.coverage)}`,
+            `Phase 3: ${run.phase3?.validation ? (run.phase3.validation.ok ? 'OK' : '주의 필요') : '대기'}`,
+            `Phase 4+5: ${run.phase45?.validation ? (run.phase45.validation.ok ? 'OK' : '주의 필요') : '대기'}`,
+            run.lastError ? `마지막 오류: ${run.lastError}` : null,
+        ].filter(Boolean).join('\n');
+
+        warningEl.textContent = run.storageStringId
+            ? `주의: Phase 실행 결과는 storageStringId ${run.storageStringId}의 번역 칸에 저장됩니다. 테스트 후 수동 정리가 필요해요.`
+            : '';
+
+        if (run.segments?.length) {
+            const preview = run.segments.slice(0, 12).map(seg => {
+                const text = String(seg.origin_string || '').replace(/\s+/g, ' ').slice(0, 80);
+                return `<div><b>#${escapeHtml(seg.id)}</b> ${escapeHtml(text)}</div>`;
+            }).join('');
+            const rest = run.segments.length > 12 ? `<div class="tw-muted">... 외 ${run.segments.length - 12}개</div>` : '';
+            segmentsEl.innerHTML = preview + rest;
+        } else {
+            segmentsEl.innerHTML = '<span class="tw-muted">현재 페이지 수집을 먼저 실행하세요.</span>';
+        }
+
+        updateBatchButtons(run);
+        renderBatchTimeline(run);
+        renderLogOutput();
+        renderReviewTable();
+    }
+
+    function renderBatchTimeline(run) {
+        if (!modalEl) return;
+        const timelineEl = $('.tw-batch-timeline', modalEl);
+        if (!timelineEl) return;
+
+        if (!run) {
+            timelineEl.innerHTML = `
+<div class="tw-msg tw-msg-system tw-batch-event">
+    <div class="tw-msg-content">현재 페이지 수집을 누르면 배치 작업 이벤트가 여기에 대화처럼 쌓입니다.</div>
+</div>`;
+            return;
+        }
+
+        const logs = run.logs || [];
+        if (!logs.length) {
+            timelineEl.innerHTML = `
+<div class="tw-msg tw-msg-ai tw-batch-event tw-batch-event-info">
+    <div class="tw-msg-role">배치 워크플로우</div>
+    <div class="tw-msg-content">배치 세션이 준비되었습니다. 아래 프롬프트와 모델을 확인한 뒤 현재 페이지를 수집하세요.</div>
+</div>`;
+            return;
+        }
+
+        timelineEl.innerHTML = logs.map(log => {
+            const type = ['success', 'warn', 'error'].includes(log.type) ? log.type : 'info';
+            const time = log.at ? new Date(log.at).toLocaleTimeString('ko-KR', { hour12: false }) : '';
+            return `
+<div class="tw-msg tw-msg-ai tw-batch-event tw-batch-event-${type}">
+    <div class="tw-msg-role">배치 이벤트${time ? ` · ${escapeHtml(time)}` : ''}</div>
+    <div class="tw-msg-content">${escapeHtml(log.message)}</div>
+</div>`;
+        }).join('');
+        timelineEl.scrollTop = timelineEl.scrollHeight;
+    }
+
+    function updateBatchButtons(run) {
+        if (!modalEl) return;
+        const busy = run ? isBatchBusy(run.status) : false;
+        const collectBtn = $('.tw-btn-batch-collect', modalEl);
+        const phase12Btn = $('.tw-btn-phase12', modalEl);
+        const phase3Btn = $('.tw-btn-phase3', modalEl);
+        const phase45Btn = $('.tw-btn-phase45', modalEl);
+        const refetchBtn = $('.tw-btn-batch-refetch', modalEl);
+
+        if (collectBtn) collectBtn.disabled = busy;
+        if (phase12Btn) phase12Btn.disabled = busy || !run?.segments?.length;
+        if (phase3Btn) phase3Btn.disabled = busy || !run?.phase12?.validation?.ok;
+        if (phase45Btn) phase45Btn.disabled = busy || !run?.phase3?.validation?.ok;
+        if (refetchBtn) refetchBtn.disabled = busy || !run?.storageStringId || !run?.lastExpectedPhase;
+    }
+
+    function onBatchReset() {
+        const run = batchRun || restoreActiveBatchRun();
+        if (run) {
+            const ok = confirm(
+                '현재 배치 실행 기록(JSON/로그/검증 상태)을 초기화할까요?\n\n' +
+                '이미 TMS 번역 칸에 저장된 storageStringId 결과는 삭제되지 않습니다.'
+            );
+            if (!ok) return;
+        }
+        clearActiveBatchRun();
+        toast('배치 실행 기록을 초기화했습니다.', 'success');
+    }
+
+    function renderLogOutput() {
+        if (!modalEl) return;
+        const output = $('.tw-log-output', modalEl);
+        if (!output) return;
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run) {
+            output.textContent = '아직 로그가 없습니다.';
+            return;
+        }
+
+        const logLines = (run.logs || []).map(log => `[${log.at}] ${log.type.toUpperCase()} ${log.message}`);
+        const jsonBlocks = [];
+        if (run.lastError) jsonBlocks.push(`\n\n=== Last error ===\n${run.lastError}`);
+        if (run.validations && Object.keys(run.validations).length) {
+            jsonBlocks.push(`\n\n=== Validation object ===\n${JSON.stringify(run.validations, null, 2)}`);
+        }
+        if (run.phase12?.raw) jsonBlocks.push(`\n\n=== Phase 1+2 raw ===\n${run.phase12.raw}`);
+        if (run.phase3?.raw) jsonBlocks.push(`\n\n=== Phase 3 raw ===\n${run.phase3.raw}`);
+        if (run.phase45?.raw) jsonBlocks.push(`\n\n=== Phase 4+5 raw ===\n${run.phase45.raw}`);
+        output.textContent = (logLines.join('\n') || '아직 로그가 없습니다.') + jsonBlocks.join('');
+    }
+
+    function getBatchFinalText(id) {
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run?.phase3?.parsed || !run.phase3.validation?.ok) return '';
+        const phase3 = (run.phase3.parsed.translations || []).find(item => normalizeId(item.id) === normalizeId(id));
+        const revision = run.phase45?.validation?.ok
+            ? (run.phase45?.parsed?.revisions || []).find(item => normalizeId(item.id) === normalizeId(id))
+            : null;
+        if (!phase3) return '';
+        return revision && revision.t !== null ? String(revision.t || '') : String(phase3.t || '');
+    }
+
+    function getReviewTranslationIds() {
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run?.phase3?.parsed || !run.phase3.validation?.ok) return [];
+        return (run.phase3.parsed.translations || []).map(item => normalizeId(item.id));
+    }
+
+    function getSelectedReviewIds() {
+        if (!modalEl) return [];
+        return $$('.tw-review-select:checked', modalEl)
+            .map(input => normalizeId(input.dataset.id))
+            .filter(id => Number.isFinite(Number(id)));
+    }
+
+    async function applyBatchFinalToTextarea(id) {
+        const text = getBatchFinalText(id);
+        if (!text) throw new Error(`#${id} 최종 후보가 없습니다.`);
+
+        const item = findStringItemByStringId(id);
+        if (!item) {
+            throw new Error(`#${id} 세그먼트가 현재 화면 DOM에 없습니다. 해당 세그먼트가 보이도록 스크롤한 뒤 다시 시도하세요.`);
+        }
+
+        item.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        item.click();
+        await sleep(120);
+
+        const textarea = findTranslationTextareaForStringId(id);
+        if (!textarea) {
+            throw new Error(`#${id} 번역 textarea를 찾지 못했습니다. 세그먼트를 펼친 뒤 다시 시도하세요.`);
+        }
+
+        injectTextareaValue(textarea, text);
+        return { id, ok: true };
+    }
+
+    async function applyBatchTranslationsByIds(ids) {
+        const uniqueIds = Array.from(new Set((ids || []).map(normalizeId)));
+        if (!uniqueIds.length) {
+            toast('입력할 세그먼트를 선택하세요.', 'error');
+            updateReviewApplyStatus('선택된 항목이 없습니다.');
+            return;
+        }
+
+        let success = 0;
+        const failures = [];
+        updateReviewApplyStatus(`${uniqueIds.length}개 입력 시작...`);
+
+        for (const id of uniqueIds) {
+            try {
+                await applyBatchFinalToTextarea(id);
+                success += 1;
+                appendBatchLog(`#${id} textarea 입력 완료`, 'success');
+            } catch (error) {
+                failures.push({ id, message: error.message });
+                appendBatchLog(`#${id} textarea 입력 실패: ${error.message}`, 'warn');
+            }
+        }
+
+        const message = failures.length
+            ? `입력 완료 ${success}개, 실패 ${failures.length}개`
+            : `입력 완료 ${success}개`;
+        updateReviewApplyStatus(message);
+        toast(message, failures.length ? 'info' : 'success', 4000);
+    }
+
+    function renderReviewTable() {
+        if (!modalEl) return;
+        const summaryEl = $('.tw-review-summary', modalEl);
+        const tableEl = $('.tw-review-table', modalEl);
+        if (!summaryEl || !tableEl) return;
+        const run = batchRun || restoreActiveBatchRun();
+
+        if (!run?.phase3?.parsed) {
+            summaryEl.textContent = '아직 Phase 3 결과가 없습니다.';
+            tableEl.innerHTML = '';
+            return;
+        }
+        if (!run.phase3.validation?.ok) {
+            summaryEl.textContent = 'Phase 3 검증이 실패해 결과 검토를 표시하지 않습니다. JSON/로그 탭에서 세부 오류를 확인하세요.';
+            tableEl.innerHTML = '';
+            return;
+        }
+
+        const translations = run.phase3.parsed.translations || [];
+        const usePhase45 = !!run.phase45?.validation?.ok;
+        const revisions = usePhase45 ? (run.phase45?.parsed?.revisions || []) : [];
+        const revisionById = new Map(revisions.map(item => [normalizeId(item.id), item]));
+        const segmentById = new Map((run.segments || []).map(seg => [normalizeId(seg.id), seg]));
+        const changedCount = revisions.filter(item => item.t !== null).length;
+
+        summaryEl.textContent = `번역 ${translations.length}개 · Phase 4+5 ${usePhase45 ? `수정 ${changedCount}개` : '미적용 또는 검증 실패'} · 자동 적용 없음`;
+        const rows = translations.map(item => {
+            const id = normalizeId(item.id);
+            const seg = segmentById.get(id);
+            const revision = revisionById.get(id);
+            const finalText = getBatchFinalText(id);
+            const revisionText = revision && revision.t !== null ? String(revision.t || '') : '';
+            const flag = revision ? (revision.t === null ? '유지' : `수정: ${(revision.r || []).join(', ') || 'reason 없음'}`) : 'Phase3';
+            return `
+<div class="tw-review-row">
+    <div class="tw-review-cell tw-review-check" data-label="선택"><input class="tw-review-select" type="checkbox" data-id="${escapeHtml(id)}"></div>
+    <div class="tw-review-cell" data-label="ID">#${escapeHtml(id)}</div>
+    <div class="tw-review-cell" data-label="그룹">${escapeHtml(item.gid || '')}</div>
+    <div class="tw-review-cell tw-review-source" data-label="원문">${escapeHtml(seg?.origin_string || '')}</div>
+    <div class="tw-review-cell" data-label="Phase 3">${escapeHtml(item.t || '')}</div>
+    <div class="tw-review-cell" data-label="Phase 4+5">${escapeHtml(revisionText || '유지')}</div>
+    <div class="tw-review-cell" data-label="최종 후보">${escapeHtml(finalText)}</div>
+    <div class="tw-review-cell tw-review-actions" data-label="동작">
+        <button class="tw-btn tw-btn-primary tw-btn-apply-final" data-id="${escapeHtml(id)}">입력</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-copy-final" data-id="${escapeHtml(id)}">복사</button>
+        <div class="tw-muted">${escapeHtml(flag)}</div>
+    </div>
+</div>`;
+        }).join('');
+
+        tableEl.innerHTML = `
+<div class="tw-review-row tw-review-head">
+    <div><input class="tw-review-select-all" type="checkbox" title="전체 선택"></div><div>ID</div><div>그룹</div><div>원문</div><div>Phase 3</div><div>Phase 4+5</div><div>최종 후보</div><div>동작</div>
+</div>${rows}`;
+        updateReviewApplyStatus('입력은 textarea 값 주입까지만 수행합니다.');
+    }
+
+    async function onBatchCollect() {
+        batchRun = createBatchRunBase();
+        try {
+            setBatchStatus('collecting');
+            appendBatchLog('현재 페이지 세그먼트 수집 시작');
+
+            const { segments, meta } = await fetchCurrentPageSegments(batchRun);
+            if (!segments.length) throw new Error('현재 페이지에서 세그먼트를 찾지 못했습니다.');
+
+            const expectedIds = segments.map(seg => normalizeId(seg.id));
+            const storageStringId = currentStringId && expectedIds.includes(normalizeId(currentStringId))
+                ? normalizeId(currentStringId)
+                : expectedIds[0];
+
+            appendBatchLog(`세그먼트 ${segments.length}개 수집 (${meta.shape}, count=${meta.count ?? segments.length})`);
+            const notesByStringId = await fetchBatchNotes(expectedIds);
+            appendBatchLog(`备注 있는 세그먼트 ${Object.keys(notesByStringId).length}개 수집`);
+
+            const storageSnapshot = await fetchSavedResultSnapshot(storageStringId);
+            const tbSummary = buildBatchTbSummary(segments);
+            Object.assign(batchRun, {
+                status: 'ready',
+                segments,
+                segmentMeta: meta,
+                notesByStringId,
+                storageStringId,
+                initialStorageRaw: storageSnapshot.raw,
+                tbSummary,
+                phase12: null,
+                phase3: null,
+                phase45: null,
+                validations: {},
+            });
+            appendBatchLog(`파일 전체 TB 용어 ${tbSummary.length}개 준비`);
+            if (storageSnapshot.raw) {
+                appendBatchLog(`storageStringId 기존 결과 길이: ${storageSnapshot.raw.length}`, 'warn');
+            }
+            persistBatchRun(batchRun);
+            renderBatchRun();
+        } catch (error) {
+            batchRun.status = 'failed';
+            appendBatchLog(`수집 실패: ${error.message}`, 'error');
+            persistBatchRun(batchRun);
+            renderBatchRun();
+            toast(error.message, 'error');
+        }
+    }
+
+    function getPreviousRawForPhase(run, phaseTag) {
+        if (phaseTag === '1+2') return run.initialStorageRaw || '';
+        if (phaseTag === '3') return run.phase12?.raw || '';
+        if (phaseTag === '4+5') return run.phase3?.raw || '';
+        return '';
+    }
+
+    function getRawForPhase(run, phaseTag) {
+        if (phaseTag === '1+2') return run.phase12?.raw || '';
+        if (phaseTag === '3') return run.phase3?.raw || '';
+        if (phaseTag === '4+5') return run.phase45?.raw || '';
+        return '';
+    }
+
+    function buildPromptForPhase(run, phaseTag) {
+        if (phaseTag === '1+2') return buildPhase12CompactPrompt(run);
+        if (phaseTag === '3') return buildPhase3CompactPrompt(run);
+        if (phaseTag === '4+5') return buildPhase45CompactPrompt(run);
+        throw new Error(`알 수 없는 Phase: ${phaseTag}`);
+    }
+
+    function validateParsedPhase(run, phaseTag, parsed) {
+        if (phaseTag === '1+2') return validatePhase12Compact(parsed, run.segments);
+        if (phaseTag === '3') return validatePhase3Compact(run.phase12.parsed, parsed, run.segments);
+        if (phaseTag === '4+5') return validatePhase45Compact(run.phase3.parsed, parsed, run.segments);
+        throw new Error(`알 수 없는 Phase: ${phaseTag}`);
+    }
+
+    function storePhaseResult(run, phaseTag, raw, parsed, validation) {
+        const phaseResult = { raw, parsed, validation, updatedAt: new Date().toISOString() };
+        if (phaseTag === '1+2') {
+            run.phase12 = phaseResult;
+            run.status = validation.ok ? 'phase12_ready' : 'failed';
+        } else if (phaseTag === '3') {
+            run.phase3 = phaseResult;
+            run.status = validation.ok ? 'phase3_ready' : 'failed';
+        } else if (phaseTag === '4+5') {
+            run.phase45 = phaseResult;
+            run.status = validation.ok ? 'phase45_ready' : 'failed';
+        }
+        run.validations[phaseTag] = validation;
+        if (validation.ok) run.lastError = null;
+    }
+
+    async function onRunBatchPhase(phaseTag) {
+        const run = ensureBatchRun();
+        if (!run.segments?.length) {
+            toast('먼저 현재 페이지를 수집하세요.', 'error');
+            return;
+        }
+        if (phaseTag === '3' && !run.phase12?.validation?.ok) {
+            toast('Phase 1+2 검증 통과 후 실행할 수 있습니다.', 'error');
+            return;
+        }
+        if (phaseTag === '4+5' && !run.phase3?.validation?.ok) {
+            toast('Phase 3 검증 통과 후 실행할 수 있습니다.', 'error');
+            return;
+        }
+
+        try {
+            run.model = getSelectedModel() || run.model || MODELS[0];
+            const statusMap = { '1+2': 'phase12_running', '3': 'phase3_running', '4+5': 'phase45_running' };
+            run.status = statusMap[phaseTag];
+            run.lastExpectedPhase = phaseTag;
+            run.lastError = null;
+            persistBatchRun(run);
+            renderBatchRun();
+
+            const prompt = buildPromptForPhase(run, phaseTag);
+            appendBatchLog(`Phase ${phaseTag} 실행 시작, prompt length=${prompt.length}`);
+
+            const previousRaw = getPreviousRawForPhase(run, phaseTag);
+            const taskId = await callPrefixPromptTran(run.projectId, run.storageStringId, prompt, run.model);
+            appendBatchLog(`task 등록 완료: ${taskId}`);
+
+            await pollTask(taskId, {
+                maxAttempts: BATCH_MAX_POLL_ATTEMPTS,
+                interval: BATCH_POLL_INTERVAL_MS,
+                onProgress: (n, status) => appendBatchLog(`Phase ${phaseTag} 폴링 ${n}차: ${status}`),
+            });
+
+            const { raw, parsed } = await waitForExpectedBatchResult(run, phaseTag, previousRaw);
+            const validation = validateParsedPhase(run, phaseTag, parsed);
+            storePhaseResult(run, phaseTag, raw, parsed, validation);
+            appendBatchLog(`Phase ${phaseTag} 검증: ${validation.ok ? 'OK' : '주의 필요'}`, validation.ok ? 'success' : 'warn');
+            persistBatchRun(run);
+            renderBatchRun();
+            if (validation.ok) toast(`Phase ${phaseTag} 완료`, 'success');
+        } catch (error) {
+            const statusByCode = {
+                STALE_RESULT: 'stale',
+                BEDROCK_READ_TIMEOUT: 'bedrock_timeout',
+                MODEL_ENDPOINT_ERROR: 'model_endpoint_error',
+            };
+            run.status = statusByCode[error.workflowCode] || 'failed';
+            run.lastError = error.message;
+            appendBatchLog(`Phase ${phaseTag} 실패: ${error.message}`, 'error');
+            persistBatchRun(run);
+            renderBatchRun();
+            toast(error.message, 'error', 5000);
+        }
+    }
+
+    async function onBatchRefetchResult() {
+        const run = ensureBatchRun();
+        if (!run.storageStringId || !run.lastExpectedPhase) {
+            toast('다시 읽을 Phase 결과가 없습니다.', 'error');
+            return;
+        }
+
+        try {
+            appendBatchLog(`storageStringId ${run.storageStringId} 결과 다시 읽기 시작`);
+            const { raw } = await fetchSavedResultSnapshot(run.storageStringId);
+            const savedIssue = classifySavedResult(raw);
+            if (savedIssue) {
+                throw makeWorkflowError(savedIssue.message, savedIssue.type);
+            }
+
+            const parsed = parseWorkflowJson(raw, run.lastExpectedPhase);
+            const staleCandidates = [
+                getRawForPhase(run, run.lastExpectedPhase),
+                run.initialStorageRaw || '',
+            ].filter(Boolean);
+            if (staleCandidates.some(staleRaw => raw === staleRaw)) {
+                throw makeWorkflowError('저장본이 이미 알고 있는 같은 phase 결과와 동일합니다. 새 결과 반영 여부를 확인할 수 없어 stale로 처리합니다.', 'STALE_RESULT');
+            }
+            const validation = validateParsedPhase(run, run.lastExpectedPhase, parsed);
+            storePhaseResult(run, run.lastExpectedPhase, raw, parsed, validation);
+            appendBatchLog(`결과 다시 읽기 검증: ${validation.ok ? 'OK' : '주의 필요'}`, validation.ok ? 'success' : 'warn');
+            persistBatchRun(run);
+            renderBatchRun();
+            toast('저장 결과를 다시 읽었습니다.', validation.ok ? 'success' : 'info');
+        } catch (error) {
+            const statusByCode = {
+                STALE_RESULT: 'stale',
+                BEDROCK_READ_TIMEOUT: 'bedrock_timeout',
+                MODEL_ENDPOINT_ERROR: 'model_endpoint_error',
+            };
+            run.status = statusByCode[error.workflowCode] || 'failed';
+            run.lastError = error.message;
+            appendBatchLog(`결과 다시 읽기 실패: ${error.message}`, 'error');
+            persistBatchRun(run);
+            renderBatchRun();
+            toast(error.message, 'error', 5000);
+        }
+    }
+
     // ========================================================================
     // 모달 Show/Hide + 세그먼트 로드 + 자동 감지 폴링
     // ========================================================================
@@ -849,7 +2503,7 @@
     }
 
     async function showModal() {
-        const stringId = getCurrentStringId();
+        const stringId = getCurrentStringId(true); // verbose: 모달 열 때는 로그 남김
         if (!stringId) {
             toast('현재 선택된 세그먼트를 찾지 못했습니다. 세그먼트를 먼저 클릭하세요.', 'error');
             return;
@@ -869,12 +2523,16 @@
 
         // 세션 복원
         renderChatHistory();
+        batchRun = restoreActiveBatchRun() || batchRun;
+        setMainTab(currentMainTab);
 
         // 자동 감지 폴링 시작
         startSegmentWatcher();
 
         // 입력창 포커스
-        setTimeout(() => $('.tw-chat-input', el).focus(), 100);
+        if (currentMainTab === 'chat') {
+            setTimeout(() => $('.tw-chat-input', el).focus(), 100);
+        }
     }
 
     function hideModal() {
@@ -1025,7 +2683,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
             // API 호출
             const { projectId } = getUrlParams();
-            const model = $('.tw-model-select', modalEl).value;
+            const model = getSelectedModel();
 
             updateProgressMessage(progressMsg, '⏳ 작업 등록 중…');
             const taskId = await callPrefixPromptTran(projectId, currentStringId, prefixPrompt, model);
@@ -1216,7 +2874,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         function refresh() {
             const prompts = loadPrompts();
             listEl.innerHTML = prompts.map(p =>
-                `<div class="tw-settings-list-item ${p.id === currentEditingId ? 'active' : ''}" 
+                `<div class="tw-settings-list-item ${p.id === currentEditingId ? 'active' : ''}"
                       data-id="${p.id}">${escapeHtml(p.name)}</div>`
             ).join('');
             $$('.tw-settings-list-item', listEl).forEach(item => {
@@ -1238,7 +2896,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
         $('.tw-btn-settings-close', overlay).addEventListener('click', () => {
             overlay.remove();
-            renderPromptSelect($('.tw-prompt-select', modalEl));
+            renderAllPromptSelects(modalEl);
         });
 
         $('.tw-btn-settings-new', overlay).addEventListener('click', () => {
@@ -1393,7 +3051,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 refreshSessionStats();
                 // 프롬프트도 복원됐으면 드롭다운 갱신
                 if (result.promptsCount > 0) {
-                    renderPromptSelect($('.tw-prompt-select', modalEl));
+                    renderAllPromptSelects(modalEl);
                     refresh(); // 프롬프트 편집 화면도 갱신
                 }
             } catch (err) {
@@ -1473,7 +3131,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
     window.tmsWorkflow = {
         open: () => showModal(),
         close: () => hideModal(),
-        getCurrentStringId: () => getCurrentStringId(),
+        getCurrentStringId: () => getCurrentStringId(true),
         getParams: () => getUrlParams(),
         getSegment: async (id) => {
             const sid = id || getCurrentStringId();
@@ -1482,6 +3140,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.2.1] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.3.3] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
