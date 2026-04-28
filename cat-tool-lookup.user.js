@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 번역 조회 팝업
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  Alt+Q → 팝업 열기/닫기 / Alt+W → 현재 세그먼트 매칭 삽입 / Alt+Shift+W → 전체 일괄 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-lookup.user.js
@@ -90,13 +90,24 @@
     return aliases.some(alias => normalized === alias);
   }
 
-  /** textarea 값 설정 (Vue/React 반응성 대응, <br> → \n 변환) */
+  /**
+   * 원문의 <br> 사용 여부에 따라 번역문의 <br>을 보존할지 \n으로 변환할지 결정
+   *
+   * - 원문에 <br>이 텍스트로 노출되어 있으면 → 번역문도 <br> 그대로 (작성자가 의도적으로 노출시킨 마커)
+   * - 원문에 <br>이 없으면 (진짜 줄바꿈만 있거나, 단일 라인) → 기존처럼 \n으로 변환
+   */
+  function convertTranslationForOrigin(translation, origin) {
+    const originHasBrText = origin && /<br\s*\/?>/i.test(origin);
+    if (originHasBrText) return translation;
+    return translation.replace(/<br\s*\/?>/gi, '\n');
+  }
+
+  /** textarea 값 설정 (Vue/React 반응성 대응) */
   function setTextareaValue(textarea, value) {
-    const converted = value.replace(/<br\s*\/?>/gi, '\n');
     const nativeSetter = Object.getOwnPropertyDescriptor(
       window.HTMLTextAreaElement.prototype, 'value'
     ).set;
-    nativeSetter.call(textarea, converted);
+    nativeSetter.call(textarea, value);
     textarea.dispatchEvent(new Event('input', { bubbles: true }));
     textarea.dispatchEvent(new Event('change', { bubbles: true }));
   }
@@ -473,7 +484,7 @@
       return;
     }
 
-    setTextareaValue(active, translation);
+    setTextareaValue(active, convertTranslationForOrigin(translation, sourceText));
     console.log(`${LOG_PREFIX} 매칭 삽입: "${sourceText}" → "${translation}"`);
     if (window.catToast) window.catToast('✅ 매칭 삽입 완료');
   }
@@ -502,7 +513,7 @@
 
       const translation = findTranslation(sourceText);
       if (translation) {
-        setTextareaValue(textarea, translation);
+        setTextareaValue(textarea, convertTranslationForOrigin(translation, sourceText));
         matched++;
       }
     }
@@ -526,7 +537,7 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v2.2 로드 완료`);
+  console.log(`${LOG_PREFIX} v2.3 로드 완료`);
   console.log('  Alt+Q       → 팝업 열기/닫기');
   console.log('  Alt+W       → 현재 세그먼트 매칭 삽입');
   console.log('  Alt+Shift+W → 전체 세그먼트 일괄 삽입');
