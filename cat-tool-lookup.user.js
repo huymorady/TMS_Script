@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 번역 조회 팝업
 // @namespace    http://tampermonkey.net/
-// @version      2.6
+// @version      2.7
 // @description  Alt+Q → 팝업 열기/닫기 / Alt+W → 현재 세그먼트 매칭 삽입 / Alt+Shift+W → 전체 일괄 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-lookup.user.js
@@ -44,9 +44,45 @@
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  /** 앞뒤 따옴표 제거 ("..." 또는 '...') */
-  function stripQuotes(s) {
-    return s.replace(/^["']|["']$/g, '');
+  /**
+   * 마크다운 표 행을 셀로 분할 (이스케이프된 \| 처리)
+   *
+   * 마크다운에서 셀 안에 리터럴 | 문자를 넣을 때 \|로 이스케이프함.
+   * 단순 split('|')은 이를 셀 구분자로 잘못 처리해서 셀 개수가 어긋남.
+   * 트릭: split 전에 \|를 placeholder로 치환하고, split 후 다시 복원.
+   */
+  function splitCells(line) {
+    const PLACEHOLDER = '\u0000'; // null 문자 — 일반 텍스트에 등장하지 않음
+    const escaped = line.replace(/\\\|/g, PLACEHOLDER);
+    return escaped
+      .split('|')
+      .map(c => c.trim().replace(new RegExp(PLACEHOLDER, 'g'), '|'))
+      .filter(c => c !== '');
+  }
+
+  /**
+   * 마크다운 표 셀 값을 정리:
+   *  1) 양 끝의 따옴표 제거 ("..." 또는 '...')
+   *  2) 셀 안의 엑셀 CSV 이스케이프 해제 ("" → ")
+   *
+   * 엑셀에서 셀 안에 따옴표가 있을 때 셀 전체가 "..."로 감싸지고
+   * 내부 "는 ""로 이스케이프됨. 이걸 LLM이 마크다운으로 변환할 때 그대로
+   * 남겨버리는 경우가 있어서, CAT 원문(단일 따옴표 사용)과 매칭이 깨짐.
+   * 예) <link=""store?{{X}}""> → <link="store?{{X}}">
+   */
+  function unescapeCell(s) {
+    if (!s) return s;
+    let result = s;
+    if (result.length >= 2) {
+      const first = result[0];
+      const last = result[result.length - 1];
+      if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+        result = result.slice(1, -1);
+      }
+    }
+    // 엑셀 CSV "" → " 디이스케이프
+    result = result.replace(/""/g, '"');
+    return result;
   }
 
   /**
@@ -492,7 +528,7 @@
     }
 
     // 헤더 행에서 열 인덱스 자동 감지 (별칭 + 괄호 부가정보 허용)
-    const headerCells = lines[0].split('|').map(c => c.trim()).filter(c => c !== '');
+    const headerCells = splitCells(lines[0]);
     let srcIdx = -1;
     let tgtIdx = -1;
 
@@ -518,14 +554,14 @@
     const newData = {};
 
     for (let i = 1; i < lines.length; i++) {
-      const cells = lines[i].split('|').map(c => c.trim()).filter(c => c !== '');
+      const cells = splitCells(lines[i]);
 
       // 구분선(---) 건너뛰기
       if (cells.some(c => /^[-:]+$/.test(c))) continue;
 
       if (cells.length > Math.max(srcIdx, tgtIdx)) {
-        const source = stripQuotes(cells[srcIdx]);
-        const target = stripQuotes(cells[tgtIdx]);
+        const source = unescapeCell(cells[srcIdx]);
+        const target = unescapeCell(cells[tgtIdx]);
 
         if (source && target) {
           newData[source] = target;
@@ -658,7 +694,7 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v2.6 로드 완료`);
+  console.log(`${LOG_PREFIX} v2.7 로드 완료`);
   console.log('  Alt+Q       → 팝업 열기/닫기');
   console.log('  Alt+W       → 현재 세그먼트 매칭 삽입');
   console.log('  Alt+Shift+W → 전체 세그먼트 일괄 삽입');
