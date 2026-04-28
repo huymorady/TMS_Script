@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 번역 조회 팝업
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Alt+Q → 팝업 열기/닫기 / Alt+W → 현재 세그먼트 매칭 삽입 / Alt+Shift+W → 전체 일괄 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-lookup.user.js
@@ -49,13 +49,27 @@
     return s.replace(/^["']|["']$/g, '');
   }
 
-  /** 텍스트 정규화 (<br> ↔ \n 통일, 앞뒤 공백 제거) */
+  /**
+   * 텍스트 정규화 (매칭용 키 생성)
+   *
+   * 다음 변형들을 모두 같은 키로 흡수해서 매칭 성공률을 높임:
+   *  - <br> ↔ \n 통일
+   *  - \r\n / \r → \n 통일
+   *  - 빈 줄(연속된 \n) 압축 — 엑셀 원본의 <br>+\n 이중 줄바꿈 대응
+   *  - 각 줄의 양 끝 공백 제거 — 엑셀 셀의 들여쓰기 공백, 줄 끝 trailing space 대응
+   *  - 빈 줄 자체는 제거
+   *
+   * 단어 사이 공백은 보존 (의도적 차이를 흡수하지 않음)
+   */
   function normalize(text) {
     return text
       .replace(/<br\s*\/?>/gi, '\n')
       .replace(/\r\n/g, '\n')
       .replace(/\r/g, '\n')
-      .trim();
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line)
+      .join('\n');
   }
 
   /**
@@ -133,8 +147,18 @@
   //  데이터 관리
   // ═══════════════════════════════════════
 
-  let lookupData = {};
+  let lookupData = {};       // 원본 키 → 번역문 (UI 표시용)
+  let normalizedIndex = {};  // 정규화된 키 → 번역문 (매칭용)
   let dataCount = 0;
+
+  /** lookupData에서 normalizedIndex 재구축 */
+  function rebuildIndex() {
+    normalizedIndex = {};
+    for (const [key, value] of Object.entries(lookupData)) {
+      const normKey = normalize(key);
+      if (normKey) normalizedIndex[normKey] = value;
+    }
+  }
 
   /** sessionStorage 저장 */
   function saveToSession() {
@@ -152,6 +176,7 @@
       if (saved) {
         lookupData = JSON.parse(saved);
         dataCount = Object.keys(lookupData).length;
+        rebuildIndex();
         console.log(`${LOG_PREFIX} sessionStorage에서 ${dataCount}건 복원`);
       }
     } catch (e) {
@@ -162,6 +187,7 @@
   /** 데이터 초기화 */
   function clearData() {
     lookupData = {};
+    normalizedIndex = {};
     dataCount = 0;
     saveToSession();
     document.getElementById('cat-lookup-input').value = '';
@@ -171,16 +197,14 @@
     console.log(`${LOG_PREFIX} 데이터 초기화`);
   }
 
-  /** 정규화된 키로 번역문 검색 */
+  /** 정규화 인덱스로 번역문 검색 (O(1)) */
   function findTranslation(sourceText) {
-    // 1순위: 완전 일치
+    // 1순위: 원본 키 완전 일치 (가장 빠른 경로)
     if (lookupData[sourceText]) return lookupData[sourceText];
 
-    // 2순위: 정규화 후 비교
-    const normalizedSource = normalize(sourceText);
-    for (const [key, value] of Object.entries(lookupData)) {
-      if (normalize(key) === normalizedSource) return value;
-    }
+    // 2순위: 정규화 인덱스 조회
+    const normSource = normalize(sourceText);
+    if (normalizedIndex[normSource]) return normalizedIndex[normSource];
 
     return null;
   }
@@ -381,6 +405,7 @@
     // 기존 데이터에 추가
     Object.assign(lookupData, newData);
     dataCount = Object.keys(lookupData).length;
+    rebuildIndex();
     saveToSession();
 
     document.getElementById('cat-lookup-count').textContent = dataCount;
@@ -501,7 +526,7 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v2.1 로드 완료`);
+  console.log(`${LOG_PREFIX} v2.2 로드 완료`);
   console.log('  Alt+Q       → 팝업 열기/닫기');
   console.log('  Alt+W       → 현재 세그먼트 매칭 삽입');
   console.log('  Alt+Shift+W → 전체 세그먼트 일괄 삽입');
