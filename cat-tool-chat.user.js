@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.3.3
+// @version      0.5.0
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @run-at       document-end
@@ -16,7 +16,10 @@
     // ========================================================================
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
-        ACTIVE_PROMPT_ID: 'tms_workflow_active_prompt_v1',
+        ACTIVE_PROMPT_ID: 'tms_workflow_active_prompt_v1', // legacy: v0.4.0 마이그레이션 폴백용. 신규 코드는 CHAT/BATCH ID를 사용.
+        CHAT_ACTIVE_PROMPT_ID: 'tms_workflow_chat_active_prompt_v1',
+        BATCH_ACTIVE_PROMPT_ID: 'tms_workflow_batch_active_prompt_v1',
+        PROMPT_LOCK_LINKED: 'tms_workflow_prompt_lock_v1',
         SESSIONS: 'tms_workflow_sessions_v1',
         MODEL: 'tms_workflow_model_v1',
         MODAL_POS: 'tms_workflow_modal_pos_v1',
@@ -789,16 +792,51 @@
     function savePrompts(prompts) {
         lsSet(LS_KEYS.SYSTEM_PROMPTS, prompts);
     }
-    function getActivePromptId() {
-        return lsGet(LS_KEYS.ACTIVE_PROMPT_ID, 'default');
+
+    // ----- 활성 프롬프트 ID: 채팅/배치 분리 (v0.4.0+) -----
+    // 기존 단일 ACTIVE_PROMPT_ID에서 마이그레이션. 한 번만 실행하면 충분.
+    function migrateActivePromptIdsIfNeeded() {
+        const chatId = lsGet(LS_KEYS.CHAT_ACTIVE_PROMPT_ID, null);
+        const batchId = lsGet(LS_KEYS.BATCH_ACTIVE_PROMPT_ID, null);
+        if (chatId !== null && batchId !== null) return; // 이미 마이그레이션 완료
+
+        const legacyId = lsGet(LS_KEYS.ACTIVE_PROMPT_ID, 'default');
+        if (chatId === null) lsSet(LS_KEYS.CHAT_ACTIVE_PROMPT_ID, legacyId);
+        if (batchId === null) lsSet(LS_KEYS.BATCH_ACTIVE_PROMPT_ID, legacyId);
     }
-    function setActivePromptId(id) {
-        lsSet(LS_KEYS.ACTIVE_PROMPT_ID, id);
+    migrateActivePromptIdsIfNeeded();
+
+    function getChatActivePromptId() {
+        return lsGet(LS_KEYS.CHAT_ACTIVE_PROMPT_ID, null)
+            || lsGet(LS_KEYS.ACTIVE_PROMPT_ID, 'default');
     }
-    function getActivePrompt() {
+    function setChatActivePromptId(id) {
+        lsSet(LS_KEYS.CHAT_ACTIVE_PROMPT_ID, id);
+    }
+    function getBatchActivePromptId() {
+        return lsGet(LS_KEYS.BATCH_ACTIVE_PROMPT_ID, null)
+            || lsGet(LS_KEYS.ACTIVE_PROMPT_ID, 'default');
+    }
+    function setBatchActivePromptId(id) {
+        lsSet(LS_KEYS.BATCH_ACTIVE_PROMPT_ID, id);
+    }
+    function getChatActivePrompt() {
         const prompts = loadPrompts();
-        const id = getActivePromptId();
+        const id = getChatActivePromptId();
         return prompts.find(p => p.id === id) || prompts[0];
+    }
+    function getBatchActivePrompt() {
+        const prompts = loadPrompts();
+        const id = getBatchActivePromptId();
+        return prompts.find(p => p.id === id) || prompts[0];
+    }
+
+    // 잠금: ON이면 채팅/배치 활성 ID가 같이 움직임 (실시간 동기화)
+    function getPromptLockLinked() {
+        return !!lsGet(LS_KEYS.PROMPT_LOCK_LINKED, false);
+    }
+    function setPromptLockLinked(linked) {
+        lsSet(LS_KEYS.PROMPT_LOCK_LINKED, !!linked);
     }
 
     function getSelectedModel() {
@@ -869,6 +907,86 @@
             console.warn('[TMS-WF] data-key에서 string_id 추출 실패:', activeItem.dataset?.key);
         }
         return null;
+    }
+
+    // ========================================================================
+    // 세그먼트 통합 상태 (채팅·배치 합쳐서 조회)
+    // ========================================================================
+    /**
+     * 세그먼트 하나에 대해 채팅 세션과 배치 실행 결과를 통합 조회.
+     * 읽기 전용. UI 표시 및 추후 크로스 액션의 기반.
+     *
+     * @param {number|string} stringId
+     * @returns {{
+     *   id: number|string,
+     *   chat: {
+     *     hasSession: boolean,
+     *     messageCount: number,
+     *     lastTranslation: string|null,
+     *     updatedAt: number|null
+     *   },
+     *   batch: {
+     *     runId: string|null,
+     *     hasPhase3: boolean,
+     *     phase3Text: string|null,
+     *     groupId: string|null,
+     *     hasRevision: boolean,
+     *     revisionText: string|null,
+     *     changed: boolean,
+     *     reasons: string[]
+     *   },
+     *   finalCandidate: string|null,
+     *   status: 'fresh'|'chat_only'|'batch_only'|'both'
+     * }}
+     */
+    function getSegmentWorkState(stringId) {
+        const id = normalizeId(stringId);
+
+        // 채팅 세션 측
+        const sessions = loadSessions();
+        const session = sessions[id] || sessions[String(id)] || null;
+        const messages = (session && Array.isArray(session.messages)) ? session.messages : [];
+        const lastAi = [...messages].reverse().find(m => m.role === 'ai') || null;
+        const chat = {
+            hasSession: messages.length > 0,
+            messageCount: messages.length,
+            lastTranslation: lastAi?.content || null,
+            updatedAt: session?.updated || null,
+        };
+
+        // 배치 측 (활성 런만 참조 — 일관성 유지)
+        const run = batchRun || restoreActiveBatchRun();
+        const phase3Item = run?.phase3?.parsed?.translations
+            ?.find(t => normalizeId(t.id) === id) || null;
+        const revisionItem = run?.phase45?.parsed?.revisions
+            ?.find(r => normalizeId(r.id) === id) || null;
+
+        const batch = {
+            runId: run?.runId || null,
+            hasPhase3: !!phase3Item,
+            phase3Text: phase3Item?.t || null,
+            groupId: phase3Item?.gid || revisionItem?.gid || null,
+            hasRevision: !!revisionItem,
+            // revisionItem.t === null 의미: Phase 3 그대로 사용 (변경 없음)
+            revisionText: (revisionItem && revisionItem.t !== null && typeof revisionItem.t === 'string')
+                ? revisionItem.t
+                : null,
+            changed: !!(revisionItem && revisionItem.t !== null && revisionItem.t !== undefined),
+            reasons: Array.isArray(revisionItem?.r) ? revisionItem.r : [],
+        };
+
+        // 최종 후보: revision 수정문 → phase3 → 채팅 마지막 AI 답변 순
+        const finalCandidate = batch.revisionText
+            || batch.phase3Text
+            || chat.lastTranslation
+            || null;
+
+        let status = 'fresh';
+        if (chat.hasSession && (batch.hasPhase3 || batch.hasRevision)) status = 'both';
+        else if (chat.hasSession) status = 'chat_only';
+        else if (batch.hasPhase3 || batch.hasRevision) status = 'batch_only';
+
+        return { id, chat, batch, finalCandidate, status };
     }
 
     // ========================================================================
@@ -1105,7 +1223,7 @@
     }
 
     function getWorkflowBasePrompt() {
-        const activePrompt = getActivePrompt();
+        const activePrompt = getBatchActivePrompt();
         const content = activePrompt?.content || '';
         if (!content.trim()) {
             throw new Error('배치 실행에는 v3.1 워크플로우 시스템 프롬프트가 필요합니다. 설정에서 프롬프트를 먼저 선택하세요.');
@@ -1393,7 +1511,7 @@
             <div class="tw-input-controls">
                 <label class="tw-ctrl">
                     프롬프트:
-                    <select class="tw-prompt-select"></select>
+                    <select class="tw-prompt-select tw-chat-prompt-select"></select>
                 </label>
                 <label class="tw-ctrl">
                     모델:
@@ -1652,6 +1770,10 @@
 .tw-review-source { color: #aaa; max-height: 90px; overflow: hidden; }
 .tw-review-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 .tw-review-actions .tw-btn { width: 76px; }
+.tw-review-chat-badge {
+    margin-left: 6px; font-size: 11px; opacity: 0.85;
+    cursor: help;
+}
 .tw-log-output {
     flex: 1; margin: 0; overflow: auto; white-space: pre-wrap; word-break: break-word;
     background: #181818; border: 1px solid #333; border-radius: 6px; padding: 10px;
@@ -1724,14 +1846,38 @@
 .tw-settings-tab:hover { color: #ccc; background: #252525; }
 .tw-settings-tab.active { background: #2a2a2a; color: #4ade80; border-color: #4ade80; }
 .tw-settings-content { flex: 1; display: flex; gap: 12px; overflow: hidden; }
+.tw-settings-tab-prompts { flex-direction: column; }
+.tw-settings-prompt-toolbar {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 8px 10px; background: #252525; border-radius: 6px;
+    flex-shrink: 0;
+}
+.tw-prompt-lock-label {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: #e0e0e0; cursor: pointer;
+    user-select: none;
+}
+.tw-prompt-lock-label input[type="checkbox"] { accent-color: #4ade80; cursor: pointer; }
+.tw-prompt-lock-hint { color: #888; font-size: 11px; }
+.tw-settings-prompt-body { flex: 1; display: flex; gap: 12px; overflow: hidden; min-height: 0; }
 .tw-settings-list { width: 200px; background: #252525; border-radius: 6px; padding: 8px;
     overflow-y: auto; }
 .tw-settings-list-item {
     padding: 6px 10px; cursor: pointer; border-radius: 4px; margin-bottom: 2px;
     font-size: 12px; color: #ccc;
+    display: flex; align-items: center; gap: 6px;
 }
 .tw-settings-list-item:hover { background: #2a2a2a; }
 .tw-settings-list-item.active { background: #4ade80; color: #000; font-weight: 500; }
+.tw-prompt-list-name {
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tw-prompt-badges {
+    display: inline-flex; gap: 2px; flex-shrink: 0; font-size: 11px;
+}
+.tw-prompt-badge {
+    display: inline-block; line-height: 1;
+}
 .tw-settings-editor { flex: 1; display: flex; flex-direction: column; gap: 8px; }
 .tw-prompt-header-row { display: flex; gap: 8px; align-items: center; }
 .tw-prompt-name {
@@ -1769,19 +1915,43 @@
     }
 
     function renderAllPromptSelects(root = modalEl) {
-        $$('.tw-prompt-select', root).forEach(selectEl => renderPromptSelect(selectEl));
+        if (!root) return;
+        $$('.tw-chat-prompt-select', root).forEach(selectEl => renderChatPromptSelect(selectEl));
+        $$('.tw-batch-prompt-select', root).forEach(selectEl => renderBatchPromptSelect(selectEl));
     }
 
     function renderAllModelSelects(root = modalEl) {
         $$('.tw-model-select', root).forEach(selectEl => renderModelSelect(selectEl));
     }
 
-    function syncPromptSelects(promptId) {
-        setActivePromptId(promptId);
+    // 채팅 드롭다운 변경 → 채팅 활성 ID 저장. 잠금 ON이면 배치도 같이.
+    function syncChatPromptSelects(promptId) {
+        setChatActivePromptId(promptId);
         if (!modalEl) return;
-        $$('.tw-prompt-select', modalEl).forEach(selectEl => {
+        $$('.tw-chat-prompt-select', modalEl).forEach(selectEl => {
             selectEl.value = promptId;
         });
+        if (getPromptLockLinked()) {
+            setBatchActivePromptId(promptId);
+            $$('.tw-batch-prompt-select', modalEl).forEach(selectEl => {
+                selectEl.value = promptId;
+            });
+        }
+    }
+
+    // 배치 드롭다운 변경 → 배치 활성 ID 저장. 잠금 ON이면 채팅도 같이.
+    function syncBatchPromptSelects(promptId) {
+        setBatchActivePromptId(promptId);
+        if (!modalEl) return;
+        $$('.tw-batch-prompt-select', modalEl).forEach(selectEl => {
+            selectEl.value = promptId;
+        });
+        if (getPromptLockLinked()) {
+            setChatActivePromptId(promptId);
+            $$('.tw-chat-prompt-select', modalEl).forEach(selectEl => {
+                selectEl.value = promptId;
+            });
+        }
     }
 
     function syncModelSelects(model) {
@@ -1800,14 +1970,24 @@
         modelSelect.onchange = () => syncModelSelects(modelSelect.value);
     }
 
-    function renderPromptSelect(selectEl) {
+    function renderChatPromptSelect(selectEl) {
         if (!selectEl) return;
         const prompts = loadPrompts();
-        const activeId = getActivePromptId();
+        const activeId = getChatActivePromptId();
         selectEl.innerHTML = prompts.map(p =>
             `<option value="${p.id}" ${p.id === activeId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
         ).join('');
-        selectEl.onchange = () => syncPromptSelects(selectEl.value);
+        selectEl.onchange = () => syncChatPromptSelects(selectEl.value);
+    }
+
+    function renderBatchPromptSelect(selectEl) {
+        if (!selectEl) return;
+        const prompts = loadPrompts();
+        const activeId = getBatchActivePromptId();
+        selectEl.innerHTML = prompts.map(p =>
+            `<option value="${p.id}" ${p.id === activeId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
+        ).join('');
+        selectEl.onchange = () => syncBatchPromptSelects(selectEl.value);
     }
 
     // ========================================================================
@@ -1987,10 +2167,45 @@
         return ['collecting', 'phase12_running', 'phase3_running', 'phase45_running'].includes(status);
     }
 
-    function formatCoverage(coverage) {
-        if (!coverage) return '검증 전';
-        if (coverage.ok) return `OK (${coverage.actualCount}/${coverage.expectedCount})`;
-        return `누락 ${coverage.missing.length}, 추가 ${coverage.extra.length}, 중복 ${coverage.duplicates.length}`;
+    // 검증 객체에서 실패 사유를 짧은 토큰 배열로 추출. 간단 표시용.
+    function summarizeValidationIssues(validation) {
+        if (!validation) return [];
+        const tokens = [];
+        const c = validation.coverage;
+        if (c && !c.ok) {
+            if (c.missing?.length) tokens.push(`누락 ${c.missing.length}`);
+            if (c.extra?.length) tokens.push(`추가 ${c.extra.length}`);
+            if (c.duplicates?.length) tokens.push(`중복 ${c.duplicates.length}`);
+        }
+        // Phase 1+2 전용
+        if (validation.invalidGroups?.length) {
+            tokens.push(`그룹 스키마 ${validation.invalidGroups.length}`);
+        }
+        if (validation.groupsCount === 0) tokens.push('그룹 0');
+        // Phase 3 / 4+5 공용
+        if (validation.wrongGroups?.length) tokens.push(`그룹ID 불일치 ${validation.wrongGroups.length}`);
+        if (validation.invalidTranslationType?.length) tokens.push(`번역타입 ${validation.invalidTranslationType.length}`);
+        if (validation.emptyTranslations?.length) tokens.push(`빈 번역 ${validation.emptyTranslations.length}`);
+        if (validation.missingPlaceholders?.length) tokens.push(`플레이스홀더 누락 ${validation.missingPlaceholders.length}`);
+        if (validation.hanjaLike?.length) tokens.push(`한자 잔존 ${validation.hanjaLike.length}`);
+        // Phase 4+5 전용
+        if (validation.missingTField?.length) tokens.push(`t 필드 ${validation.missingTField.length}`);
+        if (validation.invalidTType?.length) tokens.push(`t 타입 ${validation.invalidTType.length}`);
+        if (validation.invalidReasons?.length) tokens.push(`reason ${validation.invalidReasons.length}`);
+        if (validation.emptyFinals?.length) tokens.push(`빈 최종 ${validation.emptyFinals.length}`);
+        return tokens;
+    }
+
+    function formatPhaseValidation(validation) {
+        if (!validation) return '대기';
+        const c = validation.coverage;
+        if (validation.ok) {
+            return c ? `OK (${c.actualCount}/${c.expectedCount})` : 'OK';
+        }
+        const issues = summarizeValidationIssues(validation);
+        const issueStr = issues.length ? ` — ${issues.join(', ')}` : '';
+        const counts = c ? ` (${c.actualCount}/${c.expectedCount})` : '';
+        return `주의 필요${counts}${issueStr}`;
     }
 
     function renderBatchRun() {
@@ -2028,9 +2243,9 @@
         ].join('\n');
 
         validationEl.textContent = [
-            `Phase 1+2: ${formatCoverage(run.phase12?.validation?.coverage)}`,
-            `Phase 3: ${run.phase3?.validation ? (run.phase3.validation.ok ? 'OK' : '주의 필요') : '대기'}`,
-            `Phase 4+5: ${run.phase45?.validation ? (run.phase45.validation.ok ? 'OK' : '주의 필요') : '대기'}`,
+            `Phase 1+2: ${formatPhaseValidation(run.phase12?.validation)}`,
+            `Phase 3: ${formatPhaseValidation(run.phase3?.validation)}`,
+            `Phase 4+5: ${formatPhaseValidation(run.phase45?.validation)}`,
             run.lastError ? `마지막 오류: ${run.lastError}` : null,
         ].filter(Boolean).join('\n');
 
@@ -2250,10 +2465,14 @@
             const finalText = getBatchFinalText(id);
             const revisionText = revision && revision.t !== null ? String(revision.t || '') : '';
             const flag = revision ? (revision.t === null ? '유지' : `수정: ${(revision.r || []).join(', ') || 'reason 없음'}`) : 'Phase3';
+            const workState = getSegmentWorkState(id);
+            const chatBadge = workState.chat.hasSession
+                ? `<span class="tw-review-chat-badge" title="채팅 세션 ${workState.chat.messageCount}개 메시지">💬</span>`
+                : '';
             return `
 <div class="tw-review-row">
     <div class="tw-review-cell tw-review-check" data-label="선택"><input class="tw-review-select" type="checkbox" data-id="${escapeHtml(id)}"></div>
-    <div class="tw-review-cell" data-label="ID">#${escapeHtml(id)}</div>
+    <div class="tw-review-cell" data-label="ID">#${escapeHtml(id)}${chatBadge}</div>
     <div class="tw-review-cell" data-label="그룹">${escapeHtml(item.gid || '')}</div>
     <div class="tw-review-cell tw-review-source" data-label="원문">${escapeHtml(seg?.origin_string || '')}</div>
     <div class="tw-review-cell" data-label="Phase 3">${escapeHtml(item.t || '')}</div>
@@ -2406,7 +2625,10 @@
             const { raw, parsed } = await waitForExpectedBatchResult(run, phaseTag, previousRaw);
             const validation = validateParsedPhase(run, phaseTag, parsed);
             storePhaseResult(run, phaseTag, raw, parsed, validation);
-            appendBatchLog(`Phase ${phaseTag} 검증: ${validation.ok ? 'OK' : '주의 필요'}`, validation.ok ? 'success' : 'warn');
+            appendBatchLog(
+                `Phase ${phaseTag} 검증: ${formatPhaseValidation(validation)}`,
+                validation.ok ? 'success' : 'warn'
+            );
             persistBatchRun(run);
             renderBatchRun();
             if (validation.ok) toast(`Phase ${phaseTag} 완료`, 'success');
@@ -2450,7 +2672,10 @@
             }
             const validation = validateParsedPhase(run, run.lastExpectedPhase, parsed);
             storePhaseResult(run, run.lastExpectedPhase, raw, parsed, validation);
-            appendBatchLog(`결과 다시 읽기 검증: ${validation.ok ? 'OK' : '주의 필요'}`, validation.ok ? 'success' : 'warn');
+            appendBatchLog(
+                `결과 다시 읽기 검증: ${formatPhaseValidation(validation)}`,
+                validation.ok ? 'success' : 'warn'
+            );
             persistBatchRun(run);
             renderBatchRun();
             toast('저장 결과를 다시 읽었습니다.', validation.ok ? 'success' : 'info');
@@ -2596,6 +2821,34 @@
     <div class="tw-context-value">${escapeHtml(seg.context)}</div>
 </div>`);
             }
+
+            // 배치 정보 (있을 때만 표시)
+            const workState = getSegmentWorkState(stringId);
+            if (workState.batch.hasPhase3 || workState.batch.hasRevision) {
+                const lines = [];
+                if (workState.batch.groupId) {
+                    lines.push(`<div><b>그룹:</b> ${escapeHtml(workState.batch.groupId)}</div>`);
+                }
+                if (workState.batch.phase3Text) {
+                    lines.push(`<div><b>Phase 3:</b> ${escapeHtml(workState.batch.phase3Text)}</div>`);
+                }
+                if (workState.batch.hasRevision) {
+                    if (workState.batch.changed && workState.batch.revisionText) {
+                        const reasons = workState.batch.reasons.length
+                            ? ` <span class="tw-muted">(${escapeHtml(workState.batch.reasons.join(', '))})</span>`
+                            : '';
+                        lines.push(`<div><b>Phase 4+5:</b> ${escapeHtml(workState.batch.revisionText)}${reasons}</div>`);
+                    } else {
+                        lines.push(`<div><b>Phase 4+5:</b> <span class="tw-muted">유지 (Phase 3 그대로)</span></div>`);
+                    }
+                }
+                sections.push(`
+<div class="tw-context-section">
+    <div class="tw-context-label">📦 배치 결과</div>
+    <div class="tw-context-value">${lines.join('')}</div>
+</div>`);
+            }
+
             contentEl.innerHTML = sections.join('');
         } catch (e) {
             contentEl.innerHTML = `<span class="tw-muted">오류: ${escapeHtml(e.message)}</span>`;
@@ -2668,7 +2921,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
         try {
             // 프롬프트 조립
-            const activePrompt = getActivePrompt();
+            const activePrompt = getChatActivePrompt();
             const systemPrompt = activePrompt?.content || '';
             const segmentCtx = buildSegmentContext(currentSegment);
 
@@ -2791,16 +3044,25 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         <button class="tw-btn tw-btn-ghost tw-btn-settings-close">닫기</button>
     </div>
     <div class="tw-settings-content tw-settings-tab-prompts">
-        <div class="tw-settings-list"></div>
-        <div class="tw-settings-editor">
-            <div class="tw-prompt-header-row">
-                <input type="text" class="tw-prompt-name" placeholder="프롬프트 이름">
-                <button class="tw-btn tw-btn-ghost tw-btn-settings-new">+ 새 프롬프트</button>
-            </div>
-            <textarea class="tw-prompt-content" placeholder="시스템 프롬프트 내용을 입력하세요 (예: v3.0 프롬프트)"></textarea>
-            <div class="tw-settings-buttons">
-                <button class="tw-btn tw-btn-ghost tw-btn-settings-delete">🗑️ 삭제</button>
-                <button class="tw-btn tw-btn-primary tw-btn-settings-save" style="margin-left:auto">💾 저장</button>
+        <div class="tw-settings-prompt-toolbar">
+            <label class="tw-prompt-lock-label">
+                <input type="checkbox" class="tw-prompt-lock-toggle">
+                <span>채팅 · 배치 프롬프트 동기화 (잠금)</span>
+            </label>
+            <span class="tw-prompt-lock-hint">체크 시 한쪽 변경이 양쪽에 반영됩니다.</span>
+        </div>
+        <div class="tw-settings-prompt-body">
+            <div class="tw-settings-list"></div>
+            <div class="tw-settings-editor">
+                <div class="tw-prompt-header-row">
+                    <input type="text" class="tw-prompt-name" placeholder="프롬프트 이름">
+                    <button class="tw-btn tw-btn-ghost tw-btn-settings-new">+ 새 프롬프트</button>
+                </div>
+                <textarea class="tw-prompt-content" placeholder="시스템 프롬프트 내용을 입력하세요 (예: v3.0 프롬프트)"></textarea>
+                <div class="tw-settings-buttons">
+                    <button class="tw-btn tw-btn-ghost tw-btn-settings-delete">🗑️ 삭제</button>
+                    <button class="tw-btn tw-btn-primary tw-btn-settings-save" style="margin-left:auto">💾 저장</button>
+                </div>
             </div>
         </div>
     </div>
@@ -2865,7 +3127,27 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         });
 
         // ==== 시스템 프롬프트 탭 ====
-        let currentEditingId = getActivePromptId();
+        // 잠금 토글: 채팅·배치 활성 프롬프트 동기화
+        const lockToggle = $('.tw-prompt-lock-toggle', overlay);
+        if (lockToggle) {
+            lockToggle.checked = getPromptLockLinked();
+            lockToggle.addEventListener('change', () => {
+                const linked = lockToggle.checked;
+                setPromptLockLinked(linked);
+                if (linked) {
+                    // 활성화 시점: 채팅 ID를 기준으로 양쪽 통일 (드롭다운 즉시 반영)
+                    const chatId = getChatActivePromptId();
+                    syncChatPromptSelects(chatId);
+                    toast('채팅·배치 프롬프트가 동기화되었습니다.', 'success');
+                } else {
+                    toast('동기화가 해제되었습니다. 양쪽 프롬프트를 따로 선택할 수 있습니다.', 'info');
+                }
+                refresh(); // 뱃지 다시 그리기
+            });
+        }
+
+        // 편집 진입 시 기본으로 보여줄 프롬프트: 채팅 활성 프롬프트 기준
+        let currentEditingId = getChatActivePromptId();
 
         const listEl = $('.tw-settings-list', overlay);
         const nameInput = $('.tw-prompt-name', overlay);
@@ -2873,10 +3155,19 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
         function refresh() {
             const prompts = loadPrompts();
-            listEl.innerHTML = prompts.map(p =>
-                `<div class="tw-settings-list-item ${p.id === currentEditingId ? 'active' : ''}"
-                      data-id="${p.id}">${escapeHtml(p.name)}</div>`
-            ).join('');
+            const chatActiveId = getChatActivePromptId();
+            const batchActiveId = getBatchActivePromptId();
+            listEl.innerHTML = prompts.map(p => {
+                const badges = [];
+                if (p.id === chatActiveId) badges.push('<span class="tw-prompt-badge tw-prompt-badge-chat" title="채팅 탭에서 활성">💬</span>');
+                if (p.id === batchActiveId) badges.push('<span class="tw-prompt-badge tw-prompt-badge-batch" title="배치 탭에서 활성">📦</span>');
+                const badgeHtml = badges.length ? `<span class="tw-prompt-badges">${badges.join('')}</span>` : '';
+                return `<div class="tw-settings-list-item ${p.id === currentEditingId ? 'active' : ''}"
+                              data-id="${p.id}">
+                          <span class="tw-prompt-list-name">${escapeHtml(p.name)}</span>
+                          ${badgeHtml}
+                        </div>`;
+            }).join('');
             $$('.tw-settings-list-item', listEl).forEach(item => {
                 item.addEventListener('click', () => {
                     currentEditingId = item.dataset.id;
@@ -2929,15 +3220,36 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 toast('최소 1개의 프롬프트는 유지해야 합니다.', 'error');
                 return;
             }
-            if (!confirm(`'${nameInput.value}' 프롬프트를 삭제하시겠습니까?`)) return;
+
+            // 삭제 대상이 채팅·배치에서 활성인지 점검
+            const activeIn = [];
+            if (getChatActivePromptId() === currentEditingId) activeIn.push('채팅');
+            if (getBatchActivePromptId() === currentEditingId) activeIn.push('배치');
+
+            const targetName = nameInput.value || '(이름 없음)';
+            let confirmMsg = `'${targetName}' 프롬프트를 삭제하시겠습니까?`;
+            if (activeIn.length) {
+                confirmMsg = `⚠️ '${targetName}' 프롬프트는 현재 ${activeIn.join('과 ')} 탭에서 활성입니다.\n` +
+                    `삭제하면 첫 번째 프롬프트로 자동 전환됩니다.\n\n` +
+                    `계속 삭제하시겠습니까?`;
+            }
+
+            if (!confirm(confirmMsg)) return;
+
             const filtered = prompts.filter(x => x.id !== currentEditingId);
             savePrompts(filtered);
-            if (getActivePromptId() === currentEditingId) {
-                setActivePromptId(filtered[0].id);
+            // 채팅·배치 활성 ID가 삭제 대상이면 각각 첫 번째 프롬프트로 폴백
+            if (getChatActivePromptId() === currentEditingId) {
+                setChatActivePromptId(filtered[0].id);
+            }
+            if (getBatchActivePromptId() === currentEditingId) {
+                setBatchActivePromptId(filtered[0].id);
             }
             currentEditingId = filtered[0].id;
             refresh();
-            toast('삭제됨', 'success');
+            // 폴백된 활성 ID가 메인 모달의 드롭다운에도 반영되도록
+            renderAllPromptSelects(modalEl);
+            toast(activeIn.length ? '삭제됨. 활성 프롬프트가 변경되었습니다.' : '삭제됨', 'success');
         });
 
         // ==== 세션 관리 탭 ====
@@ -3140,6 +3452,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.3.3] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.5.0] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
