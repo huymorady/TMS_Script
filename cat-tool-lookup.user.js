@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 번역 조회 팝업
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  Alt+Q → 팝업 열기/닫기 / Alt+W → 현재 세그먼트 매칭 삽입 / Alt+Shift+W → 전체 일괄 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-lookup.user.js
@@ -91,14 +91,23 @@
   }
 
   /**
-   * 원문의 <br> 사용 여부에 따라 번역문의 <br>을 보존할지 \n으로 변환할지 결정
+   * 원문의 <br> 사용 패턴에 따라 번역문을 변환
    *
-   * - 원문에 <br>이 텍스트로 노출되어 있으면 → 번역문도 <br> 그대로 (작성자가 의도적으로 노출시킨 마커)
-   * - 원문에 <br>이 없으면 (진짜 줄바꿈만 있거나, 단일 라인) → 기존처럼 \n으로 변환
+   * 1) 원문에 <br>이 텍스트로 노출되어 있으면:
+   *    - 번역문의 <br>도 보존 (작성자가 의도적으로 노출시킨 마커)
+   *    - 추가로 각 <br> 뒤에 진짜 줄바꿈도 삽입 → 원문의 시각적 줄 구조와 일치시킴
+   *    - 단, 번역문에 이미 <br> 뒤에 줄바꿈이 있으면 중복 추가하지 않음
+   *
+   * 2) 원문에 <br>이 없으면 (진짜 줄바꿈만 있거나 단일 라인):
+   *    - 기존처럼 <br> → \n으로 변환
    */
   function convertTranslationForOrigin(translation, origin) {
     const originHasBrText = origin && /<br\s*\/?>/i.test(origin);
-    if (originHasBrText) return translation;
+    if (originHasBrText) {
+      return translation.replace(/<br\s*\/?>(\r?\n)?/gi, (match, existingNewline) => {
+        return existingNewline ? match : match + '\n';
+      });
+    }
     return translation.replace(/<br\s*\/?>/gi, '\n');
   }
 
@@ -537,7 +546,7 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v2.3 로드 완료`);
+  console.log(`${LOG_PREFIX} v2.4 로드 완료`);
   console.log('  Alt+Q       → 팝업 열기/닫기');
   console.log('  Alt+W       → 현재 세그먼트 매칭 삽입');
   console.log('  Alt+Shift+W → 전체 세그먼트 일괄 삽입');
