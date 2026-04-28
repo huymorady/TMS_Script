@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 번역 조회 팝업
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  Alt+Q → 팝업 열기/닫기 / Alt+W → 현재 세그먼트 매칭 삽입 / Alt+Shift+W → 전체 일괄 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-lookup.user.js
@@ -29,10 +29,11 @@
   // sessionStorage 키
   const STORAGE_KEY = 'cat-lookup-data';
 
-  // 헤더 열 이름
-  const HEADER = {
-    SOURCE: '원문',
-    TARGET: '번역문',
+  // 헤더 별칭 (괄호 안 부가정보 — 예: "(zh-CN)", "(ko-KR)" — 는 자동 제거 후 비교)
+  // 배열의 첫 번째 원소가 "대표 이름"으로 미리보기 등 UI에 표시됨
+  const HEADER_ALIASES = {
+    SOURCE: ['원문'],
+    TARGET: ['번역문', '최종 수정안'],
   };
 
   // ═══════════════════════════════════════
@@ -55,6 +56,24 @@
       .replace(/\r\n/g, '\n')
       .replace(/\r/g, '\n')
       .trim();
+  }
+
+  /**
+   * 헤더 셀에서 괄호 안 부가정보를 제거하고 별칭과 비교
+   * 예) "원문 (zh-CN)"  → "원문"     → SOURCE 매칭
+   *     "최종 수정안 (ko-KR)" → "최종 수정안" → TARGET 매칭
+   *     "번역문"        → "번역문"   → TARGET 매칭
+   *
+   * 괄호는 반각 () 와 전각 () 모두 인식.
+   * 공백은 모두 단일 공백으로 압축한 뒤 양 끝 trim.
+   */
+  function matchHeaderAlias(cell, aliases) {
+    if (!cell) return false;
+    const normalized = cell
+      .replace(/[\(（][^)）]*[\)）]/g, '') // 괄호와 그 내용 제거 (반각/전각 모두)
+      .replace(/\s+/g, ' ')
+      .trim();
+    return aliases.some(alias => normalized === alias);
   }
 
   /** textarea 값 설정 (Vue/React 반응성 대응, <br> → \n 변환) */
@@ -316,19 +335,26 @@
       return;
     }
 
-    // 헤더 행에서 열 인덱스 자동 감지
+    // 헤더 행에서 열 인덱스 자동 감지 (별칭 + 괄호 부가정보 허용)
     const headerCells = lines[0].split('|').map(c => c.trim()).filter(c => c !== '');
     let srcIdx = -1;
     let tgtIdx = -1;
 
     for (let i = 0; i < headerCells.length; i++) {
-      if (headerCells[i] === HEADER.SOURCE) srcIdx = i;
-      if (headerCells[i] === HEADER.TARGET) tgtIdx = i;
+      if (srcIdx === -1 && matchHeaderAlias(headerCells[i], HEADER_ALIASES.SOURCE)) {
+        srcIdx = i;
+        continue;
+      }
+      if (tgtIdx === -1 && matchHeaderAlias(headerCells[i], HEADER_ALIASES.TARGET)) {
+        tgtIdx = i;
+      }
     }
 
     if (srcIdx === -1 || tgtIdx === -1) {
+      const srcList = HEADER_ALIASES.SOURCE.join(' / ');
+      const tgtList = HEADER_ALIASES.TARGET.join(' / ');
       document.getElementById('cat-lookup-status').textContent =
-        `⚠ 헤더에서 "${HEADER.SOURCE}"과 "${HEADER.TARGET}" 열을 찾을 수 없습니다.`;
+        `⚠ 헤더에서 원문 열(${srcList})과 번역문 열(${tgtList})을 찾을 수 없습니다.`;
       return;
     }
 
@@ -359,11 +385,11 @@
 
     document.getElementById('cat-lookup-count').textContent = dataCount;
     document.getElementById('cat-lookup-status').textContent =
-      `✅ ${parsed}건 파싱 완료 (총 ${dataCount}건 저장)`;
+      `✅ ${parsed}건 파싱 완료 (총 ${dataCount}건 저장) — 원문="${headerCells[srcIdx]}", 번역문="${headerCells[tgtIdx]}"`;
 
     updatePreview();
 
-    console.log(`${LOG_PREFIX} ${parsed}건 파싱, 총 ${dataCount}건 저장`);
+    console.log(`${LOG_PREFIX} ${parsed}건 파싱, 총 ${dataCount}건 저장 (헤더: "${headerCells[srcIdx]}" / "${headerCells[tgtIdx]}")`);
     if (window.catToast) window.catToast(`📋 ${parsed}건 파싱 완료 (총 ${dataCount}건)`);
   }
 
@@ -378,7 +404,10 @@
       return;
     }
 
-    let html = `<table><tr><th>${HEADER.SOURCE}</th><th>${HEADER.TARGET}</th></tr>`;
+    const srcLabel = HEADER_ALIASES.SOURCE[0];
+    const tgtLabel = HEADER_ALIASES.TARGET[0];
+
+    let html = `<table><tr><th>${srcLabel}</th><th>${tgtLabel}</th></tr>`;
     const show = entries.slice(-20);
     for (const [src, tgt] of show) {
       html += `<tr><td>${escapeHtml(src)}</td><td>${escapeHtml(tgt)}</td></tr>`;
@@ -472,8 +501,10 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v2.0 로드 완료`);
+  console.log(`${LOG_PREFIX} v2.1 로드 완료`);
   console.log('  Alt+Q       → 팝업 열기/닫기');
   console.log('  Alt+W       → 현재 세그먼트 매칭 삽입');
   console.log('  Alt+Shift+W → 전체 세그먼트 일괄 삽입');
+  console.log(`  지원 헤더(원문):   ${HEADER_ALIASES.SOURCE.join(' / ')} (+ "(zh-CN)" 같은 괄호 부가정보 허용)`);
+  console.log(`  지원 헤더(번역문): ${HEADER_ALIASES.TARGET.join(' / ')} (+ "(ko-KR)" 같은 괄호 부가정보 허용)`);
 })();
