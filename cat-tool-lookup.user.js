@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 번역 조회 팝업
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Alt+Q → 팝업 열기/닫기 / Alt+W → 현재 세그먼트 매칭 삽입 / Alt+Shift+W → 전체 일괄 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-lookup.user.js
@@ -95,20 +95,34 @@
    *
    * 1) 원문에 <br>이 텍스트로 노출되어 있으면:
    *    - 번역문의 <br>도 보존 (작성자가 의도적으로 노출시킨 마커)
-   *    - 추가로 각 <br> 뒤에 진짜 줄바꿈도 삽입 → 원문의 시각적 줄 구조와 일치시킴
-   *    - 단, 번역문에 이미 <br> 뒤에 줄바꿈이 있으면 중복 추가하지 않음
+   *    - 연속된 <br><br>은 "줄 끝 + 빈 줄" 단락 구분자로 인식
+   *      → 첫 <br>만 남기고 나머지는 빈 줄(\n\n...)로 변환
+   *      예) "A<br><br>B"   → "A<br>\n\nB"
+   *           "A<br><br><br>B" → "A<br>\n\n\nB"
+   *    - 남은 <br> 뒤에는 줄바꿈을 추가하여 원문의 시각적 줄 구조와 일치시킴
+   *    - 이미 <br> 뒤에 줄바꿈이 있으면 중복 추가하지 않음
    *
    * 2) 원문에 <br>이 없으면 (진짜 줄바꿈만 있거나 단일 라인):
    *    - 기존처럼 <br> → \n으로 변환
    */
   function convertTranslationForOrigin(translation, origin) {
     const originHasBrText = origin && /<br\s*\/?>/i.test(origin);
-    if (originHasBrText) {
-      return translation.replace(/<br\s*\/?>(\r?\n)?/gi, (match, existingNewline) => {
-        return existingNewline ? match : match + '\n';
-      });
+    if (!originHasBrText) {
+      return translation.replace(/<br\s*\/?>/gi, '\n');
     }
-    return translation.replace(/<br\s*\/?>/gi, '\n');
+
+    // 1단계: 연속된 <br>을 단락 구분자로 처리
+    let result = translation.replace(/(<br\s*\/?>)((?:\s*<br\s*\/?>)+)/gi, (match, first, rest) => {
+      const extraBrCount = (rest.match(/<br\s*\/?>/gi) || []).length;
+      return first + '\n' + '\n'.repeat(extraBrCount);
+    });
+
+    // 2단계: 남은 <br> 뒤에 줄바꿈 추가 (이미 있으면 중복 방지)
+    result = result.replace(/<br\s*\/?>(\r?\n)?/gi, (match, existingNewline) => {
+      return existingNewline ? match : match + '\n';
+    });
+
+    return result;
   }
 
   /** textarea 값 설정 (Vue/React 반응성 대응) */
@@ -546,7 +560,7 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v2.4 로드 완료`);
+  console.log(`${LOG_PREFIX} v2.5 로드 완료`);
   console.log('  Alt+Q       → 팝업 열기/닫기');
   console.log('  Alt+W       → 현재 세그먼트 매칭 삽입');
   console.log('  Alt+Shift+W → 전체 세그먼트 일괄 삽입');
