@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 번역 조회 팝업
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Alt+Q → 팝업 열기/닫기 / Alt+W → 현재 세그먼트 매칭 삽입 / Alt+Shift+W → 전체 일괄 삽입
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-lookup.user.js
@@ -91,19 +91,95 @@
   }
 
   /**
-   * 원문의 <br> 사용 패턴에 따라 번역문을 변환
+   * 텍스트를 단락으로 분할.
+   * - <br>과 \n은 모두 줄바꿈 효과를 가짐
+   * - 줄바꿈 효과가 ≥ 2 연속이면 단락 경계 (즉 "빈 줄" 발생)
+   * - 단락 안의 <br>은 보존, 단락 사이의 separator도 원본 그대로 보존
    *
-   * 1) 원문에 <br>이 텍스트로 노출되어 있으면:
-   *    - 번역문의 <br>도 보존 (작성자가 의도적으로 노출시킨 마커)
-   *    - 연속된 <br><br>은 "줄 끝 + 빈 줄" 단락 구분자로 인식
-   *      → 첫 <br>만 남기고 나머지는 빈 줄(\n\n...)로 변환
-   *      예) "A<br><br>B"   → "A<br>\n\nB"
-   *           "A<br><br><br>B" → "A<br>\n\n\nB"
-   *    - 남은 <br> 뒤에는 줄바꿈을 추가하여 원문의 시각적 줄 구조와 일치시킴
-   *    - 이미 <br> 뒤에 줄바꿈이 있으면 중복 추가하지 않음
+   * 반환: [{ text, separatorAfter }, ...]
+   *   - text: 단락 본문 (단락 내부 <br>과 \n 그대로)
+   *   - separatorAfter: 다음 단락까지의 구분자 (마지막 단락은 끝 trailing 또는 '')
+   */
+  function parseParagraphs(text) {
+    const tempText = String(text || '').replace(/<br\s*\/?>/gi, '<<BR>>');
+
+    // 토큰화
+    const tokens = [];
+    let i = 0;
+    while (i < tempText.length) {
+      if (tempText.startsWith('<<BR>>', i)) {
+        tokens.push({ type: 'BR' });
+        i += 6;
+      } else if (tempText[i] === '\n') {
+        tokens.push({ type: 'NL' });
+        i += 1;
+      } else if (tempText[i] === '\r') {
+        i += 1;
+      } else {
+        let buf = '';
+        while (i < tempText.length && !tempText.startsWith('<<BR>>', i) && tempText[i] !== '\n' && tempText[i] !== '\r') {
+          buf += tempText[i];
+          i += 1;
+        }
+        tokens.push({ type: 'TEXT', raw: buf });
+      }
+    }
+
+    // 단락 분할
+    const paragraphs = [];
+    let currentText = '';
+    let buffer = '';
+    let bufferLineBreaks = 0;
+
+    function commitBuffer() {
+      if (currentText && bufferLineBreaks >= 2) {
+        paragraphs.push({ text: currentText, separatorAfter: buffer });
+        currentText = '';
+      } else if (currentText) {
+        currentText += buffer;
+      }
+      buffer = '';
+      bufferLineBreaks = 0;
+    }
+
+    for (const tok of tokens) {
+      if (tok.type === 'TEXT') {
+        if (tok.raw.trim() === '') {
+          buffer += tok.raw;
+        } else {
+          if (buffer || bufferLineBreaks > 0) commitBuffer();
+          currentText += tok.raw;
+        }
+      } else if (tok.type === 'BR') {
+        buffer += '<<BR>>';
+        bufferLineBreaks += 1;
+      } else if (tok.type === 'NL') {
+        buffer += '\n';
+        bufferLineBreaks += 1;
+      }
+    }
+
+    if (currentText) paragraphs.push({ text: currentText, separatorAfter: buffer });
+
+    return paragraphs.map(p => ({
+      text: p.text.replace(/<<BR>>/g, '<br>'),
+      separatorAfter: p.separatorAfter.replace(/<<BR>>/g, '<br>'),
+    }));
+  }
+
+  /**
+   * 원문의 <br>/줄 구조에 맞춰 번역문을 변환
    *
-   * 2) 원문에 <br>이 없으면 (진짜 줄바꿈만 있거나 단일 라인):
-   *    - 기존처럼 <br> → \n으로 변환
+   * 1) 원문에 <br>이 노출되어 있지 않으면 → <br> → \n 변환 (기존 동작)
+   *
+   * 2) 원문에 <br>이 노출되어 있으면:
+   *    a) 단락 개수가 일치 → 단락 인덱스 매핑
+   *       각 번역문 단락 사이에 원문 단락 사이의 separator를 그대로 삽입
+   *       → 원문 패턴(<br>, <br><br>, 빈 줄 위치 등)을 정확히 재현
+   *    b) 단락 개수가 불일치 → 안전 폴백
+   *       - 원문에 <br><br> 있으면: 번역문의 <br>은 모두 보존
+   *       - 원문에 <br><br> 없으면: 번역문의 <br><br>을 단락 구분자(\n\n)로 변환
+   *       - 어느 경우든 모든 <br> 뒤에 줄바꿈 추가
    */
   function convertTranslationForOrigin(translation, origin) {
     const originHasBrText = origin && /<br\s*\/?>/i.test(origin);
@@ -111,17 +187,39 @@
       return translation.replace(/<br\s*\/?>/gi, '\n');
     }
 
-    // 1단계: 연속된 <br>을 단락 구분자로 처리
-    let result = translation.replace(/(<br\s*\/?>)((?:\s*<br\s*\/?>)+)/gi, (match, first, rest) => {
-      const extraBrCount = (rest.match(/<br\s*\/?>/gi) || []).length;
-      return first + '\n' + '\n'.repeat(extraBrCount);
-    });
+    const originParas = parseParagraphs(origin);
+    const transParas = parseParagraphs(translation);
 
-    // 2단계: 남은 <br> 뒤에 줄바꿈 추가 (이미 있으면 중복 방지)
-    result = result.replace(/<br\s*\/?>(\r?\n)?/gi, (match, existingNewline) => {
-      return existingNewline ? match : match + '\n';
-    });
+    // 단락 개수 일치 → 인덱스 매핑
+    if (originParas.length > 0 && originParas.length === transParas.length) {
+      let result = '';
+      for (let idx = 0; idx < transParas.length; idx++) {
+        result += transParas[idx].text;
+        result += originParas[idx].separatorAfter;
+      }
+      // 단락 안의 <br> 뒤에 줄바꿈 추가 (시각 정렬)
+      result = result.replace(/<br\s*\/?>(\r?\n)?/gi, (match, existingNL) => {
+        return existingNL ? match : match + '\n';
+      });
+      return result;
+    }
 
+    // 폴백: 해석 B
+    const originHasConsecutiveBr = /<br\s*\/?>\s*<br\s*\/?>/i.test(origin);
+    let result = translation;
+
+    if (!originHasConsecutiveBr) {
+      // 원문에 <br><br>이 없으면 번역문의 <br><br>은 단락 구분자로 변환
+      result = result.replace(/(<br\s*\/?>)((?:\s*<br\s*\/?>)+)/gi, (match, first, rest) => {
+        const extraBrCount = (rest.match(/<br\s*\/?>/gi) || []).length;
+        return first + '\n' + '\n'.repeat(extraBrCount);
+      });
+    }
+
+    // 모든 <br> 뒤에 줄바꿈 추가
+    result = result.replace(/<br\s*\/?>(\r?\n)?/gi, (match, existingNL) => {
+      return existingNL ? match : match + '\n';
+    });
     return result;
   }
 
@@ -560,7 +658,7 @@
   //  로드 완료
   // ═══════════════════════════════════════
 
-  console.log(`${LOG_PREFIX} v2.5 로드 완료`);
+  console.log(`${LOG_PREFIX} v2.6 로드 완료`);
   console.log('  Alt+Q       → 팝업 열기/닫기');
   console.log('  Alt+W       → 현재 세그먼트 매칭 삽입');
   console.log('  Alt+Shift+W → 전체 세그먼트 일괄 삽입');
