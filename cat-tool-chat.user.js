@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.4
+// @version      0.7.5
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -162,6 +162,79 @@
         `;
         document.body.appendChild(el);
         setTimeout(() => el.remove(), ms);
+    }
+
+    // v0.7.5: 로그 레벨 가드 — localStorage 'tms_workflow_log_level' (silent/error/warn/info/verbose)
+    // 기본은 'warn' — info/verbose 는 디버깅 시에만. dverbose/dinfo/dwarn/derror 헬퍼로 wrap.
+    const LOG_LEVEL_RANK = { silent: 0, error: 1, warn: 2, info: 3, verbose: 4 };
+    const LOG_TAG = '[TMS-WF]';
+    function getLogRank() {
+        let lvl = 'warn';
+        try {
+            const stored = localStorage.getItem('tms_workflow_log_level');
+            if (stored && LOG_LEVEL_RANK[stored] != null) lvl = stored;
+        } catch {}
+        return LOG_LEVEL_RANK[lvl];
+    }
+    let LOG_RANK = getLogRank();
+    function dverbose(...args) { if (LOG_RANK >= 4) console.log(LOG_TAG, ...args); }
+    function dinfo(...args) { if (LOG_RANK >= 3) console.log(LOG_TAG, ...args); }
+    function dwarn(...args) { if (LOG_RANK >= 2) console.warn(LOG_TAG, ...args); }
+    function derror(...args) { if (LOG_RANK >= 1) console.error(LOG_TAG, ...args); }
+    // 사용자가 콘솔에서 즉시 토글 — window.tmsLog('verbose') / 'silent' 등
+    try {
+        window.tmsLog = function (level) {
+            if (level && LOG_LEVEL_RANK[level] != null) {
+                try { localStorage.setItem('tms_workflow_log_level', level); } catch {}
+                LOG_RANK = LOG_LEVEL_RANK[level];
+                console.log(LOG_TAG, `log level → ${level}`);
+            } else {
+                console.log(LOG_TAG, `current level rank=${LOG_RANK}, choices: silent/error/warn/info/verbose`);
+            }
+        };
+    } catch {}
+
+    // v0.7.5: 자체 confirm 모달 — 브라우저 confirm()을 대체. Promise<boolean> 반환.
+    // \n 줄바꿈 보존 + 모달 톤 일관성 + Esc/Enter 단축키.
+    function twConfirm({ title = '확인', message = '', confirmLabel = '확인', cancelLabel = '취소', danger = false } = {}) {
+        return new Promise((resolve) => {
+            const overlay = document.createElement('div');
+            overlay.className = 'tw-confirm-overlay';
+            const dialog = document.createElement('div');
+            dialog.className = 'tw-confirm-dialog' + (danger ? ' tw-confirm-danger' : '');
+            const titleEl = document.createElement('div');
+            titleEl.className = 'tw-confirm-title';
+            titleEl.textContent = title;
+            const msgEl = document.createElement('div');
+            msgEl.className = 'tw-confirm-message';
+            msgEl.textContent = message;
+            const btns = document.createElement('div');
+            btns.className = 'tw-confirm-buttons';
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'tw-btn tw-btn-ghost tw-confirm-cancel';
+            cancelBtn.textContent = cancelLabel;
+            const okBtn = document.createElement('button');
+            okBtn.className = 'tw-btn ' + (danger ? 'tw-btn-danger' : 'tw-btn-primary') + ' tw-confirm-ok';
+            okBtn.textContent = confirmLabel;
+            btns.append(cancelBtn, okBtn);
+            dialog.append(titleEl, msgEl, btns);
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+            const cleanup = (val) => {
+                document.removeEventListener('keydown', onKey, true);
+                overlay.remove();
+                resolve(val);
+            };
+            const onKey = (e) => {
+                if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); cleanup(false); }
+                else if (e.key === 'Enter') { e.stopPropagation(); e.preventDefault(); cleanup(true); }
+            };
+            document.addEventListener('keydown', onKey, true);
+            cancelBtn.addEventListener('click', () => cleanup(false));
+            okBtn.addEventListener('click', () => cleanup(true));
+            overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(false); });
+            setTimeout(() => okBtn.focus(), 0);
+        });
     }
 
     // ========================================================================
@@ -855,7 +928,7 @@
         if (stringId) {
             const explicitTextarea = findTranslationTextareaForStringId(stringId);
             if (explicitTextarea) {
-                console.log(`[TMS-WF] #${stringId} string-item에서 번역 textarea 발견`);
+                dverbose(`#${stringId} string-item에서 번역 textarea 발견`);
                 return explicitTextarea;
             }
         }
@@ -866,7 +939,7 @@
             // .info-row 안의 번역 textarea (우측 번역 패널)
             const ta = findTranslationTextareaInItem(activeItem);
             if (ta) {
-                console.log('[TMS-WF] 활성 string-item에서 번역 textarea 발견');
+                dverbose('활성 string-item에서 번역 textarea 발견');
                 return ta;
             }
         }
@@ -875,11 +948,11 @@
         const focused = document.activeElement;
         if (focused && focused.tagName === 'TEXTAREA' &&
             !modalEl?.contains(focused) && !focused.readOnly && !focused.disabled) {
-            console.log('[TMS-WF] 포커스된 textarea 사용');
+            dverbose('포커스된 textarea 사용');
             return focused;
         }
 
-        console.warn('[TMS-WF] 활성 번역 textarea를 찾지 못함');
+        dwarn('활성 번역 textarea를 찾지 못함');
         return null;
     }
 
@@ -947,7 +1020,7 @@
         }
         if (removed > 0) {
             saveSessions(sessions);
-            console.log(`[TMS-WF] ${SESSION_TTL_DAYS}일 이상 된 세션 ${removed}개 자동 정리됨`);
+            dinfo(`${SESSION_TTL_DAYS}일 이상 된 세션 ${removed}개 자동 정리됨`);
         }
         return removed;
     }
@@ -1140,20 +1213,20 @@
     function getCurrentStringId(verbose = false) {
         const activeItem = findActiveStringItem();
         if (!activeItem) {
-            if (verbose) console.warn('[TMS-WF] 활성 .string-item을 찾지 못함');
+            if (verbose) dwarn('활성 .string-item을 찾지 못함');
             return null;
         }
 
         const stringId = extractStringIdFromItem(activeItem);
         if (stringId) {
             if (verbose) {
-                console.log(`[TMS-WF] 활성 세그먼트 string_id: ${stringId} (DOM row#${activeItem.id})`);
+                dverbose(`활성 세그먼트 string_id: ${stringId} (DOM row#${activeItem.id})`);
             }
             return stringId;
         }
 
         if (verbose) {
-            console.warn('[TMS-WF] data-key에서 string_id 추출 실패:', activeItem.dataset?.key);
+            dwarn('data-key에서 string_id 추출 실패:', activeItem.dataset?.key);
         }
         return null;
     }
@@ -2326,6 +2399,7 @@
             <span class="tw-review-failed-chips tw-hidden" title="클릭하면 해당 행으로 이동"></span>
         </span>
         <span class="tw-review-apply-status tw-muted">입력은 textarea 값 주입까지만 수행합니다.</span>
+        <span class="tw-review-shortcut-hint tw-muted" title="검토 표 행에 포커스가 있을 때 사용할 수 있는 단축키">⌨ ↑↓ 이동 · E 편집 · A 입력 · C 복사</span>
         <button class="tw-btn tw-btn-ghost tw-btn-review-history" title="과거 run 목록 / 내보내기 / 설정">📚 history</button>
     </div>
     <div class="tw-review-history-panel tw-hidden">
@@ -3023,6 +3097,47 @@
 .tw-btn-danger { background: #dc2626; color: #fff; }
 .tw-btn-danger:hover:not(:disabled) { background: #b91c1c; }
 
+/* v0.7.5: 자체 confirm 모달 */
+.tw-confirm-overlay {
+    position: fixed; inset: 0; z-index: 2147483647;
+    background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center;
+    font-family: system-ui, -apple-system, sans-serif;
+}
+.tw-confirm-dialog {
+    background: #2a2a2a; color: #e0e0e0;
+    border: 1px solid #3a3a3a; border-radius: 8px;
+    min-width: 320px; max-width: 520px;
+    padding: 20px 22px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+}
+.tw-confirm-dialog.tw-confirm-danger { border-color: #dc2626; }
+.tw-confirm-title {
+    font-size: 14px; font-weight: 600;
+    color: #4ade80; margin-bottom: 12px;
+}
+.tw-confirm-dialog.tw-confirm-danger .tw-confirm-title { color: #f87171; }
+.tw-confirm-message {
+    font-size: 13px; line-height: 1.55;
+    white-space: pre-wrap; word-break: break-word;
+    margin-bottom: 18px; color: #d0d0d0;
+}
+.tw-confirm-buttons {
+    display: flex; justify-content: flex-end; gap: 8px;
+}
+.tw-confirm-buttons .tw-btn { min-width: 72px; }
+
+/* v0.7.5: 검토 표 행 키보드 포커스 */
+.tw-review-row[tabindex="0"] { outline: none; }
+.tw-review-row[tabindex="0"]:focus,
+.tw-review-row.tw-review-row-focused {
+    box-shadow: inset 3px 0 0 #4ade80, inset 0 0 0 1px rgba(74,222,128,0.35);
+    background: rgba(74,222,128,0.05);
+}
+.tw-review-shortcut-hint {
+    font-size: 11px; opacity: 0.7; padding: 0 4px;
+}
+
 /* 세션 관리 탭 */
 .tw-session-stats, .tw-session-actions, .tw-session-info {
     background: #252525; border-radius: 6px; padding: 14px;
@@ -3317,13 +3432,79 @@
                 const id = normalizeId(revertBtn.dataset.id);
                 const run = batchRun || restoreActiveBatchRun();
                 if (run?.runId) {
-                    if (!confirm(`#${id} 직접 수정을 되돌리고 배치 결과로 복원하시겠습니까?`)) return;
+                    const ok = await twConfirm({
+                        title: '직접 수정 되돌리기',
+                        message: `#${id} 직접 수정을 되돌리고 배치 결과로 복원하시겠습니까?`,
+                        danger: true,
+                    });
+                    if (!ok) return;
                     clearReviewOverride(run.runId, id);
                     appendBatchLog(`#${id} 직접 수정 되돌림`, 'info');
                     renderReviewTable();
                 }
                 return;
             }
+        });
+
+        // v0.7.5: 검토 표 행 키보드 단축키 — ↑↓ 이동, E 편집, A 적용, C 복사
+        $('.tw-review-table', el).addEventListener('keydown', async (e) => {
+            const tag = (e.target.tagName || '').toUpperCase();
+            // 입력 컨트롤에서는 단축키 가로채지 않음
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target.isContentEditable) return;
+            if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+            const row = e.target.closest('.tw-review-row[data-row-id]');
+            if (!row) return;
+            const id = row.dataset.rowId;
+
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                const rows = $$('.tw-review-row[data-row-id]', el);
+                const idx = rows.indexOf(row);
+                if (idx < 0) return;
+                const nextIdx = e.key === 'ArrowDown' ? Math.min(rows.length - 1, idx + 1) : Math.max(0, idx - 1);
+                const next = rows[nextIdx];
+                if (next && next !== row) {
+                    next.focus();
+                    next.scrollIntoView({ block: 'nearest' });
+                }
+                return;
+            }
+            const k = e.key.toLowerCase();
+            if (k === 'e') {
+                e.preventDefault();
+                openInlineFinalEditor(normalizeId(id));
+                return;
+            }
+            if (k === 'a') {
+                e.preventDefault();
+                await applyBatchTranslationsByIds([Number(id)]);
+                renderReviewTable();
+                // 재렌더 후 같은 행에 포커스 복원
+                const restored = $(`.tw-review-row[data-row-id="${CSS && CSS.escape ? CSS.escape(String(id)) : String(id)}"]`, el);
+                if (restored) restored.focus();
+                return;
+            }
+            if (k === 'c') {
+                e.preventDefault();
+                const text = getBatchFinalText(Number(id));
+                if (!text) { toast(`#${id} 복사할 최종 후보가 없습니다.`, 'error'); return; }
+                try {
+                    await navigator.clipboard.writeText(text);
+                    toast('최종 후보를 클립보드에 복사했습니다.', 'success');
+                } catch {
+                    toast('클립보드 복사에 실패했습니다.', 'error');
+                }
+                return;
+            }
+        });
+
+        // v0.7.5: 행 어디든 클릭하면 키보드 포커스가 그 행으로 이동 (단축키 시작점 명확화)
+        $('.tw-review-table', el).addEventListener('click', (e) => {
+            const tag = (e.target.tagName || '').toUpperCase();
+            if (tag === 'INPUT' || tag === 'BUTTON' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+            const row = e.target.closest('.tw-review-row[data-row-id]');
+            if (row && document.activeElement !== row) row.focus();
         });
 
         $('.tw-review-table', el).addEventListener('change', (e) => {
@@ -3959,13 +4140,14 @@
         if (refetchBtn) refetchBtn.disabled = busy || !run?.storageStringId || !run?.lastExpectedPhase;
     }
 
-    function onBatchReset() {
+    async function onBatchReset() {
         const run = batchRun || restoreActiveBatchRun();
         if (run) {
-            const ok = confirm(
-                '현재 배치 실행 기록(JSON/로그/검증 상태)을 초기화할까요?\n\n' +
-                '이미 TMS 번역 칸에 저장된 storageStringId 결과는 삭제되지 않습니다.'
-            );
+            const ok = await twConfirm({
+                title: '배치 실행 기록 초기화',
+                message: '현재 배치 실행 기록(JSON/로그/검증 상태)을 초기화할까요?\n\n이미 TMS 번역 칸에 저장된 storageStringId 결과는 삭제되지 않습니다.',
+                danger: true,
+            });
             if (!ok) return;
         }
         clearActiveBatchRun();
@@ -4012,7 +4194,7 @@
             await navigator.clipboard.writeText(text);
             toast(`JSON/로그 전체 복사 완료 (${text.length.toLocaleString()}자)`, 'success');
         } catch (error) {
-            console.error('[TMS-WF] log copy 실패', error);
+            derror('log copy 실패', error);
             toast('클립보드 복사 실패: ' + error.message, 'error');
         }
     }
@@ -4149,7 +4331,7 @@
         const file = input.files?.[0];
         if (!file) return;
         const reader = new FileReader();
-        reader.onload = () => {
+        reader.onload = async () => {
             try {
                 const text = String(reader.result || '');
                 const parsed = JSON.parse(text);
@@ -4175,7 +4357,12 @@
                     return;
                 }
                 if (schemaVersion !== null && schemaVersion !== 1) {
-                    if (!confirm(`이 파일의 schemaVersion=${schemaVersion} 은 알려진 형식이 아닙니다.\n\n그래도 가져오시겠습니까? (호환성은 보장되지 않음)`)) {
+                    const okSchema = await twConfirm({
+                        title: '알려지지 않은 schemaVersion',
+                        message: `이 파일의 schemaVersion=${schemaVersion} 은 알려진 형식이 아닙니다.\n\n그래도 가져오시겠습니까? (호환성은 보장되지 않음)`,
+                        danger: true,
+                    });
+                    if (!okSchema) {
                         return;
                     }
                 }
@@ -4207,7 +4394,13 @@
                     }
                 }
                 const detail = `신규 ${added} · 변경 ${changed} · 동일 ${same}`;
-                if (!confirm(`override 가져오기\n\n파일: run ${runIds.length}개 / 항목 ${incomingCount}개\n비교: ${detail}\n\n[확인] 진행 (변경된 항목은 파일 값으로 덮어쓰기)\n[취소] 중단`)) {
+                const okImport = await twConfirm({
+                    title: 'override 가져오기',
+                    message: `파일: run ${runIds.length}개 / 항목 ${incomingCount}개\n비교: ${detail}\n\n진행하면 변경된 항목은 파일 값으로 덮어쓰기 됩니다.`,
+                    confirmLabel: '진행',
+                    cancelLabel: '중단',
+                });
+                if (!okImport) {
                     return;
                 }
 
@@ -4238,7 +4431,7 @@
                 appendBatchLog(`override 가져오기 (신규 ${appliedAdded}, 덮어쓰기 ${appliedChanged}, 동일 ${same}, schemaVersion=${schemaVersion ?? 'raw'})`, 'info');
                 renderReviewTable();
             } catch (err) {
-                console.error('[TMS-WF] override import 실패:', err);
+                derror('override import 실패:', err);
                 toast('가져오기 실패: ' + err.message, 'error');
             } finally {
                 input.value = '';
@@ -4332,12 +4525,13 @@
         renderHistoryPanel();
         toast(`run ${runId} 활성화`, 'success');
     }
-    function onDeleteRun(runId) {
+    async function onDeleteRun(runId) {
         if (!runId) return;
         const isActive = runId === getActiveBatchRunId();
         const msg = (isActive ? '⚠ 현재 활성 run을 삭제합니다.\n\n' : '')
             + `run을 삭제합니다.\n\n${runId}\n\n계속하시겠습니까?`;
-        if (!confirm(msg)) return;
+        const ok = await twConfirm({ title: 'run 삭제', message: msg, danger: true });
+        if (!ok) return;
         const runs = loadBatchRuns();
         delete runs[runId];
         saveBatchRuns(runs);
@@ -4562,7 +4756,7 @@
                 recordAppliedFromBatch(id, run.runId, phase, text);
             }
         } catch (err) {
-            console.warn('[TMS-WF] applied-from-batch 기록 실패', err);
+            dwarn('applied-from-batch 기록 실패', err);
         }
         return { id, ok: true };
     }
@@ -4616,7 +4810,7 @@
     }
 
     // v0.6.6 (B1): 고아 override 정리 클릭 핸들러
-    function onReviewOverrideGc() {
+    async function onReviewOverrideGc() {
         const all = loadReviewOverrides();
         const totalRuns = Object.keys(all).length;
         const totalItems = Object.values(all).reduce((sum, b) => sum + Object.keys(b || {}).length, 0);
@@ -4640,11 +4834,11 @@
             toast(`정리할 고아 데이터가 없습니다. (전체 ${totalItems}개, run ${totalRuns}개 모두 활성/알려진 run 안에 있음)`, 'info', 3500);
             return;
         }
-        const msg = `직접 수정 데이터 정리\n` +
-            `- 알려지지 않은 run: ${orphanRunIds.length}개 (항목 ${orphanItems}개)\n` +
+        const msg = `- 알려지지 않은 run: ${orphanRunIds.length}개 (항목 ${orphanItems}개)\n` +
             (prunedActive ? `- 활성 run 내 phase3에 없는 항목: ${prunedActive}개\n` : '') +
             `\n총 ${removableItems}개 항목을 삭제합니다. 진행하시겠습니까?`;
-        if (!confirm(msg)) return;
+        const ok = await twConfirm({ title: '직접 수정 데이터 정리', message: msg, danger: true });
+        if (!ok) return;
         const result = gcOrphanReviewOverrides();
         const after = loadReviewOverrides();
         const remaining = Object.values(after).reduce((sum, b) => sum + Object.keys(b || {}).length, 0);
@@ -4673,9 +4867,12 @@
         // 기존 chat 메시지가 있으면 덮어쓰기 confirm
         const existing = getSession(id);
         if (existing.messages && existing.messages.length > 0) {
-            if (!confirm(`#${id}에 이미 ${existing.messages.length}개의 chat 메시지가 있습니다.\n배치 결과로 새로 시드하면 기존 대화는 사라집니다. 계속하시겠습니까?`)) {
-                return;
-            }
+            const ok = await twConfirm({
+                title: '기존 chat 메시지 덮어쓰기',
+                message: `#${id}에 이미 ${existing.messages.length}개의 chat 메시지가 있습니다.\n배치 결과로 새로 시드하면 기존 대화는 사라집니다. 계속하시겠습니까?`,
+                danger: true,
+            });
+            if (!ok) return;
         }
 
         try {
@@ -4686,7 +4883,7 @@
         }
 
         currentStringId = id;
-        try { await loadSegmentInfo(id); } catch (err) { console.warn('[TMS-WF] loadSegmentInfo 실패', err); }
+        try { await loadSegmentInfo(id); } catch (err) { dwarn('loadSegmentInfo 실패', err); }
         setMainTab('chat');
         renderChatHistory();
         appendBatchLog(`#${id} chat 다듬기 모드로 시드됨`, 'info');
@@ -4939,7 +5136,7 @@
             }
             const warnChipsHtml = warnChips.length ? `<div class="tw-review-warn-row">${warnChips.join('')}</div>` : '';
             return `
-<div class="tw-review-row" data-row-id="${escapeHtml(id)}" data-has-override="${hasOverride ? '1' : '0'}">
+<div class="tw-review-row" data-row-id="${escapeHtml(id)}" data-has-override="${hasOverride ? '1' : '0'}" tabindex="0">
     <div class="tw-review-cell tw-review-check" data-label="선택"><input class="tw-review-select" type="checkbox" data-id="${escapeHtml(id)}"></div>
     <div class="tw-review-cell" data-label="ID">#${escapeHtml(id)}${chatBadge}${appliedBadge}</div>
     <div class="tw-review-cell" data-label="그룹">${escapeHtml(item.gid || '')}</div>
@@ -4959,7 +5156,7 @@
         // v0.6.10 F1: 대용량 run 감시 (200+ 항목일 때 콘솔에 렌더 시간 기록)
         if (descriptors.length >= 200) {
             const dt = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - (renderReviewTable._t0 || 0);
-            console.log(`[TMS-WF] renderReviewTable: ${descriptors.length}개 행 / ${dt.toFixed(1)}ms (filtered=${filtered.length})`);
+            dverbose(`renderReviewTable: ${descriptors.length}개 행 / ${dt.toFixed(1)}ms (filtered=${filtered.length})`);
         }
     }
 
@@ -5078,11 +5275,12 @@
         if ((phaseTag === '3' || phaseTag === '4+5') && run.runId) {
             const overrideCount = countReviewOverridesForRun(run.runId);
             if (overrideCount > 0) {
-                const ok = confirm(
-                    `이 run에 직접 수정한 최종 후보가 ${overrideCount}개 있습니다.\n` +
-                    `Phase ${phaseTag}을(를) 다시 실행하면 새 결과가 표시되지만 직접 수정값은 유지되어 우선 적용됩니다.\n` +
-                    `계속하시겠습니까? (취소하면 실행이 중단됩니다)`
-                );
+                const ok = await twConfirm({
+                    title: `Phase ${phaseTag} 재실행 — 직접 수정 보존`,
+                    message: `이 run에 직접 수정한 최종 후보가 ${overrideCount}개 있습니다.\n` +
+                        `Phase ${phaseTag}을(를) 다시 실행하면 새 결과가 표시되지만 직접 수정값은 유지되어 우선 적용됩니다.\n\n` +
+                        `계속하시겠습니까? (취소하면 실행이 중단됩니다)`,
+                });
                 if (!ok) {
                     appendBatchLog(`Phase ${phaseTag} 재실행 취소됨 (직접 수정 ${overrideCount}개 유지)`, 'info');
                     return;
@@ -5209,7 +5407,7 @@
             }
             const newId = getCurrentStringId();
             if (newId && newId !== currentStringId) {
-                console.log(`[TMS-WF] 세그먼트 변경 감지: ${currentStringId} → ${newId}`);
+                dverbose(`세그먼트 변경 감지: ${currentStringId} → ${newId}`);
                 const targetId = newId;
                 currentStringId = targetId;
                 try {
@@ -5473,7 +5671,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             const rawResult = await fetchActiveResult(currentStringId);
             const result = sanitizeChatTranslation(rawResult);
             if (rawResult && result !== rawResult) {
-                console.log('[TMS-WF] sanitize:', { before: rawResult, after: result });
+                dverbose('sanitize:', { before: rawResult, after: result });
             }
 
             if (!result) {
@@ -5504,9 +5702,14 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         }
     }
 
-    function onResetSession() {
+    async function onResetSession() {
         if (!currentStringId) return;
-        if (!confirm('현재 세그먼트의 대화 이력을 초기화하시겠습니까?\n(번역 자체는 삭제되지 않습니다)')) return;
+        const ok = await twConfirm({
+            title: '대화 이력 초기화',
+            message: '현재 세그먼트의 대화 이력을 초기화하시겠습니까?\n(번역 자체는 삭제되지 않습니다)',
+            danger: true,
+        });
+        if (!ok) return;
         clearSession(currentStringId);
         renderChatHistory();
         toast('세션 초기화됨', 'success');
@@ -5593,7 +5796,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             // v0.6.0 L3: chat에서 채택한 순간 출처가 batch→chat으로 전환되므로 applied 기록 제거
             try { clearAppliedFromBatch(currentStringId); } catch (err) { console.warn('[TMS-WF] applied 기록 제거 실패', err); }
             toast('번역 입력창에 채웠습니다. 확인 후 저장하세요.', 'success');
-            console.log('[TMS-WF] textarea 주입 완료:', translation.slice(0, 50) + '...');
+            dverbose('textarea 주입 완료:', translation.slice(0, 50) + '...');
             hideModal();
         } catch (e) {
             console.error('[TMS-WF] textarea 주입 실패:', e);
@@ -5790,7 +5993,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             }
         });
 
-        $('.tw-btn-settings-delete', overlay).addEventListener('click', () => {
+        $('.tw-btn-settings-delete', overlay).addEventListener('click', async () => {
             const prompts = loadPrompts();
             if (prompts.length <= 1) {
                 toast('최소 1개의 프롬프트는 유지해야 합니다.', 'error');
@@ -5810,7 +6013,12 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     `계속 삭제하시겠습니까?`;
             }
 
-            if (!confirm(confirmMsg)) return;
+            const okDeletePrompt = await twConfirm({
+                title: '프롬프트 삭제',
+                message: confirmMsg,
+                danger: true,
+            });
+            if (!okDeletePrompt) return;
 
             const filtered = prompts.filter(x => x.id !== currentEditingId);
             savePrompts(filtered);
@@ -5905,14 +6113,15 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 // 사용자에게 복원 범위 선택 요청
                 let restorePrompts = false;
                 if (hasPrompts) {
-                    restorePrompts = confirm(
-                        `이 백업에는 다음이 포함되어 있습니다:\n` +
-                        (hasSessions ? `• 세션 ${sessionCount}개\n` : '') +
-                        `• 시스템 프롬프트 ${promptCount}개\n\n` +
-                        `⚠️ 프롬프트도 함께 복원하시겠습니까?\n` +
-                        `  [확인] = 세션 + 프롬프트 모두 복원\n` +
-                        `  [취소] = 세션만 복원 (기존 프롬프트 보존)`
-                    );
+                    restorePrompts = await twConfirm({
+                        title: '프롬프트 복원 여부',
+                        message: `이 백업에는 다음이 포함되어 있습니다:\n` +
+                            (hasSessions ? `• 세션 ${sessionCount}개\n` : '') +
+                            `• 시스템 프롬프트 ${promptCount}개\n\n` +
+                            `프롬프트도 함께 복원하시겠습니까?`,
+                        confirmLabel: '세션 + 프롬프트',
+                        cancelLabel: '세션만',
+                    });
                 }
 
                 // 세션 복원 최종 확인
@@ -5920,7 +6129,8 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     const msg = restorePrompts
                         ? `세션 ${sessionCount}개와 프롬프트 ${promptCount}개를 복원합니다.\n기존 데이터는 덮어씌워집니다.`
                         : `세션 ${sessionCount}개를 복원합니다.\n(기존 프롬프트는 보존됩니다)\n기존 세션은 덮어씌워집니다.`;
-                    if (!confirm(msg)) {
+                    const okRestore = await twConfirm({ title: '복원 확인', message: msg, danger: true });
+                    if (!okRestore) {
                         importFileInput.value = '';
                         return;
                     }
@@ -5949,13 +6159,18 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             importFileInput.value = '';
         });
 
-        $('.tw-btn-session-clear-all', overlay).addEventListener('click', () => {
+        $('.tw-btn-session-clear-all', overlay).addEventListener('click', async () => {
             const stats = getSessionStats();
             if (stats.count === 0) {
                 toast('삭제할 세션이 없습니다.', 'info');
                 return;
             }
-            if (!confirm(`정말로 ${stats.count}개의 모든 세션을 삭제하시겠습니까?\n\n⚠️ 세션만 삭제되며 시스템 프롬프트는 보존됩니다.\n이 작업은 되돌릴 수 없습니다.`)) return;
+            const ok = await twConfirm({
+                title: '모든 세션 삭제',
+                message: `정말로 ${stats.count}개의 모든 세션을 삭제하시겠습니까?\n\n⚠️ 세션만 삭제되며 시스템 프롬프트는 보존됩니다.\n이 작업은 되돌릴 수 없습니다.`,
+                danger: true,
+            });
+            if (!ok) return;
             clearAllSessions();
             toast('모든 세션이 삭제되었습니다. (프롬프트는 보존됨)', 'success');
             refreshSessionStats();
@@ -5984,26 +6199,26 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             const isOtherTextarea = tgt.tagName === 'TEXTAREA';
             // INPUT이면 차단 (검색창 등)
             if (isInput) {
-                console.log('[TMS-WF] Alt+Z - INPUT/contentEditable이라 무시:', tgt.tagName);
+                dverbose('Alt+Z - INPUT/contentEditable이라 무시:', tgt.tagName);
                 return;
             }
             // TEXTAREA는 허용 (번역 입력창에서 바로 호출 가능)
             // 우리 모달 안의 textarea도 이 경로로 들어오지 않음 (inOwnModal=true라 위에서 걸림)
             if (isOtherTextarea) {
-                console.log('[TMS-WF] Alt+Z - TEXTAREA에서 호출 허용');
+                dverbose('Alt+Z - TEXTAREA에서 호출 허용');
             }
         }
 
         e.preventDefault();
         e.stopPropagation();
 
-        console.log('[TMS-WF] Alt+Z 감지 → 모달 토글 시도');
+        dverbose('Alt+Z 감지 → 모달 토글 시도');
         try {
             if (modalEl && modalEl.style.display !== 'none' && !modalEl.classList.contains('tw-hidden')) {
-                console.log('[TMS-WF] 모달 숨기기');
+                dverbose('모달 숨기기');
                 hideModal();
             } else {
-                console.log('[TMS-WF] 모달 열기 시도');
+                dverbose('모달 열기 시도');
                 showModal().catch(err => {
                     console.error('[TMS-WF] showModal 실패:', err);
                     alert('TMS Workflow 모달 오픈 실패: ' + err.message);
