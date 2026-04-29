@@ -2386,7 +2386,7 @@
 }
 #tms-workflow-modal * { box-sizing: border-box; }
 .tw-header {
-    display: flex; align-items: center; padding: 10px 14px;
+    display: flex; align-items: center; padding: 12px 18px;
     background: #2a2a2a; border-bottom: 1px solid #3a3a3a;
     border-radius: 10px 10px 0 0; cursor: move; user-select: none;
     flex-shrink: 0;
@@ -2396,13 +2396,13 @@
     text-overflow: ellipsis; white-space: nowrap; }
 .tw-header-right { display: flex; gap: 4px; }
 .tw-main-tabs {
-    display: flex; gap: 4px; padding: 8px 10px 0;
+    display: flex; gap: 4px; padding: 10px 14px 0;
     background: #202020; border-bottom: 1px solid #333;
     flex-shrink: 0;
 }
 .tw-main-tab {
     background: transparent; color: #999; border: 1px solid transparent;
-    border-bottom: none; padding: 7px 12px; border-radius: 6px 6px 0 0;
+    border-bottom: none; padding: 8px 14px; border-radius: 6px 6px 0 0;
     cursor: pointer; font-size: 12px; transition: all 0.15s;
 }
 .tw-main-tab:hover { color: #ddd; background: #282828; }
@@ -2423,53 +2423,53 @@
 .tw-tab-content { flex: 1; overflow: hidden; display: none; }
 .tw-tab-content.active { display: flex; }
 .tw-context-panel {
-    width: 320px; flex-shrink: 0; padding: 12px;
+    width: 320px; flex-shrink: 0; padding: 16px;
     border-right: 1px solid #3a3a3a; overflow-y: auto;
     background: #252525;
-    display: flex; flex-direction: column; gap: 10px;
+    display: flex; flex-direction: column; gap: 14px;
 }
 .tw-panel-title { font-weight: 600; color: #4ade80; margin: 0 0 4px; font-size: 12px;
-    padding-bottom: 6px; border-bottom: 1px solid #333; }
+    padding-bottom: 8px; border-bottom: 1px solid #333; }
 .tw-context-content { font-size: 12px; line-height: 1.55; word-break: break-word; }
 .tw-muted { color: #888; }
-.tw-context-section { margin: 0 0 10px; display: flex; flex-direction: column; gap: 4px; }
+.tw-context-section { margin: 0 0 14px; display: flex; flex-direction: column; gap: 6px; }
 .tw-context-section:last-child { margin-bottom: 0; }
 .tw-context-label { color: #4ade80; font-size: 10px; font-weight: 600;
     text-transform: uppercase; letter-spacing: 0.5px; margin: 0; }
-.tw-context-value { background: #1a1a1a; padding: 6px 8px; border-radius: 4px; color: #ddd;
+.tw-context-value { background: #1a1a1a; padding: 8px 10px; border-radius: 4px; color: #ddd;
     white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
 .tw-chat-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.tw-chat-messages { flex: 1; overflow-y: auto; padding: 14px; }
-.tw-msg { margin-bottom: 14px; max-width: 90%; word-wrap: break-word; }
+.tw-chat-messages { flex: 1; overflow-y: auto; padding: 18px; }
+.tw-msg { margin-bottom: 16px; max-width: 90%; word-wrap: break-word; }
 .tw-msg-user { margin-left: auto; }
 .tw-msg-ai { margin-right: auto; }
 .tw-msg-role { font-size: 11px; color: #888; margin-bottom: 4px; }
 .tw-msg-user .tw-msg-role { text-align: right; }
-.tw-msg-content { padding: 10px 14px; border-radius: 8px; white-space: pre-wrap;
-    line-height: 1.5; }
+.tw-msg-content { padding: 12px 16px; border-radius: 8px; white-space: pre-wrap;
+    line-height: 1.55; }
 .tw-msg-user .tw-msg-content { background: #2563eb; color: #fff; }
 .tw-msg-ai .tw-msg-content { background: #2a2a2a; color: #e0e0e0; border: 1px solid #3a3a3a; }
 .tw-msg-system .tw-msg-content { background: transparent; color: #888; font-style: italic;
     text-align: center; padding: 4px; font-size: 11px; }
 .tw-msg-system { max-width: 100%; }
 .tw-msg-progress { color: #fbbf24; }
-.tw-chat-input-wrap { padding: 10px 12px; border-top: 1px solid #3a3a3a;
+.tw-chat-input-wrap { padding: 14px 16px; border-top: 1px solid #3a3a3a;
     background: #252525; flex-shrink: 0; }
-.tw-input-controls { display: flex; gap: 12px; margin-bottom: 8px; font-size: 12px; color: #aaa; }
+.tw-input-controls { display: flex; gap: 14px; margin-bottom: 10px; font-size: 12px; color: #aaa; }
 .tw-ctrl { display: flex; align-items: center; gap: 6px; }
 .tw-prompt-select, .tw-model-select {
     background: #1a1a1a; color: #e0e0e0; border: 1px solid #3a3a3a;
-    padding: 4px 8px; border-radius: 4px; font-size: 12px; min-width: 140px;
+    padding: 5px 8px; border-radius: 4px; font-size: 12px; min-width: 140px;
 }
 .tw-chat-input {
     width: 100%; min-height: 70px; max-height: 180px; resize: vertical;
     background: #1a1a1a; color: #e0e0e0; border: 1px solid #3a3a3a;
-    border-radius: 6px; padding: 8px 10px; font-size: 13px; font-family: inherit;
-    line-height: 1.4;
+    border-radius: 6px; padding: 10px 12px; font-size: 13px; font-family: inherit;
+    line-height: 1.45;
 }
 .tw-chat-input:focus { outline: none; border-color: #4ade80; }
 .tw-chat-buttons { display: flex; gap: 8px; justify-content: flex-end;
-    margin-top: 8px; align-items: center; }
+    margin-top: 12px; align-items: center; }
 .tw-btn-reset { margin-right: auto; }
 .tw-review-panel, .tw-log-panel {
     flex-direction: column; padding: 14px; gap: 12px; background: #202020;
@@ -2490,7 +2490,7 @@
 .tw-batch-event-warn .tw-msg-content { background: #33290f; border-color: #7c5c11; color: #facc15; }
 .tw-batch-event-error .tw-msg-content { background: #3a1d1d; border-color: #7f1d1d; color: #fecaca; }
 .tw-batch-input-wrap {
-    padding: 10px 12px; border-top: 1px solid #3a3a3a;
+    padding: 14px 16px; border-top: 1px solid #3a3a3a;
     background: #252525; flex-shrink: 0;
 }
 .tw-batch-header-row { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
@@ -2503,14 +2503,14 @@
 .tw-batch-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .tw-batch-warning {
     color: #fbbf24; background: #2a2212; border: 1px solid #5a4214;
-    border-radius: 6px; padding: 10px 12px 12px; font-size: 11px; line-height: 1.55;
+    border-radius: 6px; padding: 12px 14px; font-size: 11px; line-height: 1.55;
     word-break: break-word;
 }
 .tw-batch-warning:empty { display: none; }
 /* v0.6.9 hotfix2: 사용 모델/프롬프트 미니 표시 (사이드바) */
 .tw-batch-config-row {
-    display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px;
-    padding: 6px 10px; border: 1px dashed var(--tw-border); border-radius: 6px;
+    display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 11px;
+    padding: 8px 12px; border: 1px dashed var(--tw-border); border-radius: 6px;
     background: rgba(255,255,255,0.02);
 }
 .tw-batch-config-row:empty { display: none; }
@@ -2554,10 +2554,10 @@
 /* .tw-batch-segments는 v0.6.9 hotfix2부터 overlay-body 안에서만 사용됨 */
 /* v0.6.9 (G1-a): 활성 run 헤더 카드 — 사이드바에 맞게 줄당 1~2 항목으로 wrap */
 .tw-batch-run-header {
-    display: flex; gap: 6px 10px; align-items: center; flex-wrap: wrap;
-    padding: 6px 8px; border: 1px solid var(--tw-border); border-radius: 8px;
+    display: flex; gap: 8px 12px; align-items: center; flex-wrap: wrap;
+    padding: 8px 10px; border: 1px solid var(--tw-border); border-radius: 8px;
     background: linear-gradient(135deg, rgba(74,222,128,0.06) 0%, var(--tw-bg-2) 70%);
-    font-size: 11px; line-height: 1.35;
+    font-size: 11px; line-height: 1.4;
 }
 .tw-batch-run-header .tw-batch-run-id {
     font-family: monospace; color: var(--tw-accent); font-weight: 600;
@@ -2578,7 +2578,7 @@
 .tw-batch-step {
     flex: 1 1 0; min-width: 0;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 2px; padding: 6px 4px;
+    gap: 3px; padding: 8px 4px;
     border: 1px solid var(--tw-border);
     background: var(--tw-bg-1); color: var(--tw-muted);
     text-align: center; line-height: 1.2;
@@ -2606,13 +2606,13 @@
 /* v0.6.9 (G1-d): 수집/검증 결과 카드 그리드 — 290px 사이드바에서 2열 정도 들어가게 */
 .tw-batch-summary-cards {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-    gap: 6px;
+    gap: 8px;
 }
 .tw-batch-summary-cards:empty { display: none; }
 .tw-summary-card {
-    padding: 6px 8px; border: 1px solid var(--tw-border); border-radius: 6px;
-    background: var(--tw-bg-2); display: flex; flex-direction: column; gap: 1px;
-    min-height: 52px; transition: transform 0.08s ease, border-color 0.12s ease;
+    padding: 8px 10px; border: 1px solid var(--tw-border); border-radius: 6px;
+    background: var(--tw-bg-2); display: flex; flex-direction: column; gap: 2px;
+    min-height: 56px; transition: transform 0.08s ease, border-color 0.12s ease;
     min-width: 0;
 }
 .tw-summary-card.tw-summary-clickable { cursor: pointer; }
@@ -2669,7 +2669,7 @@
 }
 .tw-review-row {
     display: grid; grid-template-columns: 34px 78px 54px minmax(120px, 0.8fr) minmax(130px, 0.95fr) minmax(120px, 0.85fr) minmax(150px, 1fr) 178px;
-    gap: 8px; padding: 10px 12px; border-bottom: 1px solid #303030; align-items: start;
+    gap: 10px; padding: 12px 14px; border-bottom: 1px solid #303030; align-items: start;
 }
 .tw-review-row:last-child { border-bottom: none; }
 .tw-review-head { color: #4ade80; font-weight: 600; background: #202020; position: sticky; top: 0; z-index: 1; }
