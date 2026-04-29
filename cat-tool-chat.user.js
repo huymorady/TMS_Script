@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.7
+// @version      0.6.8
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -1469,7 +1469,7 @@
             if (cloned.phase45) delete cloned.phase45.raw;
         }
         cloned.exportedAt = new Date().toISOString();
-        cloned.exportedFromVersion = '0.6.7';
+        cloned.exportedFromVersion = '0.6.8';
         return JSON.stringify(cloned, null, 2);
     }
 
@@ -2155,7 +2155,7 @@
     // v0.6.5 (A3): 리뷰 탭 필터/정렬 상태 (메모리 only — 세션 한정)
     // v0.6.7 (C2): 비교 모드 상태 추가 — compareMode/compareRunId 가 set 되면
     // 검토 표 대신 직전 run 비교 표가 렌더된다.
-    const reviewView = { filter: 'all', sort: 'id', compareMode: false, compareRunId: null };
+    const reviewView = { filter: 'all', sort: 'id', compareMode: false, compareRunId: null, lastFailedIds: [], showOnlyFailed: false };
     // v0.6.7 (D1): 로그 탭 필터/검색 상태
     const logView = { level: 'all', query: '' };
 
@@ -2283,6 +2283,8 @@
             </label>
         </span>
         <span class="tw-review-apply-status tw-muted">입력은 textarea 값 주입까지만 수행합니다.</span>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-failed-toggle tw-hidden" title="직전 일괄 입력에서 실패한 ID만 보기">🔁 실패만 보기</button>
+        <span class="tw-review-failed-chips tw-hidden" title="클릭하면 해당 행으로 이동"></span>
         <button class="tw-btn tw-btn-ghost tw-btn-review-gc" title="현재 활성 batch run 외에 남아있는 직접 수정 데이터 정리">override 정리</button>
         <span class="tw-review-toolbar-divider"></span>
         <label class="tw-review-filter-label" title="같은 project/file/language의 직전 run과 비교 (LLM 결과 drift 확인)">비교
@@ -2499,6 +2501,20 @@
     background: linear-gradient(135deg, #202820 0%, #181818 70%);
 }
 .tw-review-apply-status { margin-left: auto; font-size: 12px; }
+/* v0.6.8 (A1): 일괄 입력 실패 ID 칩 */
+.tw-review-failed-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; max-width: 360px; }
+.tw-review-failed-chip {
+    display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 9999px;
+    font-size: 11px; font-weight: 500; line-height: 1.4; cursor: pointer;
+    background: rgba(231, 76, 60, 0.18); color: #fca5a5; border: 1px solid rgba(231, 76, 60, 0.45);
+}
+.tw-review-failed-chip:hover { background: rgba(231, 76, 60, 0.32); color: #fff; }
+.tw-btn-review-failed-toggle.tw-active { background: var(--tw-danger); color: #fff; border-color: var(--tw-danger); }
+.tw-review-row.tw-review-row-flash { animation: tw-row-flash 1.6s ease-out; }
+@keyframes tw-row-flash {
+    0% { background: rgba(251, 191, 36, 0.45); }
+    100% { background: transparent; }
+}
 /* v0.6.5 (A3): 필터/정렬 컨트롤 */
 .tw-review-filter-group { display: flex; gap: 8px; align-items: center; }
 .tw-review-filter-label { display: flex; align-items: center; gap: 4px; font-size: 12px; color: #aaa; }
@@ -2891,6 +2907,10 @@
         // v0.6.6 (B1): 고아 override 정리
         $('.tw-btn-review-gc', el).addEventListener('click', onReviewOverrideGc);
 
+        // v0.6.8 (A1): 실패만 보기 토글 + 실패 ID 칩 클릭
+        $('.tw-btn-review-failed-toggle', el).addEventListener('click', onToggleFailedOnly);
+        $('.tw-review-failed-chips', el).addEventListener('click', onFailedChipClick);
+
         // v0.6.7 (C2): 비교 모드 select / 종료 버튼
         $('.tw-review-compare-select', el).addEventListener('change', onCompareSelectChange);
         $('.tw-btn-review-compare-exit', el).addEventListener('click', onExitCompareMode);
@@ -2982,6 +3002,65 @@
     function updateReviewApplyStatus(message) {
         const el = $('.tw-review-apply-status', modalEl);
         if (el) el.textContent = message;
+    }
+
+    // v0.6.8 (A1): 실패 ID 칩/토글 영역 갱신
+    function refreshFailedChips() {
+        if (!modalEl) return;
+        const wrap = $('.tw-review-failed-chips', modalEl);
+        const toggle = $('.tw-btn-review-failed-toggle', modalEl);
+        if (!wrap || !toggle) return;
+        const ids = reviewView.lastFailedIds || [];
+        if (!ids.length) {
+            wrap.classList.add('tw-hidden');
+            toggle.classList.add('tw-hidden');
+            toggle.classList.remove('tw-active');
+            wrap.innerHTML = '';
+            return;
+        }
+        wrap.classList.remove('tw-hidden');
+        toggle.classList.remove('tw-hidden');
+        toggle.textContent = `🔁 실패만 보기 (${ids.length})`;
+        toggle.classList.toggle('tw-active', !!reviewView.showOnlyFailed);
+        const preview = ids.slice(0, 12).map(id =>
+            `<button type="button" class="tw-review-failed-chip" data-failed-id="${escapeHtml(String(id))}" title="#${escapeHtml(String(id))} 행으로 이동">#${escapeHtml(String(id))}</button>`
+        ).join('');
+        const more = ids.length > 12 ? `<span class="tw-muted" style="font-size:11px;">+${ids.length - 12}</span>` : '';
+        wrap.innerHTML = preview + more;
+    }
+
+    // v0.6.8 (A1): 특정 review row로 스크롤 + 짧은 하이라이트
+    function scrollToReviewRow(id) {
+        if (!modalEl) return false;
+        const norm = normalizeId(id);
+        const row = $(`.tw-review-row[data-row-id="${CSS && CSS.escape ? CSS.escape(String(norm)) : String(norm)}"]`, modalEl);
+        if (!row) return false;
+        row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        row.classList.remove('tw-review-row-flash');
+        // reflow trigger then re-add for animation restart
+        void row.offsetWidth;
+        row.classList.add('tw-review-row-flash');
+        return true;
+    }
+
+    function onToggleFailedOnly() {
+        if (!reviewView.lastFailedIds.length) return;
+        reviewView.showOnlyFailed = !reviewView.showOnlyFailed;
+        renderReviewTable();
+    }
+
+    function onFailedChipClick(e) {
+        const btn = e.target.closest('.tw-review-failed-chip');
+        if (!btn) return;
+        const id = btn.getAttribute('data-failed-id');
+        if (!id) return;
+        if (reviewView.showOnlyFailed) {
+            // 필터 켜진 상태면 그대로 스크롤
+            if (!scrollToReviewRow(id)) toast(`#${id} 행을 찾지 못했습니다.`, 'info');
+            return;
+        }
+        // 필터 꺼진 상태에서는 한 번 렌더 후 스크롤
+        if (!scrollToReviewRow(id)) toast(`#${id} 행을 찾지 못했습니다.`, 'info');
     }
 
     function makeDraggable(modal, handle) {
@@ -3622,6 +3701,9 @@
         }
         updateReviewApplyStatus(message);
         toast(message, failures.length ? 'info' : 'success', 4500);
+        // v0.6.8 (A1): 실패 ID를 reviewView에 보존하고 칩 영역을 갱신
+        reviewView.lastFailedIds = failures.map(f => normalizeId(f.id));
+        if (!reviewView.lastFailedIds.length) reviewView.showOnlyFailed = false;
         // v0.6.5: 입력 후 applied 배지/필터 갱신
         if (success > 0 || failures.length > 0) renderReviewTable();
     }
@@ -3713,6 +3795,8 @@
 
         // v0.6.7 (C2): 비교 select 옵션 갱신 (run 변경/재렌더 시 동기화)
         refreshCompareSelect(run);
+        // v0.6.8 (A1): 일괄 입력 실패 ID 칩/토글 갱신
+        refreshFailedChips();
 
         if (!run?.phase3?.parsed) {
             summaryEl.textContent = '아직 Phase 3 결과가 없습니다.';
@@ -3815,7 +3899,11 @@
         });
 
         // 필터 적용
+        const failedSet = reviewView.showOnlyFailed && reviewView.lastFailedIds.length
+            ? new Set(reviewView.lastFailedIds.map(normalizeId))
+            : null;
         const filtered = descriptors.filter(d => {
+            if (failedSet && !failedSet.has(normalizeId(d.id))) return false;
             switch (reviewView.filter) {
                 case 'edited': return d.stateKey === 'edit';
                 case 'kept': return d.stateKey === 'keep' || d.stateKey === 'none';
@@ -4965,6 +5053,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         };
     }
 
-    console.log('%c[TMS Workflow v0.6.7] 로드됨. Alt+Z로 모달 오픈 (run 비교 + JSON/CSV export + 로그 필터 + 디자인 토큰)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.6.8] 로드됨. Alt+Z로 모달 오픈 (일괄 입력 실패 ID 칩 + 실패만 보기 토글 + 행 스크롤/하이라이트)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
