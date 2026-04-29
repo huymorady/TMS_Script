@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.3
+// @version      0.7.4
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -2284,12 +2284,22 @@
 </div>
 <div class="tw-review-panel tw-tab-content" data-tab-content="review">
     <div class="tw-panel-title">결과 검토</div>
+    <div class="tw-compare-banner-bar tw-hidden">
+        <span class="tw-compare-banner-text">↔ 비교 모드</span>
+        <label class="tw-review-compare-overrides-label" title="비교 시 직접 수정(override)을 final에 덮어 표시 (실제 적용 결과 기준 drift)">
+            <input type="checkbox" class="tw-review-compare-overrides" /> override 포함
+        </label>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-compare-exit" title="비교 모드 종료">↩ 검토로 돌아가기</button>
+    </div>
     <div class="tw-review-summary tw-muted">아직 Phase 3 결과가 없습니다.</div>
     <div class="tw-review-toolbar">
-        <button class="tw-btn tw-btn-primary tw-btn-review-apply-selected">선택 입력</button>
-        <button class="tw-btn tw-btn-ghost tw-btn-review-apply-edited" title="Phase 4+5에서 수정된 행만 일괄 입력">수정만 입력</button>
-        <button class="tw-btn tw-btn-ghost tw-btn-review-apply-all">전체 입력</button>
-        <span class="tw-review-filter-group">
+        <span class="tw-review-toolbar-group" data-group="입력">
+            <button class="tw-btn tw-btn-primary tw-btn-review-apply-selected" title="체크된 행만 일괄 입력 (textarea 값 주입까지만 수행)">선택 입력</button>
+            <button class="tw-btn tw-btn-ghost tw-btn-review-apply-edited" title="Phase 4+5에서 수정된 행만 일괄 입력">수정만 입력</button>
+            <button class="tw-btn tw-btn-ghost tw-btn-review-apply-all" title="모든 행 일괄 입력">전체 입력</button>
+        </span>
+        <span class="tw-review-toolbar-divider"></span>
+        <span class="tw-review-toolbar-group" data-group="보기">
             <label class="tw-review-filter-label">필터
                 <select class="tw-review-filter">
                     <option value="all">전체</option>
@@ -2312,26 +2322,28 @@
                     <option value="state">상태</option>
                 </select>
             </label>
+            <button class="tw-btn tw-btn-ghost tw-btn-review-failed-toggle tw-hidden" title="직전 일괄 입력에서 실패한 ID만 보기">🔁 실패만 보기</button>
+            <span class="tw-review-failed-chips tw-hidden" title="클릭하면 해당 행으로 이동"></span>
         </span>
         <span class="tw-review-apply-status tw-muted">입력은 textarea 값 주입까지만 수행합니다.</span>
-        <button class="tw-btn tw-btn-ghost tw-btn-review-failed-toggle tw-hidden" title="직전 일괄 입력에서 실패한 ID만 보기">🔁 실패만 보기</button>
-        <span class="tw-review-failed-chips tw-hidden" title="클릭하면 해당 행으로 이동"></span>
-        <button class="tw-btn tw-btn-ghost tw-btn-review-gc" title="현재 활성 batch run 외에 남아있는 직접 수정 데이터 정리">override 정리</button>
-        <span class="tw-review-toolbar-divider"></span>
-        <label class="tw-review-filter-label tw-hidden tw-review-compare-overrides-label" title="비교 시 직접 수정(override)을 final에 덮어 표시 (실제 적용 결과 기준 drift)">
-            <input type="checkbox" class="tw-review-compare-overrides" /> override 포함
-        </label>
-        <button class="tw-btn tw-btn-ghost tw-btn-review-compare-exit tw-hidden" title="비교 모드 종료">↩ 검토로 돌아가기</button>
-        <button class="tw-btn tw-btn-ghost tw-btn-review-export-json" title="현재 run 결과를 JSON으로 내려받기 (raw 제외)">📥 JSON</button>
-        <button class="tw-btn tw-btn-ghost tw-btn-review-export-csv" title="현재 run 결과를 CSV로 내려받기 (id/원문/phase3/45/override/final)">📥 CSV</button>
-        <span class="tw-review-toolbar-divider"></span>
-        <button class="tw-btn tw-btn-ghost tw-btn-review-export-overrides" title="모든 직접 수정(override)을 JSON 파일로 내보내기">⤴ override</button>
-        <button class="tw-btn tw-btn-ghost tw-btn-review-import-overrides" title="JSON 파일에서 직접 수정(override) 복원">⤵ override</button>
-        <input type="file" class="tw-review-import-overrides-file" accept="application/json,.json" hidden />
-        <span class="tw-review-toolbar-divider"></span>
-        <button class="tw-btn tw-btn-ghost tw-btn-review-history" title="이 파일의 과거 batch run 목록 (활성 전환 / 삭제)">📚 history</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-history" title="과거 run 목록 / 내보내기 / 설정">📚 history</button>
     </div>
-    <div class="tw-review-history-panel tw-hidden"></div>
+    <div class="tw-review-history-panel tw-hidden">
+        <div class="tw-history-panel-header">
+            <span class="tw-history-panel-title">📚 Run history</span>
+            <span class="tw-history-panel-actions">
+                <button class="tw-btn tw-btn-ghost tw-btn-review-export-json" title="현재 run 결과를 JSON으로 내려받기 (raw 제외)">📥 JSON</button>
+                <button class="tw-btn tw-btn-ghost tw-btn-review-export-csv" title="현재 run 결과를 CSV로 내려받기 (id/원문/phase3/45/override/final)">📥 CSV</button>
+                <span class="tw-history-divider"></span>
+                <button class="tw-btn tw-btn-ghost tw-btn-review-export-overrides" title="모든 직접 수정(override)을 JSON 파일로 내보내기">⤴ override</button>
+                <button class="tw-btn tw-btn-ghost tw-btn-review-import-overrides" title="JSON 파일에서 직접 수정(override) 복원">⤵ override</button>
+                <input type="file" class="tw-review-import-overrides-file" accept="application/json,.json" hidden />
+                <span class="tw-history-divider"></span>
+                <button class="tw-btn tw-btn-ghost tw-btn-review-gc" title="현재 활성 batch run 외에 남아있는 직접 수정 데이터 정리">🧹 override 정리</button>
+            </span>
+        </div>
+        <div class="tw-history-list"></div>
+    </div>
     <div class="tw-review-table"></div>
 </div>
 <div class="tw-log-panel tw-tab-content" data-tab-content="logs">
@@ -2869,6 +2881,34 @@
 .tw-history-actions { display: flex; gap: 4px; flex-wrap: nowrap; justify-content: flex-end; }
 .tw-history-actions .tw-btn { padding: 2px 7px; font-size: 11px; white-space: nowrap; }
 .tw-history-empty { padding: 12px; text-align: center; color: var(--tw-muted, #888); font-size: 12px; }
+/* v0.7.4: history 패널 헤더 (데이터/override 운용 그룹 이주) */
+.tw-history-panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; flex-wrap: wrap; padding: 4px 6px 8px;
+    border-bottom: 1px solid var(--tw-border); margin-bottom: 6px;
+}
+.tw-history-panel-title { font-weight: 600; color: var(--tw-accent); font-size: 12px; }
+.tw-history-panel-actions { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.tw-history-panel-actions .tw-btn { padding: 3px 8px; font-size: 11px; white-space: nowrap; }
+.tw-history-divider {
+    display: inline-block; width: 1px; height: 14px; background: var(--tw-border); margin: 0 3px;
+}
+.tw-history-list { display: block; }
+/* v0.7.4: 비교 모드 banner (toolbar 외 상단에 고정 표시) */
+.tw-compare-banner-bar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin: 4px 0 6px; padding: 6px 10px; border-radius: 6px;
+    background: var(--tw-accent-soft); border: 1px solid rgba(74, 222, 128, 0.35);
+    font-size: 12px;
+}
+.tw-compare-banner-bar .tw-compare-banner-text { color: var(--tw-accent); font-weight: 600; }
+.tw-compare-banner-bar .tw-review-filter-label { margin-left: auto; color: var(--tw-fg); }
+.tw-compare-banner-bar .tw-btn { padding: 3px 10px; font-size: 12px; }
+/* v0.7.4: toolbar 그룹화 (입력 / 보기 / 운용) */
+.tw-review-toolbar-group {
+    display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.tw-btn-review-history { margin-left: 0; }
 @container (max-width: 760px) {
     .tw-context-panel { width: 260px; }
     .tw-batch-panel { flex-direction: column; }
@@ -3993,14 +4033,12 @@
 
     // v0.7.2: 비교 select를 제거하고 history 패널로 일원화—
     // refreshCompareSelect는 이제 컨트롤만(exit 버튼 / override 체크박스 / history 렌더) 갱신
+    // v0.7.4: compare 종료/override 포함 컨트롤은 toolbar 외 상단 banner로 이동
     function refreshCompareSelect(currentRun) {
         if (!modalEl) return;
-        const exitBtn = $('.tw-btn-review-compare-exit', modalEl);
-        if (exitBtn) exitBtn.classList.toggle('tw-hidden', !reviewView.compareMode);
-        // v0.7.0 B5: override 포함 토글은 compare 모드에서만 노출하고 상태도 동기화
-        const ovrLabel = $('.tw-review-compare-overrides-label', modalEl);
+        const banner = $('.tw-compare-banner-bar', modalEl);
+        if (banner) banner.classList.toggle('tw-hidden', !reviewView.compareMode);
         const ovrChk = $('.tw-review-compare-overrides', modalEl);
-        if (ovrLabel) ovrLabel.classList.toggle('tw-hidden', !reviewView.compareMode);
         if (ovrChk) ovrChk.checked = !!reviewView.compareIncludeOverrides;
         // v0.7.2: history 패널이 열려있으면 active/comparing 표시 갱신
         const panel = $('.tw-review-history-panel', modalEl);
@@ -4226,6 +4264,9 @@
     function renderHistoryPanel() {
         const panel = $('.tw-review-history-panel', modalEl);
         if (!panel || panel.classList.contains('tw-hidden')) return;
+        // v0.7.4: 동적 리스트는 .tw-history-list에만 쓰고 패널 헤더는 보존 (이벤트 핸들러 유지)
+        const listEl = $('.tw-history-list', panel);
+        if (!listEl) return;
         const runs = loadBatchRuns();
         const params = getUrlParams();
         const sameFile = Object.values(runs)
@@ -4235,7 +4276,7 @@
                 String(r.languageId) === String(params.languageId || ''))
             .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
         if (!sameFile.length) {
-            panel.innerHTML = '<div class="tw-history-empty">이 파일에는 저장된 run 기록이 없습니다.</div>';
+            listEl.innerHTML = '<div class="tw-history-empty">이 파일에는 저장된 run 기록이 없습니다.</div>';
             return;
         }
         const activeId = getActiveBatchRunId();
@@ -4274,7 +4315,7 @@
     <div class="tw-history-actions">${activateBtn}${compareBtn}${renameBtn}${deleteBtn}</div>
 </div>`;
         }).join('');
-        panel.innerHTML = head + body;
+        listEl.innerHTML = head + body;
     }
     function onActivateRun(runId) {
         if (!runId) return;
