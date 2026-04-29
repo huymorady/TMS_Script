@@ -52,13 +52,17 @@
     const BATCH_MAX_POLL_ATTEMPTS = 90;
     const BATCH_RESULT_RETRY_INTERVAL_MS = 2000;
     const BATCH_RESULT_RETRY_ATTEMPTS = 30;
-    // 실제 사용되는 batchRun.status는 5개만 존재. 이전 워크플로우에서 설정했던 phase_*,
-    // reviewing, apply_ready, bedrock_timeout, model_endpoint_error 등 dead state는 제거.
-    // 향후 새 상태 추가 시 이 맵과 isBatchBusy() 면절 메소드도 함께 업데이트할 것.
+    // BATCH_STATUS_LABELS: 실제 사용되는 batchRun.status값 모음.
+    // - idle / collecting / ready: 초기~수집 단계
+    // - phase12_ready / phase3_ready / phase45_ready: 각 Phase 완료 단계 (검증 ok=true)
+    // - failed / stale: 오류행 혹은 저장본 불일치
     const BATCH_STATUS_LABELS = {
         idle: '대기 중',
         collecting: '수집 중',
         ready: '수집 완료',
+        phase12_ready: 'Phase 1+2 완료',
+        phase3_ready: 'Phase 3 완료',
+        phase45_ready: 'Phase 4+5 완료',
         failed: '오류',
         stale: '저장본 불일치',
     };
@@ -2221,16 +2225,22 @@
         <div class="tw-batch-stepper"></div>
         <!-- v0.6.9 (G1-d): 수집/검증 결과 카드 (클릭 시 review 탭 필터 자동 적용) -->
         <div class="tw-batch-summary-cards"></div>
-        <div class="tw-batch-card">
-            <div class="tw-context-label">파일 정보</div>
-            <div class="tw-batch-file-info tw-context-value">아직 수집 전입니다.</div>
-        </div>
+        <!-- v0.6.9 hotfix2: 사용 모델/프롬프트 표시 -->
+        <div class="tw-batch-config-row tw-muted"></div>
         <div class="tw-batch-warning tw-muted"></div>
-        <div class="tw-context-label">수집 세그먼트</div>
-        <div class="tw-batch-segments"></div>
+        <!-- v0.6.9 hotfix2: 세그먼트 미리보기는 버튼 클릭 시 오버레이로 -->
+        <button type="button" class="tw-btn tw-btn-ghost tw-btn-show-segments" disabled>📋 수집 세그먼트 보기</button>
     </div>
     <div class="tw-batch-chat-panel">
         <div class="tw-batch-timeline"></div>
+        <!-- v0.6.9 hotfix2: 세그먼트 오버레이 (배치 패널 우측 영역 위로 떠오름) -->
+        <div class="tw-batch-segments-overlay tw-hidden">
+            <div class="tw-batch-segments-overlay-header">
+                <span class="tw-batch-segments-overlay-title">수집 세그먼트</span>
+                <button type="button" class="tw-btn tw-btn-ghost tw-btn-close-segments" title="닫기">✕</button>
+            </div>
+            <div class="tw-batch-segments-overlay-body tw-batch-segments"></div>
+        </div>
         <div class="tw-batch-input-wrap">
             <div class="tw-input-controls">
                 <label class="tw-ctrl">
@@ -2464,7 +2474,7 @@
     flex-direction: row; padding: 0; gap: 0; background: #202020; min-width: 0;
 }
 .tw-batch-sidebar {
-    width: 290px; flex-shrink: 0; padding: 12px; border-right: 1px solid #3a3a3a;
+    width: 320px; flex-shrink: 0; padding: 12px; border-right: 1px solid #3a3a3a;
     background: #252525; overflow-y: auto; display: flex; flex-direction: column; gap: 12px;
 }
 .tw-batch-chat-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
@@ -2488,16 +2498,57 @@
 .tw-batch-file-info, .tw-batch-validation { white-space: pre-wrap; max-height: 150px; overflow: auto; }
 .tw-batch-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .tw-batch-warning {
-    min-height: 20px; color: #fbbf24; background: #2a2212; border: 1px solid #5a4214;
-    border-radius: 6px; padding: 8px 10px; font-size: 11px; line-height: 1.45;
+    color: #fbbf24; background: #2a2212; border: 1px solid #5a4214;
+    border-radius: 6px; padding: 10px 12px 12px; font-size: 11px; line-height: 1.55;
+    word-break: break-word;
 }
 .tw-batch-warning:empty { display: none; }
-.tw-batch-segments {
-    flex: 0 0 auto; max-height: 220px; overflow: auto;
-    background: #181818; border: 1px solid #333;
-    border-radius: 6px; padding: 10px; font-size: 12px; line-height: 1.5;
+/* v0.6.9 hotfix2: 사용 모델/프롬프트 미니 표시 (사이드바) */
+.tw-batch-config-row {
+    display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px;
+    padding: 6px 10px; border: 1px dashed var(--tw-border); border-radius: 6px;
+    background: rgba(255,255,255,0.02);
 }
-/* v0.6.9 (G1-a): 활성 run 헤더 카드 — 290px 사이드바에 맞게 줄당 1~2 항목으로 wrap */
+.tw-batch-config-row:empty { display: none; }
+.tw-batch-config-row .tw-batch-config-item { display: inline-flex; gap: 4px; align-items: baseline; min-width: 0; }
+.tw-batch-config-row .tw-batch-config-key { color: var(--tw-muted); }
+.tw-batch-config-row .tw-batch-config-val {
+    color: var(--tw-fg); font-weight: 500;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px;
+}
+/* v0.6.9 hotfix2: 세그먼트 보기 버튼 */
+.tw-btn-show-segments {
+    width: 100%; text-align: left; padding: 8px 10px; font-size: 12px;
+    background: var(--tw-bg-2); border: 1px solid var(--tw-border); color: var(--tw-fg);
+}
+.tw-btn-show-segments:not(:disabled):hover { background: var(--tw-bg-3); border-color: var(--tw-accent); }
+.tw-btn-show-segments:disabled { opacity: 0.5; cursor: not-allowed; }
+/* v0.6.9 hotfix2: 세그먼트 오버레이 (chat-panel 위로 떠오름) */
+.tw-batch-chat-panel { position: relative; }
+.tw-batch-segments-overlay {
+    position: absolute; inset: 0; z-index: 20;
+    display: flex; flex-direction: column;
+    background: rgba(20, 20, 20, 0.97);
+    border-left: 1px solid var(--tw-border);
+}
+.tw-batch-segments-overlay-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; border-bottom: 1px solid var(--tw-border);
+    background: var(--tw-bg-2);
+}
+.tw-batch-segments-overlay-title { font-weight: 600; color: var(--tw-fg); }
+.tw-btn-close-segments {
+    width: 28px; height: 28px; padding: 0; border-radius: 50%;
+    background: transparent; border: 1px solid var(--tw-border); color: var(--tw-muted);
+    cursor: pointer; font-size: 14px;
+}
+.tw-btn-close-segments:hover { background: var(--tw-bg-3); color: var(--tw-fg); }
+.tw-batch-segments-overlay-body {
+    flex: 1; overflow: auto; padding: 14px; background: #181818;
+    font-size: 12px; line-height: 1.6;
+}
+/* .tw-batch-segments는 v0.6.9 hotfix2부터 overlay-body 안에서만 사용됨 */
+/* v0.6.9 (G1-a): 활성 run 헤더 카드 — 사이드바에 맞게 줄당 1~2 항목으로 wrap */
 .tw-batch-run-header {
     display: flex; gap: 6px 10px; align-items: center; flex-wrap: wrap;
     padding: 6px 8px; border: 1px solid var(--tw-border); border-radius: 8px;
@@ -2990,6 +3041,17 @@
         const batchCards = $('.tw-batch-summary-cards', el);
         if (batchCards) batchCards.addEventListener('click', onBatchSummaryCardClick);
 
+        // v0.6.9 hotfix2: 세그먼트 보기 버튼 / 오버레이 닫기
+        const segBtn = $('.tw-btn-show-segments', el);
+        if (segBtn) segBtn.addEventListener('click', openSegmentsOverlay);
+        const segCloseBtn = $('.tw-btn-close-segments', el);
+        if (segCloseBtn) segCloseBtn.addEventListener('click', closeSegmentsOverlay);
+        // ESC로 오버레이 닫기
+        const segOverlay = $('.tw-batch-segments-overlay', el);
+        if (segOverlay) {
+            segOverlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSegmentsOverlay(); });
+        }
+
         // v0.6.7 (C2): 비교 모드 select / 종료 버튼
         $('.tw-review-compare-select', el).addEventListener('change', onCompareSelectChange);
         $('.tw-btn-review-compare-exit', el).addEventListener('click', onExitCompareMode);
@@ -3317,19 +3379,23 @@
         if (run && !batchRun) batchRun = run;
 
         const statusEl = $('.tw-batch-status', modalEl);
-        const fileInfoEl = $('.tw-batch-file-info', modalEl);
         const warningEl = $('.tw-batch-warning', modalEl);
-        const segmentsEl = $('.tw-batch-segments', modalEl);
-        if (!statusEl || !fileInfoEl || !warningEl || !segmentsEl) return;
+        const segmentsEl = $('.tw-batch-segments', modalEl); // overlay body
+        const segmentsBtn = $('.tw-btn-show-segments', modalEl);
+        if (!statusEl || !warningEl || !segmentsEl) return;
 
         if (!run) {
             statusEl.textContent = '대기 중';
-            fileInfoEl.textContent = '아직 수집 전입니다.';
             warningEl.textContent = '';
             segmentsEl.innerHTML = '<span class="tw-muted">현재 페이지 수집을 먼저 실행하세요.</span>';
+            if (segmentsBtn) {
+                segmentsBtn.disabled = true;
+                segmentsBtn.textContent = '📋 수집 세그먼트 보기';
+            }
             renderBatchRunHeader(null);
             renderBatchPhaseStepper(null);
             renderBatchSummaryCards(null);
+            renderBatchConfigRow(null);
             updateBatchButtons(null);
             renderBatchTimeline(null);
             renderLogOutput();
@@ -3338,29 +3404,29 @@
         }
 
         statusEl.textContent = BATCH_STATUS_LABELS[run.status] || run.status || '대기 중';
-        fileInfoEl.textContent = [
-            `projectId=${run.projectId} / fileId=${run.fileId} / languageId=${run.languageId}`,
-            `page=${run.page} / pageSize=${run.pageSize}`,
-            `segments=${run.segments?.length || 0}`,
-            `storageStringId=${run.storageStringId || '-'}`,
-            `model=${run.model || '-'}`,
-        ].join('\n');
 
         renderBatchRunHeader(run);
         renderBatchPhaseStepper(run);
         renderBatchSummaryCards(run);
+        renderBatchConfigRow(run);
 
         warningEl.textContent = run.storageStringId
             ? `주의: Phase 실행 결과는 storageStringId ${run.storageStringId}의 번역 칸에 저장됩니다. 테스트 후 수동 정리가 필요해요.`
             : '';
 
-        if (run.segments?.length) {
-            const preview = run.segments.slice(0, 12).map(seg => {
-                const text = String(seg.origin_string || '').replace(/\s+/g, ' ').slice(0, 80);
+        const segCount = run.segments?.length || 0;
+        if (segmentsBtn) {
+            segmentsBtn.disabled = segCount === 0;
+            segmentsBtn.textContent = segCount > 0
+                ? `📋 수집 세그먼트 보기 (${segCount}개)`
+                : '📋 수집 세그먼트 보기';
+        }
+        if (segCount) {
+            const preview = run.segments.map(seg => {
+                const text = String(seg.origin_string || '').replace(/\s+/g, ' ').slice(0, 200);
                 return `<div><b>#${escapeHtml(seg.id)}</b> ${escapeHtml(text)}</div>`;
             }).join('');
-            const rest = run.segments.length > 12 ? `<div class="tw-muted">... 외 ${run.segments.length - 12}개</div>` : '';
-            segmentsEl.innerHTML = preview + rest;
+            segmentsEl.innerHTML = preview;
         } else {
             segmentsEl.innerHTML = '<span class="tw-muted">현재 페이지 수집을 먼저 실행하세요.</span>';
         }
@@ -3369,6 +3435,43 @@
         renderBatchTimeline(run);
         renderLogOutput();
         renderReviewTable();
+    }
+
+    // v0.6.9 hotfix2: 사용 모델/프롬프트 미니 표시
+    function renderBatchConfigRow(run) {
+        const el = $('.tw-batch-config-row', modalEl);
+        if (!el) return;
+        const model = (run && run.model) || (typeof getSelectedModel === 'function' ? getSelectedModel() : '');
+        let promptName = '';
+        try {
+            const p = getBatchActivePrompt();
+            promptName = p?.name || p?.id || '';
+        } catch (_) { /* noop */ }
+        const items = [];
+        if (model) items.push({ k: '모델', v: String(model) });
+        if (promptName) items.push({ k: '프롬프트', v: String(promptName) });
+        if (run) {
+            items.push({ k: '파일', v: `proj ${run.projectId || '?'} / file ${run.fileId || '?'} / lang ${run.languageId || '?'}` });
+            if (run.page || run.pageSize) items.push({ k: '페이지', v: `${run.page || '?'} / ${run.pageSize || '?'}` });
+        }
+        if (!items.length) { el.innerHTML = ''; return; }
+        el.innerHTML = items.map(it => `
+            <span class="tw-batch-config-item" title="${escapeHtml(it.k)}: ${escapeHtml(it.v)}">
+                <span class="tw-batch-config-key">${escapeHtml(it.k)}</span>
+                <span class="tw-batch-config-val">${escapeHtml(it.v)}</span>
+            </span>
+        `).join('');
+    }
+
+    function openSegmentsOverlay() {
+        if (!modalEl) return;
+        const overlay = $('.tw-batch-segments-overlay', modalEl);
+        if (overlay) overlay.classList.remove('tw-hidden');
+    }
+    function closeSegmentsOverlay() {
+        if (!modalEl) return;
+        const overlay = $('.tw-batch-segments-overlay', modalEl);
+        if (overlay) overlay.classList.add('tw-hidden');
     }
 
     // v0.6.9 (G1-a): 활성 run 헤더 카드
