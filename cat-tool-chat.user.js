@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.12
+// @version      0.7.13
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -16,6 +16,9 @@
     // ========================================================================
     // 상수 & 설정
     // ========================================================================
+    // v0.7.12: @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
+    const SCRIPT_VERSION = '0.7.13';
+
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
         ACTIVE_PROMPT_ID: 'tms_workflow_active_prompt_v1', // legacy: v0.4.0 마이그레이션 폴백용. 신규 코드는 CHAT/BATCH ID를 사용.
@@ -8199,6 +8202,8 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         };
     }
 
-    console.log('%c[TMS Workflow v0.6.9] 로드됨. Alt+Z로 모달 오픈 (배치 패널 가시성: Run 헤더 + Phase stepper + 수집/검증 카드 → 검토 탭 점프)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
-    console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
+    console.log('%c[TMS Workflow v' + SCRIPT_VERSION + '] 로드됨. Alt+Z로 모달 오픈 · 워크스페이스 탭에 📜 Activity / 🚨 위험 영역 카드 포함', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px;font-weight:600');
+    console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / window.tmsActivity.get() / window.tmsLog("verbose")', 'color:#888');
+    // v0.7.12: 활성 인스턴스가 정확히 어떤 버전인지 확인할 수 있도록 window 노출
+    try { window.tmsWorkflow = window.tmsWorkflow || {}; window.tmsWorkflow.version = SCRIPT_VERSION; } catch (_) {}
 })();
