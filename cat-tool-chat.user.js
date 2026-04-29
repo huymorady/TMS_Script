@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.9
+// @version      0.6.10
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -2305,6 +2305,10 @@
         <button class="tw-btn tw-btn-ghost tw-btn-review-compare-exit tw-hidden" title="비교 모드 종료">↩ 검토로 돌아가기</button>
         <button class="tw-btn tw-btn-ghost tw-btn-review-export-json" title="현재 run 결과를 JSON으로 내려받기 (raw 제외)">📥 JSON</button>
         <button class="tw-btn tw-btn-ghost tw-btn-review-export-csv" title="현재 run 결과를 CSV로 내려받기 (id/원문/phase3/45/override/final)">📥 CSV</button>
+        <span class="tw-review-toolbar-divider"></span>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-export-overrides" title="모든 직접 수정(override)을 JSON 파일로 내보내기">⤴ override</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-import-overrides" title="JSON 파일에서 직접 수정(override) 복원">⤵ override</button>
+        <input type="file" class="tw-review-import-overrides-file" accept="application/json,.json" hidden />
     </div>
     <div class="tw-review-table"></div>
 </div>
@@ -2453,6 +2457,16 @@
     text-align: center; padding: 4px; font-size: 11px; }
 .tw-msg-system { max-width: 100%; }
 .tw-msg-progress { color: #fbbf24; }
+/* v0.6.10 C2-신: AI 메시지 인라인 액션 버튼 */
+.tw-msg-actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.tw-msg-progress .tw-msg-actions { display: none; }
+.tw-msg-action {
+    background: transparent; color: #94a3b8; border: 1px solid #3a3a3a;
+    border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;
+    transition: all 0.12s ease;
+}
+.tw-msg-action:hover { background: #2a2a2a; color: #e0e0e0; border-color: #4ade80; }
+.tw-msg-action-apply:hover { color: #4ade80; }
 .tw-chat-input-wrap { padding: 14px 16px; border-top: 1px solid #3a3a3a;
     background: #252525; flex-shrink: 0; }
 .tw-input-controls { display: flex; gap: 14px; margin-bottom: 10px; font-size: 12px; color: #aaa; }
@@ -2655,13 +2669,15 @@
 /* v0.6.5 (A4): phase3 ↔ phase4+5 단어 단위 diff */
 .tw-diff-add { background: rgba(74, 222, 128, 0.18); color: #86efac; border-radius: 2px; padding: 0 2px; }
 .tw-diff-del { background: rgba(248, 113, 113, 0.18); color: #fca5a5; text-decoration: line-through; border-radius: 2px; padding: 0 2px; opacity: 0.85; }
-/* v0.6.6 (B3): warn-only chip (final 셀에 부착) */
+/* v0.6.6 (B3): warn-only chip (final 셀에 부착) — v0.6.10 B4: 클릭 시 행 스크롤/flash */
 .tw-review-warn-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .tw-review-warn-chip {
     display: inline-flex; align-items: center; padding: 1px 6px; border-radius: 9999px;
-    font-size: 11px; font-weight: 500; line-height: 1.4; cursor: help;
+    font-size: 11px; font-weight: 500; line-height: 1.4; cursor: pointer;
     background: rgba(250, 204, 21, 0.14); color: #fde047; border: 1px solid rgba(250, 204, 21, 0.35);
+    transition: filter 0.12s ease;
 }
+.tw-review-warn-chip:hover { filter: brightness(1.25); }
 .tw-review-warn-chip.tw-review-warn-tb { background: rgba(244, 114, 182, 0.14); color: #f9a8d4; border-color: rgba(244, 114, 182, 0.35); }
 .tw-review-warn-chip.tw-review-warn-order { background: rgba(96, 165, 250, 0.14); color: #93c5fd; border-color: rgba(96, 165, 250, 0.35); }
 .tw-review-table {
@@ -3017,6 +3033,10 @@
         // 번역 채택
         $('.tw-btn-adopt', el).addEventListener('click', onAdoptTranslation);
 
+        // v0.6.10 C2-신: AI 메시지 인라인 액션 (셀로 적용 / 복사)
+        const messagesEl = $('.tw-chat-messages', el);
+        if (messagesEl) messagesEl.addEventListener('click', onChatMessageAction);
+
         // 설정 버튼
         $('.tw-btn-settings', el).addEventListener('click', showSettingsPanel);
 
@@ -3062,12 +3082,27 @@
         // v0.6.7 (C3): export JSON/CSV
         $('.tw-btn-review-export-json', el).addEventListener('click', onExportRunJson);
         $('.tw-btn-review-export-csv', el).addEventListener('click', onExportRunCsv);
+        // v0.6.10 E1: override export/import
+        $('.tw-btn-review-export-overrides', el).addEventListener('click', onExportOverrides);
+        $('.tw-btn-review-import-overrides', el).addEventListener('click', () => {
+            $('.tw-review-import-overrides-file', el)?.click();
+        });
+        $('.tw-review-import-overrides-file', el).addEventListener('change', onImportOverridesFile);
         // v0.6.7 (D1): 로그 필터/검색/다운로드
         $('.tw-log-level', el).addEventListener('change', onLogLevelChange);
         $('.tw-log-search', el).addEventListener('input', onLogSearchInput);
         $('.tw-btn-log-download', el).addEventListener('click', onDownloadLog);
 
         $('.tw-review-table', el).addEventListener('click', async (e) => {
+            // v0.6.10 B4: warn chip 클릭 → 해당 행 스크롤+flash (자체 행이라도 시각 강조 도움)
+            const warnChip = e.target.closest('.tw-review-warn-chip');
+            if (warnChip) {
+                const row = warnChip.closest('.tw-review-row');
+                const rid = row?.getAttribute('data-row-id');
+                if (rid) scrollToReviewRow(rid);
+                return;
+            }
+
             const copyBtn = e.target.closest('.tw-btn-copy-final');
             if (copyBtn) {
                 const text = getBatchFinalText(Number(copyBtn.dataset.id));
@@ -3917,6 +3952,86 @@
         toast(`CSV 내보내기 완료 (${lineCount}행)`, 'success');
         appendBatchLog(`현재 run을 CSV로 내보냄 (${lineCount}행)`, 'info');
     }
+
+    // v0.6.10 E1: override export/import
+    function onExportOverrides() {
+        const all = loadReviewOverrides() || {};
+        const runIds = Object.keys(all);
+        const itemCount = runIds.reduce((sum, rid) => sum + Object.keys(all[rid] || {}).length, 0);
+        if (!itemCount) { toast('내보낼 직접 수정(override)이 없습니다.', 'info'); return; }
+        const payload = {
+            schema: 'tms_workflow_review_overrides',
+            schemaVersion: 1,
+            exportedAt: new Date().toISOString(),
+            scriptVersion: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || null,
+            runCount: runIds.length,
+            itemCount,
+            overrides: all,
+        };
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        downloadTextFile(`tms-overrides-${stamp}.json`, 'application/json', JSON.stringify(payload, null, 2));
+        toast(`override 내보내기 완료 (run ${runIds.length}, 항목 ${itemCount})`, 'success');
+    }
+    function onImportOverridesFile(e) {
+        const input = e.target;
+        const file = input.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            try {
+                const text = String(reader.result || '');
+                const parsed = JSON.parse(text);
+                const incoming = parsed?.overrides && typeof parsed.overrides === 'object' ? parsed.overrides : null;
+                if (!incoming) {
+                    toast('파일 형식이 올바르지 않습니다 (overrides 필드 없음).', 'error');
+                    return;
+                }
+                const runIds = Object.keys(incoming);
+                const incomingCount = runIds.reduce((s, rid) => s + Object.keys(incoming[rid] || {}).length, 0);
+                if (!incomingCount) { toast('파일에 복원할 항목이 없습니다.', 'info'); return; }
+                const mode = confirm(
+                    `override 가져오기\n\n` +
+                    `파일: run ${runIds.length}개 / 항목 ${incomingCount}개\n\n` +
+                    `[확인] = 같은 run+id는 파일 값으로 덮어쓰기 (병합)\n` +
+                    `[취소] = 가져오기 중단`,
+                ) ? 'merge' : null;
+                if (!mode) return;
+
+                const current = loadReviewOverrides() || {};
+                let added = 0;
+                let overwritten = 0;
+                for (const rid of runIds) {
+                    const bucket = incoming[rid] || {};
+                    const target = current[rid] || (current[rid] = {});
+                    for (const sid of Object.keys(bucket)) {
+                        const v = bucket[sid];
+                        // legacy string vs {text, updatedAt}
+                        const norm = typeof v === 'string'
+                            ? { text: v, updatedAt: Date.now() }
+                            : (v && typeof v === 'object' && typeof v.text === 'string' ? { text: v.text, updatedAt: v.updatedAt || Date.now() } : null);
+                        if (!norm) continue;
+                        if (target[sid]) overwritten += 1;
+                        else added += 1;
+                        target[sid] = norm;
+                    }
+                }
+                saveReviewOverrides(current);
+                toast(`override 가져오기 완료 — 신규 ${added}, 덮어쓰기 ${overwritten}`, 'success');
+                appendBatchLog(`override 가져오기 (신규 ${added}, 덮어쓰기 ${overwritten})`, 'info');
+                renderReviewTable();
+            } catch (err) {
+                console.error('[TMS-WF] override import 실패:', err);
+                toast('가져오기 실패: ' + err.message, 'error');
+            } finally {
+                input.value = ''; // 같은 파일 다시 선택 가능하도록 reset
+            }
+        };
+        reader.onerror = () => {
+            toast('파일을 읽지 못했습니다.', 'error');
+            input.value = '';
+        };
+        reader.readAsText(file);
+    }
     function getBatchFinalText(id) {
         const run = batchRun || restoreActiveBatchRun();
         if (!run?.phase3?.parsed || !run.phase3.validation?.ok) return '';
@@ -4221,6 +4336,8 @@
 
     function renderReviewTable() {
         if (!modalEl) return;
+        // v0.6.10 F1: 렌더 시작 시각 기록 (대량 run 감시용)
+        renderReviewTable._t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
         const summaryEl = $('.tw-review-summary', modalEl);
         const tableEl = $('.tw-review-table', modalEl);
         if (!summaryEl || !tableEl) return;
@@ -4454,6 +4571,11 @@
     <div><input class="tw-review-select-all" type="checkbox" title="전체 선택"></div><div>ID</div><div>그룹</div><div>원문</div><div>Phase 3</div><div>Phase 4+5</div><div>최종 후보</div><div>동작</div>
 </div>${rows}`;
         updateReviewApplyStatus('입력은 textarea 값 주입까지만 수행합니다.');
+        // v0.6.10 F1: 대용량 run 감시 (200+ 항목일 때 콘솔에 렌더 시간 기록)
+        if (descriptors.length >= 200) {
+            const dt = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - (renderReviewTable._t0 || 0);
+            console.log(`[TMS-WF] renderReviewTable: ${descriptors.length}개 행 / ${dt.toFixed(1)}ms (filtered=${filtered.length})`);
+        }
     }
 
     async function onBatchCollect() {
@@ -4883,9 +5005,16 @@
         const msg = document.createElement('div');
         msg.className = `tw-msg tw-msg-${role}`;
         const label = role === 'user' ? '나' : role === 'ai' ? 'AI' : '';
+        // v0.6.10 C2-신: AI 메시지마다 인라인 적용/복사 액션 부착
+        const actions = role === 'ai'
+            ? `<div class="tw-msg-actions">
+    <button type="button" class="tw-msg-action tw-msg-action-apply" title="이 결과를 현재 세그먼트 textarea에 적용">✓ 셀로 적용</button>
+    <button type="button" class="tw-msg-action tw-msg-action-copy" title="이 결과를 클립보드로 복사">📋 복사</button>
+</div>`
+            : '';
         msg.innerHTML = `
 ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
-<div class="tw-msg-content">${escapeHtml(content)}</div>`;
+<div class="tw-msg-content">${escapeHtml(content)}</div>${actions}`;
         messagesEl.appendChild(msg);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         return msg;
@@ -4996,6 +5125,55 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         clearSession(currentStringId);
         renderChatHistory();
         toast('세션 초기화됨', 'success');
+    }
+
+    // v0.6.10 C2-신: AI 메시지 인라인 액션 (셀로 적용 / 복사)
+    function onChatMessageAction(e) {
+        const btn = e.target.closest('.tw-msg-action');
+        if (!btn) return;
+        const msgEl = btn.closest('.tw-msg');
+        if (!msgEl || !msgEl.classList.contains('tw-msg-ai')) return;
+        if (msgEl.classList.contains('tw-msg-progress')) return;
+        const contentEl = $('.tw-msg-content', msgEl);
+        const text = contentEl ? contentEl.textContent : '';
+        if (!text) return;
+
+        if (btn.classList.contains('tw-msg-action-copy')) {
+            if (navigator.clipboard?.writeText) {
+                navigator.clipboard.writeText(text).then(
+                    () => toast('복사했습니다.', 'success'),
+                    () => toast('클립보드 복사 실패', 'error'),
+                );
+            } else {
+                toast('이 환경에서는 클립보드를 사용할 수 없습니다.', 'error');
+            }
+            return;
+        }
+
+        if (btn.classList.contains('tw-msg-action-apply')) {
+            if (!currentStringId) {
+                toast('현재 세그먼트 ID를 알 수 없습니다.', 'error');
+                return;
+            }
+            const textarea = findTranslationTextarea(currentStringId);
+            if (!textarea) {
+                toast('번역 입력창을 찾지 못했습니다. 세그먼트를 먼저 클릭하세요.', 'error');
+                if (navigator.clipboard?.writeText) {
+                    navigator.clipboard.writeText(text).then(
+                        () => toast('대신 클립보드에 복사했습니다.', 'info'),
+                    );
+                }
+                return;
+            }
+            try {
+                injectTextareaValue(textarea, text);
+                try { clearAppliedFromBatch(currentStringId); } catch (err) { /* noop */ }
+                toast('이 결과를 셀에 적용했습니다.', 'success');
+            } catch (err) {
+                console.error('[TMS-WF] inline apply 실패:', err);
+                toast('적용 실패: ' + err.message, 'error');
+            }
+        }
     }
 
     function onAdoptTranslation() {
