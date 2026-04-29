@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - 단축키 모음
 // @namespace    http://tampermonkey.net/
-// @version      6.3
+// @version      6.4
 // @description  Alt+` → TB 추가 / Alt+1~6 → TM 검색/사전/CAT 체크 / Alt+S → 맞춤법 / Alt+T → 태그 / Alt+H → 도움말
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-shortcuts.user.js
@@ -58,16 +58,15 @@
   // 맞춤법 검사기 URL
   const SPELLER_URL = 'https://nara-speller.co.kr/speller/?auto=true';
 
-  // 태그 추출 정규식
+  // === SHARED TOKEN PATTERN ===
+  // cat-tool-chat.user.js / cat-tool-tb.user.js와 동일한 union. 세 곳 함께 유지.
   const TAG_PATTERN = new RegExp(
-    '\\{\\d+\\}'
-    + '|\\{[a-zA-Z_][a-zA-Z0-9_]*\\}'
-    + '|%[sd]'
-    + '|%\\d+\\$[sd]'
-    + '|<br\\s*/?>'
-    + '|</?[a-zA-Z][^>]*>'
-    + '|\\\\n'
-    + '|\\[/?[a-zA-Z][^\\]]*\\]'
+    '\\{[^{}]+\\}'                  // {value1}, {0}, {한글}, {user.name}
+    + '|%\\d+\\$[sd@]'              // %1$s, %2$d, %1$@
+    + '|%[@sd]'                       // %s, %d, %@
+    + '|\\\\[nrt]'                  // \n \r \t 리터럴
+    + '|</?[a-zA-Z][^>]*>'            // <br>, <color>, <b>, <size>, <sprite> 등
+    + '|\\[/?[a-zA-Z][^\\]]*\\]'   // [color], [b], [url] 등
   , 'g');
 
   // ═══════════════════════════════════════

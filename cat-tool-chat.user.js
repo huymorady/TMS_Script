@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.5.0
+// @version      0.5.3
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
+// @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
+// @downloadURL  https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
 // @run-at       document-end
 // @grant        none
 // ==/UserScript==
@@ -209,7 +211,8 @@
             if (status === 'SUCCESS') return data.data;
             if (status === 'FAILURE') throw new Error(`작업 실패: ${data.data.traceback || '알 수 없음'}`);
         }
-        throw new Error('폴링 시간 초과 (100초)');
+        const totalSec = Math.round((maxAttempts * interval) / 1000);
+        throw new Error(`폴링 시간 초과 (${totalSec}초, ${maxAttempts}회 시도)`);
     }
 
     async function fetchActiveResult(stringId) {
@@ -288,22 +291,88 @@
         };
     }
 
+    // === SHARED TOKEN PATTERN ===
+    // 동일한 union을 cat-tool-shortcuts.user.js / cat-tool-tb.user.js와 공유한다.
+    // 세 스크립트 중 하나라도 수정하면 나머지 두 곳도 함께 갱신한다.
+    // 커버:
+    //   - {value1}, {0}, {한글}, {value-1}, {user.name} 등 중괄호 플레이스홀더
+    //   - %1$s, %2$d, %1$@ 등 위치적 printf
+    //   - %@, %s, %d 등 단순 printf
+    //   - \n, \r, \t 이스케이프 시퀀스
+    //   - <br>, <color=...>, <b>, <size=N>, <sprite=N> 등 임의 HTML/Unity rich text 태그
+    //   - [color=#...], [b], [url=...], [sprite] 등 임의 BBCode 태그
+    const TOKEN_PATTERN = new RegExp(
+        '\\{[^{}]+\\}'                  // 중괄호 플레이스홀더
+        + '|%\\d+\\$[sd@]'              // 위치적 printf
+        + '|%[@sd]'                       // 단순 printf
+        + '|\\\\[nrt]'                  // \n \r \t 리터럴
+        + '|</?[a-zA-Z][^>]*>'            // 임의 HTML/Unity rich text
+        + '|\\[/?[a-zA-Z][^\\]]*\\]'   // 임의 BBCode
+    , 'g');
+
     function extractPlaceholders(text) {
-        return Array.from(new Set(String(text || '').match(/\{[^{}]+\}|%[@sd]/g) || []));
+        return Array.from(new Set(String(text || '').match(TOKEN_PATTERN) || []));
     }
 
     function stripCodeFence(text) {
+        // 모든 ```json/``` 펜스를 제거. LLM이 두 개 블록을 붙이거나 닫는 펜스를
+        // 빠뜨려도 안전하게 본문을 노출시키기 위해 글로벌 치환을 사용.
         return String(text || '')
             .trim()
-            .replace(/^```json\s*/i, '')
-            .replace(/^```\s*/i, '')
-            .replace(/\s*```\s*$/i, '')
+            .replace(/```(?:json)?\s*/gi, '')
+            .replace(/```/g, '')
             .trim();
+    }
+
+    // 텍스트에서 첫 번째 균형 잡힌 JSON 객체/배열 substring을 추출.
+    // 문자열 리터럴과 이스케이프를 인지하므로 본문 뒤에 자연어/추가 블록이
+    // 붙어 있어도 첫 완전 객체만 반환한다. 못 찾으면 null.
+    function extractFirstJsonValue(text) {
+        const src = String(text || '');
+        for (let i = 0; i < src.length; i++) {
+            const ch = src[i];
+            if (ch !== '{' && ch !== '[') continue;
+            const open = ch;
+            const close = ch === '{' ? '}' : ']';
+            let depth = 0;
+            let inString = false;
+            let escape = false;
+            for (let j = i; j < src.length; j++) {
+                const c = src[j];
+                if (escape) { escape = false; continue; }
+                if (inString) {
+                    if (c === '\\') escape = true;
+                    else if (c === '"') inString = false;
+                    continue;
+                }
+                if (c === '"') { inString = true; continue; }
+                if (c === open) depth++;
+                else if (c === close) {
+                    depth--;
+                    if (depth === 0) return src.slice(i, j + 1);
+                }
+            }
+            // 여기서 시작한 블록이 닫히지 않으면 더 뒤를 봐도 의미 없음.
+            return null;
+        }
+        return null;
     }
 
     function parseWorkflowJson(rawText, expectedPhase) {
         const cleaned = stripCodeFence(rawText);
-        const parsed = JSON.parse(cleaned);
+        let parsed;
+        try {
+            parsed = JSON.parse(cleaned);
+        } catch (firstError) {
+            // 본문 뒤에 자연어가 붙은 경우(0.5.0 차단 패턴): 첫 균형 객체만 추출해 재시도.
+            const candidate = extractFirstJsonValue(cleaned);
+            if (!candidate || candidate === cleaned) throw firstError;
+            try {
+                parsed = JSON.parse(candidate);
+            } catch {
+                throw firstError;
+            }
+        }
         if (expectedPhase && parsed.phase !== expectedPhase) {
             throw new Error(`phase 불일치: 기대=${expectedPhase}, 실제=${parsed.phase}`);
         }
@@ -327,9 +396,11 @@
     }
 
     function inspectSavedJson(rawText, expectedPhase) {
+        // parseWorkflowJson이 내부에서 stripCodeFence를 다시 수행하므로 raw를 그대로 전달.
+        // (이전 구현은 cleaned를 또 cleaning하는 중복이 있었다.)
         const cleaned = stripCodeFence(rawText);
         try {
-            const parsed = parseWorkflowJson(cleaned, expectedPhase);
+            const parsed = parseWorkflowJson(rawText, expectedPhase);
             return { ok: true, cleaned, parsed };
         } catch (error) {
             return {
@@ -1084,10 +1155,11 @@
     function batchRunMatchesCurrentUrl(run) {
         if (!run) return false;
         const params = getUrlParams();
+        // page 키는 비교하지 않는다. 페이지 이동 후 돌아와도 활성 런을 잃지
+        // 않게 하기 위함. (project/file/language가 같으면 재시잡이다.)
         return String(run.projectId) === String(params.projectId || '') &&
             String(run.fileId) === String(params.fileId || '') &&
-            String(run.languageId) === String(params.languageId || '') &&
-            String(run.page || 1) === String(params.page || '1');
+            String(run.languageId) === String(params.languageId || '');
     }
 
     function persistBatchRun(run) {
@@ -1583,7 +1655,10 @@
     <div class="tw-review-table"></div>
 </div>
 <div class="tw-log-panel tw-tab-content" data-tab-content="logs">
-    <div class="tw-panel-title">JSON/로그</div>
+    <div class="tw-log-header">
+        <div class="tw-panel-title">JSON/로그</div>
+        <button class="tw-btn tw-btn-ghost tw-btn-log-copy">📋 전체 복사</button>
+    </div>
     <pre class="tw-log-output">아직 로그가 없습니다.</pre>
 </div>
 <div class="tw-resize-handle"></div>
@@ -1778,6 +1853,10 @@
     flex: 1; margin: 0; overflow: auto; white-space: pre-wrap; word-break: break-word;
     background: #181818; border: 1px solid #333; border-radius: 6px; padding: 10px;
     color: #ddd; font-size: 12px; line-height: 1.5;
+}
+.tw-log-header {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; flex-shrink: 0;
 }
 @container (max-width: 760px) {
     .tw-context-panel { width: 220px; }
@@ -2033,6 +2112,7 @@
         $('.tw-btn-phase45', el).addEventListener('click', () => onRunBatchPhase('4+5'));
         $('.tw-btn-batch-refetch', el).addEventListener('click', onBatchRefetchResult);
         $('.tw-btn-batch-reset', el).addEventListener('click', onBatchReset);
+        $('.tw-btn-log-copy', el).addEventListener('click', onCopyLogOutput);
         $('.tw-btn-review-apply-selected', el).addEventListener('click', () => applyBatchTranslationsByIds(getSelectedReviewIds()));
         $('.tw-btn-review-apply-all', el).addEventListener('click', () => applyBatchTranslationsByIds(getReviewTranslationIds()));
 
@@ -2354,6 +2434,23 @@
         if (run.phase3?.raw) jsonBlocks.push(`\n\n=== Phase 3 raw ===\n${run.phase3.raw}`);
         if (run.phase45?.raw) jsonBlocks.push(`\n\n=== Phase 4+5 raw ===\n${run.phase45.raw}`);
         output.textContent = (logLines.join('\n') || '아직 로그가 없습니다.') + jsonBlocks.join('');
+    }
+
+    async function onCopyLogOutput() {
+        if (!modalEl) return;
+        const output = $('.tw-log-output', modalEl);
+        const text = output?.textContent || '';
+        if (!text || text === '아직 로그가 없습니다.') {
+            toast('복사할 로그가 없습니다.', 'info');
+            return;
+        }
+        try {
+            await navigator.clipboard.writeText(text);
+            toast(`JSON/로그 전체 복사 완료 (${text.length.toLocaleString()}자)`, 'success');
+        } catch (error) {
+            console.error('[TMS-WF] log copy 실패', error);
+            toast('클립보드 복사 실패: ' + error.message, 'error');
+        }
     }
 
     function getBatchFinalText(id) {
@@ -3452,6 +3549,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.5.0] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.5.3] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();

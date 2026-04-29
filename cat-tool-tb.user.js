@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CAT Tool - TB 도구
 // @namespace    http://tampermonkey.net/
-// @version      4.5
+// @version      4.6
 // @description  Alt+B → TB 목록/검수/QA 팝업 (14개 QA 체크 항목, 접기/드래그)
 // @match        *://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-tb.user.js
@@ -26,16 +26,15 @@
     TB_SPAN: 'div.origin_string[data-type="origin_string"] span.vb[data-tooltip]',
   };
 
-  // 태그 추출 정규식 (단축키 스크립트와 동일)
+  // === SHARED TOKEN PATTERN ===
+  // cat-tool-chat.user.js / cat-tool-shortcuts.user.js와 동일한 union. 세 곳 함께 유지.
   const TAG_PATTERN = new RegExp(
-    '\\{\\d+\\}'
-    + '|\\{[a-zA-Z_][a-zA-Z0-9_]*\\}'
-    + '|%[sd]'
-    + '|%\\d+\\$[sd]'
-    + '|<br\\s*/?>'
-    + '|</?[a-zA-Z][^>]*>'
-    + '|\\\\n'
-    + '|\\[/?[a-zA-Z][^\\]]*\\]'
+    '\\{[^{}]+\\}'                  // {value1}, {0}, {한글}, {user.name}
+    + '|%\\d+\\$[sd@]'              // %1$s, %2$d, %1$@
+    + '|%[@sd]'                       // %s, %d, %@
+    + '|\\\\[nrt]'                  // \n \r \t 리터럴
+    + '|</?[a-zA-Z][^>]*>'            // <br>, <color>, <b>, <size>, <sprite> 등
+    + '|\\[/?[a-zA-Z][^\\]]*\\]'   // [color], [b], [url] 등
   , 'g');
 
   // 숫자 추출 정규식 (태그 내부 제외를 위해 태그를 먼저 제거 후 사용)
