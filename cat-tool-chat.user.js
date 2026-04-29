@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.8
+// @version      0.7.9
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -1143,6 +1143,75 @@
         saveSessions({});
     }
 
+    // v0.7.9: 워크스페이스 전체 통계 (sessions + prompts + runs + overrides + IDB slots + LS approx)
+    // 설정 패널 "📊 저장 현황" 카드와 관리 섹션이 공유.
+    function getWorkspaceStats() {
+        const sessions = (() => { try { return loadSessions(); } catch { return {}; } })();
+        const prompts = (() => { try { return loadPrompts(); } catch { return []; } })();
+        const runs = (() => { try { return loadBatchRuns(); } catch { return {}; } })();
+        const overrides = (() => { try { return loadReviewOverrides(); } catch { return {}; } })();
+
+        const sessionCount = Object.keys(sessions).length;
+        const promptCount = Array.isArray(prompts) ? prompts.length : 0;
+        const runCount = Object.keys(runs).length;
+
+        // override count + orphan
+        let overrideCount = 0;
+        let orphanOverrideRunCount = 0;
+        let orphanOverrideEntryCount = 0;
+        for (const [runId, bucket] of Object.entries(overrides)) {
+            const n = Object.keys(bucket || {}).length;
+            overrideCount += n;
+            if (!runs[runId]) {
+                orphanOverrideRunCount++;
+                orphanOverrideEntryCount += n;
+            }
+        }
+
+        // LS approx size (우리가 쓰는 키만)
+        let lsBytes = 0;
+        try {
+            for (const k of Object.values(LS_KEYS)) {
+                const v = localStorage.getItem(k);
+                if (v != null) lsBytes += k.length + v.length;
+            }
+        } catch {}
+        const lsKb = (lsBytes / 1024).toFixed(1);
+
+        return {
+            sessionCount, promptCount, runCount,
+            overrideCount, orphanOverrideRunCount, orphanOverrideEntryCount,
+            lsBytes, lsKb,
+        };
+    }
+
+    // v0.7.9: override 관리 (수동 정리)
+    function clearOverridesForRun(runId) {
+        if (!runId) return 0;
+        const all = loadReviewOverrides();
+        const bucket = all[runId];
+        const n = bucket ? Object.keys(bucket).length : 0;
+        if (n > 0) {
+            delete all[runId];
+            saveReviewOverrides(all);
+        }
+        return n;
+    }
+    function pruneOrphanOverrides() {
+        const all = loadReviewOverrides();
+        const runs = loadBatchRuns();
+        let removedRuns = 0, removedEntries = 0;
+        for (const runId of Object.keys(all)) {
+            if (!runs[runId]) {
+                removedEntries += Object.keys(all[runId] || {}).length;
+                delete all[runId];
+                removedRuns++;
+            }
+        }
+        if (removedRuns > 0) saveReviewOverrides(all);
+        return { removedRuns, removedEntries };
+    }
+
     // v0.7.8 (#4): BATCH_RUNS GC 시 SESSIONS의 dangling importedFromRunId nullify
     // - 세션 자체는 유지 (대화 이력 손실 방지). importedFromRunId만 null로 설정.
     // - source는 'batch_import' 그대로 둔다 (히스토리 흔적 보존).
@@ -1396,6 +1465,36 @@
         } else {
             lsSet(LS_KEYS.OVERRIDE_WRITE_COUNTER, next);
         }
+    }
+
+    // v0.7.9: 특정 슬롯에서 강제 복원 (수동 트리거). 호출부에서 confirm 책임.
+    // mode: 'overwrite' (기본 — LS 통째 교체) | 'merge' (슬롯이 가진 키만 덮어씀)
+    async function restoreFromBackupSlot(slot, mode = 'overwrite') {
+        const all = await readAllBackupSlots();
+        const snap = all.find(s => s && s.slot === slot);
+        if (!snap) throw new Error(`slot ${slot} 비어 있음`);
+        if (mode === 'overwrite') {
+            saveSessions(snap.sessions || {});
+            saveReviewOverrides(snap.overrides || {});
+            saveBatchRuns(snap.runs || {});
+        } else {
+            // merge: 슬롯이 가진 키만 덮어씀
+            if (snap.sessions) saveSessions({ ...loadSessions(), ...snap.sessions });
+            if (snap.overrides) {
+                const cur = loadReviewOverrides();
+                const merged = { ...cur };
+                for (const [rid, b] of Object.entries(snap.overrides)) {
+                    merged[rid] = { ...(merged[rid] || {}), ...b };
+                }
+                saveReviewOverrides(merged);
+            }
+            if (snap.runs) saveBatchRuns({ ...loadBatchRuns(), ...snap.runs });
+        }
+        return {
+            sessions: Object.keys(snap.sessions || {}).length,
+            overrides: Object.values(snap.overrides || {}).reduce((s, b) => s + Object.keys(b || {}).length, 0),
+            runs: Object.keys(snap.runs || {}).length,
+        };
     }
 
     // 모달 진입 시 호출. LS가 비어 있고 IDB에 백업이 있을 때만 사용자에게 복원 prompt.
@@ -3521,6 +3620,51 @@
 .tw-session-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 .tw-session-info-body { font-size: 12px; color: #aaa; line-height: 1.7; }
 .tw-stat-hint { font-size: 11px; color: #888; margin-top: 8px; font-style: italic; }
+
+/* v0.7.9: 워크스페이스 관리 (run/override/IDB slot 표) */
+.tw-ws-section-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 10px;
+}
+.tw-ws-section-head .tw-stat-title { margin-bottom: 0; }
+.tw-ws-section-head-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.tw-ws-table {
+    width: 100%; border-collapse: collapse; font-size: 12px;
+    background: #1f1f1f; border: 1px solid #333; border-radius: 4px;
+    overflow: hidden;
+}
+.tw-ws-table th, .tw-ws-table td {
+    padding: 6px 8px; text-align: left; border-bottom: 1px solid #2c2c2c;
+}
+.tw-ws-table th {
+    background: #2a2a2a; color: #888; font-weight: 600;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+}
+.tw-ws-table tr:last-child td { border-bottom: none; }
+.tw-ws-table tr:hover td { background: #262626; }
+.tw-ws-table tr.tw-ws-row-active td { background: rgba(74,222,128,0.08); }
+.tw-ws-table tr.tw-ws-row-active td:first-child { border-left: 2px solid #4ade80; }
+.tw-ws-table tr.tw-ws-row-orphan td { color: #fbbf24; }
+.tw-ws-table .tw-ws-actions { display: flex; gap: 4px; flex-wrap: wrap; }
+.tw-ws-table .tw-ws-actions .tw-btn {
+    padding: 2px 6px; font-size: 11px; min-width: 0;
+}
+.tw-ws-empty {
+    padding: 20px; text-align: center; color: #666; font-size: 12px; font-style: italic;
+}
+.tw-ws-warn-badge {
+    display: inline-block; padding: 1px 6px; font-size: 11px; font-weight: 600;
+    background: rgba(251,191,36,0.15); color: #fbbf24; border-radius: 8px;
+    border: 1px solid rgba(251,191,36,0.4);
+}
+.tw-ws-quota-bar {
+    height: 6px; background: #2a2a2a; border-radius: 3px; overflow: hidden;
+    margin-top: 4px;
+}
+.tw-ws-quota-bar-fill {
+    height: 100%; background: linear-gradient(90deg, #4ade80, #facc15 70%, #ef4444);
+    transition: width 0.3s;
+}
 
 /* v0.7.6 (#4): 컴팩트 모드 — Phase stepper와 수집/검증 카드 접기 */
 .tw-batch-header-right {
@@ -6577,7 +6721,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         <span class="tw-settings-header-title">⚙️ 설정</span>
         <div class="tw-settings-tabs">
             <button class="tw-settings-tab active" data-tab="prompts">📝 시스템 프롬프트</button>
-            <button class="tw-settings-tab" data-tab="sessions">💾 세션 관리</button>
+            <button class="tw-settings-tab" data-tab="sessions">🧰 워크스페이스</button>
         </div>
         <button class="tw-btn tw-btn-ghost tw-btn-settings-close">닫기</button>
     </div>
@@ -6610,7 +6754,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             <div class="tw-stat-body"></div>
         </div>
         <div class="tw-session-actions">
-            <div class="tw-stat-title">🧹 세션 관리</div>
+            <div class="tw-stat-title">🧹 채팅 세션 관리</div>
             <div class="tw-session-buttons">
                 <button class="tw-btn tw-btn-ghost tw-btn-session-prune">
                     🗓️ ${SESSION_TTL_DAYS}일 이상 된 세션 정리
@@ -6620,6 +6764,37 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 </button>
             </div>
             <div class="tw-stat-hint">💡 세션만 영향받고 시스템 프롬프트는 보존됩니다.</div>
+        </div>
+        <div class="tw-session-actions tw-ws-runs-section">
+            <div class="tw-ws-section-head">
+                <div class="tw-stat-title">🧪 Batch Run 관리</div>
+                <div class="tw-ws-section-head-actions">
+                    <button class="tw-btn tw-btn-ghost tw-btn-ws-runs-refresh" title="목록 갱신">🔄</button>
+                </div>
+            </div>
+            <div class="tw-ws-runs-body"></div>
+            <div class="tw-stat-hint">💡 활성 run은 좌측에 초록 줄로 표시됩니다. 삭제 시 dangling override는 별도 정리가 필요합니다.</div>
+        </div>
+        <div class="tw-session-actions tw-ws-overrides-section">
+            <div class="tw-ws-section-head">
+                <div class="tw-stat-title">✂ Override 관리</div>
+                <div class="tw-ws-section-head-actions">
+                    <button class="tw-btn tw-btn-ghost tw-btn-ws-overrides-prune" title="고아 override (run이 없는 항목) 일괄 삭제">🧹 고아 override 정리</button>
+                </div>
+            </div>
+            <div class="tw-ws-overrides-body"></div>
+            <div class="tw-stat-hint">💡 override는 사용자가 review 패널에서 직접 수정한 최종 후보입니다. run이 삭제되면 자동 정리되지 않습니다.</div>
+        </div>
+        <div class="tw-session-actions tw-ws-slots-section">
+            <div class="tw-ws-section-head">
+                <div class="tw-stat-title">💾 IDB 자동 백업 슬롯</div>
+                <div class="tw-ws-section-head-actions">
+                    <button class="tw-btn tw-btn-ghost tw-btn-ws-slots-snapshot" title="지금 즉시 IDB에 백업 1회 강제 저장">📸 지금 백업</button>
+                    <button class="tw-btn tw-btn-ghost tw-btn-ws-slots-refresh" title="목록 갱신">🔄</button>
+                </div>
+            </div>
+            <div class="tw-ws-slots-body"></div>
+            <div class="tw-stat-hint">💡 ${BACKUP_SLOT_COUNT}칸 ring buffer. override ${OVERRIDE_BACKUP_THRESHOLD}회마다 / phase45 완료 시 자동 저장됩니다.</div>
         </div>
         <div class="tw-session-actions">
             <div class="tw-stat-title">📦 백업 · 복원</div>
@@ -6663,7 +6838,10 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 const tab = btn.dataset.tab;
                 promptsTab.style.display = tab === 'prompts' ? 'flex' : 'none';
                 sessionsTab.style.display = tab === 'sessions' ? 'flex' : 'none';
-                if (tab === 'sessions') refreshSessionStats();
+                if (tab === 'sessions') {
+                    if (typeof refreshWorkspaceUi === 'function') refreshWorkspaceUi();
+                    else refreshSessionStats();
+                }
             });
         });
 
@@ -6800,22 +6978,305 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
         // ==== 세션 관리 탭 ====
         function refreshSessionStats() {
-            const stats = getSessionStats();
+            const ws = getWorkspaceStats();
+            const sStats = getSessionStats(); // 가장 오래된 세션 정보용
             const statBody = $('.tw-stat-body', overlay);
+            // LS quota 추정 (브라우저별 5~10MB. 5MB 기준 게이지 표시)
+            const lsQuotaBytes = 5 * 1024 * 1024;
+            const pct = Math.min(100, Math.round((ws.lsBytes / lsQuotaBytes) * 100));
+            const overrideCell = ws.orphanOverrideEntryCount > 0
+                ? `${ws.overrideCount}개 <span class="tw-ws-warn-badge" title="${ws.orphanOverrideRunCount}개 run의 ${ws.orphanOverrideEntryCount}개 override가 고아">⚠ orphan ${ws.orphanOverrideEntryCount}</span>`
+                : `${ws.overrideCount}개`;
             statBody.innerHTML = `
-                <div class="tw-stat-row">
-                    <span class="tw-stat-label">저장된 세션</span>
-                    <span class="tw-stat-value">${stats.count}개</span>
-                </div>
-                <div class="tw-stat-row">
-                    <span class="tw-stat-label">총 크기</span>
-                    <span class="tw-stat-value">${stats.sizeKb} KB</span>
-                </div>
-                <div class="tw-stat-row">
-                    <span class="tw-stat-label">가장 오래된 세션</span>
-                    <span class="tw-stat-value">${stats.oldestDays}일 전</span>
-                </div>
+                <div class="tw-stat-row"><span class="tw-stat-label">💬 채팅 세션</span><span class="tw-stat-value">${ws.sessionCount}개</span></div>
+                <div class="tw-stat-row"><span class="tw-stat-label">📝 시스템 프롬프트</span><span class="tw-stat-value">${ws.promptCount}개</span></div>
+                <div class="tw-stat-row"><span class="tw-stat-label">🧪 Batch Run</span><span class="tw-stat-value">${ws.runCount}개</span></div>
+                <div class="tw-stat-row"><span class="tw-stat-label">✂ Override</span><span class="tw-stat-value">${overrideCell}</span></div>
+                <div class="tw-stat-row"><span class="tw-stat-label">가장 오래된 세션</span><span class="tw-stat-value">${sStats.oldestDays}일 전</span></div>
+                <div class="tw-stat-row"><span class="tw-stat-label">로컬스토리지 사용량</span><span class="tw-stat-value">${ws.lsKb} KB <span style="color:#666">(~${pct}% / 5MB)</span></span></div>
+                <div class="tw-ws-quota-bar"><div class="tw-ws-quota-bar-fill" style="width:${pct}%"></div></div>
             `;
+        }
+
+        // v0.7.9: Batch Run 표 렌더
+        function refreshRunsTable() {
+            const body = $('.tw-ws-runs-body', overlay);
+            if (!body) return;
+            const runs = (() => { try { return loadBatchRuns(); } catch { return {}; } })();
+            const overrides = (() => { try { return loadReviewOverrides(); } catch { return {}; } })();
+            const activeId = getActiveBatchRunId();
+            const ids = Object.keys(runs).sort((a, b) => {
+                const ta = String(runs[a]?.updatedAt || runs[a]?.createdAt || '');
+                const tb = String(runs[b]?.updatedAt || runs[b]?.createdAt || '');
+                return tb.localeCompare(ta);
+            });
+            if (!ids.length) {
+                body.innerHTML = `<div class="tw-ws-empty">배치 run이 없습니다.</div>`;
+                return;
+            }
+            const rows = ids.map(id => {
+                const r = runs[id] || {};
+                const isActive = id === activeId;
+                const created = String(r.createdAt || '').slice(0, 19).replace('T', ' ');
+                const status = escapeHtml(String(r.status || '?'));
+                const segCount = Array.isArray(r.segments) ? r.segments.length : (r.phase45?.parsed?.length || r.phase3?.parsed?.length || 0);
+                const ovCount = overrides[id] ? Object.keys(overrides[id]).length : 0;
+                const sizeKb = (() => {
+                    try { return (new Blob([JSON.stringify(r)]).size / 1024).toFixed(1); } catch { return '?'; }
+                })();
+                const labelHtml = r.label ? `<div style="color:#aaa;font-size:11px">${escapeHtml(String(r.label))}</div>` : '';
+                return `
+                <tr class="${isActive ? 'tw-ws-row-active' : ''}" data-run-id="${escapeHtml(id)}">
+                    <td><div style="font-family:monospace;font-size:11px">${escapeHtml(id)}</div>${labelHtml}</td>
+                    <td>${escapeHtml(created)}</td>
+                    <td>${status}</td>
+                    <td style="text-align:right">${segCount}</td>
+                    <td style="text-align:right">${ovCount}</td>
+                    <td style="text-align:right">${sizeKb} KB</td>
+                    <td>
+                        <div class="tw-ws-actions">
+                            ${isActive ? '<span style="color:#4ade80;font-size:11px;padding:2px 6px">활성</span>' : '<button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-run-activate" data-run-id="' + escapeHtml(id) + '">🔁 활성</button>'}
+                            <button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-run-export" data-run-id="${escapeHtml(id)}" title="이 run 1개만 export">📤</button>
+                            <button type="button" class="tw-btn tw-btn-danger tw-btn-ws-run-delete" data-run-id="${escapeHtml(id)}">🗑</button>
+                        </div>
+                    </td>
+                </tr>`;
+            }).join('');
+            body.innerHTML = `
+            <table class="tw-ws-table">
+                <thead><tr>
+                    <th>Run ID</th><th>생성</th><th>상태</th><th style="text-align:right">행</th>
+                    <th style="text-align:right">override</th><th style="text-align:right">크기</th><th>액션</th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+        }
+
+        // v0.7.9: Override 표 렌더 (run별)
+        function refreshOverridesTable() {
+            const body = $('.tw-ws-overrides-body', overlay);
+            if (!body) return;
+            const overrides = (() => { try { return loadReviewOverrides(); } catch { return {}; } })();
+            const runs = (() => { try { return loadBatchRuns(); } catch { return {}; } })();
+            const ids = Object.keys(overrides);
+            if (!ids.length) {
+                body.innerHTML = `<div class="tw-ws-empty">override가 없습니다.</div>`;
+                return;
+            }
+            const rows = ids.sort().map(id => {
+                const bucket = overrides[id] || {};
+                const n = Object.keys(bucket).length;
+                const orphan = !runs[id];
+                return `
+                <tr class="${orphan ? 'tw-ws-row-orphan' : ''}" data-run-id="${escapeHtml(id)}">
+                    <td><div style="font-family:monospace;font-size:11px">${escapeHtml(id)}</div></td>
+                    <td style="text-align:right">${n}개</td>
+                    <td>${orphan ? '<span class="tw-ws-warn-badge">고아 (run 없음)</span>' : '<span style="color:#4ade80;font-size:11px">✓ run 존재</span>'}</td>
+                    <td>
+                        <div class="tw-ws-actions">
+                            <button type="button" class="tw-btn tw-btn-danger tw-btn-ws-override-clear" data-run-id="${escapeHtml(id)}" title="이 run의 override 전부 삭제">🗑 비우기</button>
+                        </div>
+                    </td>
+                </tr>`;
+            }).join('');
+            body.innerHTML = `
+            <table class="tw-ws-table">
+                <thead><tr><th>Run ID</th><th style="text-align:right">개수</th><th>상태</th><th>액션</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+        }
+
+        // v0.7.9: IDB 자동 백업 슬롯 표 렌더
+        async function refreshSlotsTable() {
+            const body = $('.tw-ws-slots-body', overlay);
+            if (!body) return;
+            body.innerHTML = `<div class="tw-ws-empty">로딩 중…</div>`;
+            let all = [];
+            try { all = await readAllBackupSlots(); } catch (e) {
+                body.innerHTML = `<div class="tw-ws-empty">IDB 접근 실패: ${escapeHtml(String(e?.message || e))}</div>`;
+                return;
+            }
+            if (!all.length) {
+                body.innerHTML = `<div class="tw-ws-empty">자동 백업 슬롯이 비어 있습니다.</div>`;
+                return;
+            }
+            all.sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0));
+            const rows = all.map(snap => {
+                const slot = snap.slot ?? '?';
+                const savedAt = String(snap.savedAt || '').slice(0, 19).replace('T', ' ');
+                const trigger = escapeHtml(String(snap.trigger || '?'));
+                const sCount = snap.sessions ? Object.keys(snap.sessions).length : 0;
+                const oCount = snap.overrides ? Object.values(snap.overrides).reduce((s, b) => s + Object.keys(b || {}).length, 0) : 0;
+                const rCount = snap.runs ? Object.keys(snap.runs).length : 0;
+                const sizeKb = (() => {
+                    try { return (new Blob([JSON.stringify(snap)]).size / 1024).toFixed(1); } catch { return '?'; }
+                })();
+                return `
+                <tr data-slot="${slot}">
+                    <td>#${slot}</td>
+                    <td>${escapeHtml(savedAt) || '-'}</td>
+                    <td>${trigger}</td>
+                    <td style="text-align:right">${sCount} / ${rCount} / ${oCount}</td>
+                    <td style="text-align:right">${sizeKb} KB</td>
+                    <td>
+                        <div class="tw-ws-actions">
+                            <button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-slot-download" data-slot="${slot}" title="JSON 다운로드">📤</button>
+                            <button type="button" class="tw-btn tw-btn-danger tw-btn-ws-slot-restore" data-slot="${slot}" title="이 슬롯으로 LS 통째 덮어쓰기">♻ 복원</button>
+                        </div>
+                    </td>
+                </tr>`;
+            }).join('');
+            body.innerHTML = `
+            <table class="tw-ws-table">
+                <thead><tr>
+                    <th>Slot</th><th>저장 시각</th><th>Trigger</th>
+                    <th style="text-align:right">세션 / run / override</th>
+                    <th style="text-align:right">크기</th><th>액션</th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+        }
+
+        // v0.7.9: 워크스페이스 모든 패널 일괄 갱신
+        function refreshWorkspaceUi() {
+            try { refreshSessionStats(); } catch (e) { dwarn('stats refresh 실패', e); }
+            try { refreshRunsTable(); } catch (e) { dwarn('runs refresh 실패', e); }
+            try { refreshOverridesTable(); } catch (e) { dwarn('overrides refresh 실패', e); }
+            refreshSlotsTable().catch(e => dwarn('slots refresh 실패', e));
+        }
+
+        // v0.7.9: Batch Run 섹션 이벤트 위임
+        const runsSection = $('.tw-ws-runs-section', overlay);
+        if (runsSection) {
+            runsSection.addEventListener('click', async (e) => {
+                const refresh = e.target.closest('.tw-btn-ws-runs-refresh');
+                if (refresh) { refreshRunsTable(); refreshSessionStats(); return; }
+                const act = e.target.closest('.tw-btn-ws-run-activate');
+                if (act) {
+                    const rid = act.getAttribute('data-run-id');
+                    setActiveBatchRunId(rid);
+                    syncBatchRunFromLs();
+                    toast(`run ${rid} 활성화`, 'success');
+                    refreshRunsTable();
+                    return;
+                }
+                const exp = e.target.closest('.tw-btn-ws-run-export');
+                if (exp) {
+                    const rid = exp.getAttribute('data-run-id');
+                    const runs = loadBatchRuns();
+                    const overrides = loadReviewOverrides();
+                    const single = {
+                        version: 3,
+                        exported: new Date().toISOString(),
+                        schemaVersion: CURRENT_SCHEMA_VERSION,
+                        batchRuns: { [rid]: _stripRunForBackup(runs[rid] || {}) },
+                        overrides: overrides[rid] ? { [rid]: overrides[rid] } : {},
+                    };
+                    downloadJson(JSON.stringify(single, null, 2), `tms_run_${rid}_${new Date().toISOString().slice(0,10)}.json`);
+                    toast(`run ${rid} export 완료`, 'success');
+                    return;
+                }
+                const del = e.target.closest('.tw-btn-ws-run-delete');
+                if (del) {
+                    const rid = del.getAttribute('data-run-id');
+                    await onDeleteRun(rid);
+                    refreshWorkspaceUi();
+                    return;
+                }
+            });
+        }
+
+        // v0.7.9: Override 섹션 이벤트 위임
+        const overridesSection = $('.tw-ws-overrides-section', overlay);
+        if (overridesSection) {
+            overridesSection.addEventListener('click', async (e) => {
+                const prune = e.target.closest('.tw-btn-ws-overrides-prune');
+                if (prune) {
+                    const ws = getWorkspaceStats();
+                    if (ws.orphanOverrideRunCount === 0) {
+                        toast('고아 override가 없습니다.', 'info');
+                        return;
+                    }
+                    const ok = await twConfirm({
+                        title: '고아 override 정리',
+                        message: `run이 없는 override를 정리합니다.\n\nrun ${ws.orphanOverrideRunCount}개 / override ${ws.orphanOverrideEntryCount}개\n\n계속하시겠습니까?`,
+                        danger: true,
+                    });
+                    if (!ok) return;
+                    const r = pruneOrphanOverrides();
+                    toast(`정리 완료: run ${r.removedRuns}개 / override ${r.removedEntries}개`, 'success');
+                    refreshOverridesTable();
+                    refreshSessionStats();
+                    return;
+                }
+                const clr = e.target.closest('.tw-btn-ws-override-clear');
+                if (clr) {
+                    const rid = clr.getAttribute('data-run-id');
+                    const ok = await twConfirm({
+                        title: 'override 비우기',
+                        message: `run ${rid} 의 override를 모두 삭제합니다.\n\n계속하시겠습니까?`,
+                        danger: true,
+                    });
+                    if (!ok) return;
+                    const n = clearOverridesForRun(rid);
+                    toast(`override ${n}개 삭제됨`, 'success');
+                    refreshOverridesTable();
+                    refreshSessionStats();
+                    // review 패널 열려 있으면 갱신
+                    if (typeof renderReviewTable === 'function' && currentMainTab === 'review') {
+                        try { renderReviewTable(); } catch {}
+                    }
+                    return;
+                }
+            });
+        }
+
+        // v0.7.9: IDB 슬롯 섹션 이벤트 위임
+        const slotsSection = $('.tw-ws-slots-section', overlay);
+        if (slotsSection) {
+            slotsSection.addEventListener('click', async (e) => {
+                const refresh = e.target.closest('.tw-btn-ws-slots-refresh');
+                if (refresh) { refreshSlotsTable(); return; }
+                const snap = e.target.closest('.tw-btn-ws-slots-snapshot');
+                if (snap) {
+                    triggerBackupAsync('manual');
+                    toast('IDB 백업을 시작했습니다 (백그라운드).', 'info');
+                    setTimeout(() => refreshSlotsTable(), 400);
+                    return;
+                }
+                const dl = e.target.closest('.tw-btn-ws-slot-download');
+                if (dl) {
+                    const slot = Number(dl.getAttribute('data-slot'));
+                    try {
+                        const all = await readAllBackupSlots();
+                        const s = all.find(x => x && x.slot === slot);
+                        if (!s) { toast(`slot ${slot} 비어 있음`, 'warn'); return; }
+                        downloadJson(JSON.stringify(s, null, 2), `tms_idb_slot${slot}_${(s.savedAt || '').slice(0,10)}.json`);
+                        toast(`slot ${slot} 다운로드`, 'success');
+                    } catch (err) { toast(`다운로드 실패: ${err.message}`, 'error'); }
+                    return;
+                }
+                const rs = e.target.closest('.tw-btn-ws-slot-restore');
+                if (rs) {
+                    const slot = Number(rs.getAttribute('data-slot'));
+                    const ok = await twConfirm({
+                        title: 'IDB 슬롯 복원',
+                        message: `slot ${slot} 의 스냅샷으로 LS의 sessions / overrides / batchRuns 를 통째 덮어씁니다.\n\n현재 데이터는 사라집니다 (복원 직전 IDB에 자동 1회 백업 후 진행).\n\n계속하시겠습니까?`,
+                        danger: true,
+                    });
+                    if (!ok) return;
+                    try {
+                        triggerBackupAsync('pre-restore'); // 안전망
+                        await new Promise(r => setTimeout(r, 200));
+                        const r = await restoreFromBackupSlot(slot, 'overwrite');
+                        toast(`복원 완료: 세션 ${r.sessions} / run ${r.runs} / override ${r.overrides}`, 'success');
+                        refreshWorkspaceUi();
+                        // 활성 run 메모리 동기화
+                        try { syncBatchRunFromLs(); renderBatchRun(); } catch {}
+                    } catch (err) { toast(`복원 실패: ${err.message}`, 'error'); }
+                    return;
+                }
+            });
         }
 
         $('.tw-btn-session-prune', overlay).addEventListener('click', () => {
@@ -6983,7 +7444,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         });
 
         // 초기화 시 통계 로드
-        refreshSessionStats();
+        refreshWorkspaceUi();
     }
 
     // ========================================================================
