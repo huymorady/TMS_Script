@@ -2489,45 +2489,57 @@
 .tw-batch-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .tw-batch-warning {
     min-height: 20px; color: #fbbf24; background: #2a2212; border: 1px solid #5a4214;
-    border-radius: 6px; padding: 8px 10px;
+    border-radius: 6px; padding: 8px 10px; font-size: 11px; line-height: 1.45;
 }
 .tw-batch-warning:empty { display: none; }
 .tw-batch-segments {
-    flex: 1; overflow: auto; background: #181818; border: 1px solid #333;
+    flex: 0 0 auto; max-height: 220px; overflow: auto;
+    background: #181818; border: 1px solid #333;
     border-radius: 6px; padding: 10px; font-size: 12px; line-height: 1.5;
 }
-/* v0.6.9 (G1-a): 활성 run 헤더 카드 */
+/* v0.6.9 (G1-a): 활성 run 헤더 카드 — 290px 사이드바에 맞게 줄당 1~2 항목으로 wrap */
 .tw-batch-run-header {
-    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
-    padding: 8px 10px; border: 1px solid var(--tw-border); border-radius: 8px;
+    display: flex; gap: 6px 10px; align-items: center; flex-wrap: wrap;
+    padding: 6px 8px; border: 1px solid var(--tw-border); border-radius: 8px;
     background: linear-gradient(135deg, rgba(74,222,128,0.06) 0%, var(--tw-bg-2) 70%);
-    font-size: 12px;
+    font-size: 11px; line-height: 1.35;
 }
 .tw-batch-run-header .tw-batch-run-id {
     font-family: monospace; color: var(--tw-accent); font-weight: 600;
     background: rgba(74,222,128,0.1); padding: 2px 8px; border-radius: 4px;
+    white-space: nowrap;
 }
 .tw-batch-run-header .tw-batch-run-meta { color: var(--tw-muted); }
 .tw-batch-run-header .tw-batch-run-meta b { color: var(--tw-fg); font-weight: 500; }
-.tw-batch-run-header .tw-batch-run-stamp { margin-left: auto; color: var(--tw-muted); font-size: 11px; }
-/* v0.6.9 (G1-b): Phase stepper */
+.tw-batch-run-header .tw-batch-run-stamp {
+    margin-left: auto; color: var(--tw-muted); font-size: 10px; white-space: nowrap;
+}
+/* v0.6.9 (G1-b): Phase stepper — 좁은 사이드바(290px)에서도 깨지지 않게 세로 스택 */
 .tw-batch-stepper {
     display: flex; align-items: stretch; gap: 0; flex-wrap: nowrap;
-    padding: 0; background: transparent; min-height: 36px;
+    padding: 0; background: transparent;
 }
 .tw-batch-stepper:empty { display: none; }
 .tw-batch-step {
-    flex: 1; display: flex; align-items: center; gap: 6px;
-    padding: 6px 10px; border: 1px solid var(--tw-border);
-    background: var(--tw-bg-1); font-size: 11px; color: var(--tw-muted);
-    position: relative; min-width: 0;
+    flex: 1 1 0; min-width: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 2px; padding: 6px 4px;
+    border: 1px solid var(--tw-border);
+    background: var(--tw-bg-1); color: var(--tw-muted);
+    text-align: center; line-height: 1.2;
 }
 .tw-batch-step:not(:last-child) { border-right: none; }
 .tw-batch-step:first-child { border-top-left-radius: 6px; border-bottom-left-radius: 6px; }
 .tw-batch-step:last-child { border-top-right-radius: 6px; border-bottom-right-radius: 6px; }
 .tw-batch-step .tw-batch-step-icon { font-size: 14px; line-height: 1; flex-shrink: 0; }
-.tw-batch-step .tw-batch-step-name { font-weight: 500; color: var(--tw-fg); }
-.tw-batch-step .tw-batch-step-detail { font-size: 10px; color: var(--tw-muted); margin-left: auto; white-space: nowrap; }
+.tw-batch-step .tw-batch-step-name {
+    font-weight: 500; color: var(--tw-fg); font-size: 11px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+}
+.tw-batch-step .tw-batch-step-detail {
+    font-size: 10px; color: var(--tw-muted); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+}
 .tw-batch-step.tw-step-done { background: rgba(39, 174, 96, 0.10); border-color: rgba(39, 174, 96, 0.4); }
 .tw-batch-step.tw-step-done .tw-batch-step-name { color: var(--tw-success); }
 .tw-batch-step.tw-step-warn { background: rgba(250, 204, 21, 0.08); border-color: rgba(250, 204, 21, 0.4); }
@@ -2536,22 +2548,23 @@
 .tw-batch-step.tw-step-fail .tw-batch-step-name { color: var(--tw-danger); }
 .tw-batch-step.tw-step-busy { background: rgba(52, 152, 219, 0.10); border-color: rgba(52, 152, 219, 0.4); }
 .tw-batch-step.tw-step-busy .tw-batch-step-name { color: var(--tw-info); }
-/* v0.6.9 (G1-d): 수집/검증 결과 카드 그리드 */
+/* v0.6.9 (G1-d): 수집/검증 결과 카드 그리드 — 290px 사이드바에서 2열 정도 들어가게 */
 .tw-batch-summary-cards {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    gap: 8px;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 6px;
 }
 .tw-batch-summary-cards:empty { display: none; }
 .tw-summary-card {
-    padding: 8px 10px; border: 1px solid var(--tw-border); border-radius: 6px;
-    background: var(--tw-bg-2); display: flex; flex-direction: column; gap: 2px;
-    min-height: 60px; transition: transform 0.08s ease, border-color 0.12s ease;
+    padding: 6px 8px; border: 1px solid var(--tw-border); border-radius: 6px;
+    background: var(--tw-bg-2); display: flex; flex-direction: column; gap: 1px;
+    min-height: 52px; transition: transform 0.08s ease, border-color 0.12s ease;
+    min-width: 0;
 }
 .tw-summary-card.tw-summary-clickable { cursor: pointer; }
 .tw-summary-card.tw-summary-clickable:hover { border-color: var(--tw-accent); transform: translateY(-1px); }
-.tw-summary-card .tw-summary-label { font-size: 11px; color: var(--tw-muted); text-transform: uppercase; letter-spacing: 0.4px; }
-.tw-summary-card .tw-summary-value { font-size: 16px; font-weight: 600; color: var(--tw-fg); line-height: 1.2; }
-.tw-summary-card .tw-summary-sub { font-size: 11px; color: var(--tw-muted); margin-top: 2px; }
+.tw-summary-card .tw-summary-label { font-size: 10px; color: var(--tw-muted); text-transform: uppercase; letter-spacing: 0.3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tw-summary-card .tw-summary-value { font-size: 15px; font-weight: 600; color: var(--tw-fg); line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tw-summary-card .tw-summary-sub { font-size: 10px; color: var(--tw-muted); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tw-summary-card.tw-summary-ok .tw-summary-value { color: var(--tw-success); }
 .tw-summary-card.tw-summary-warn .tw-summary-value { color: var(--tw-warn); }
 .tw-summary-card.tw-summary-fail .tw-summary-value { color: var(--tw-danger); }
@@ -3361,13 +3374,16 @@
     // v0.6.9 (G1-a): 활성 run 헤더 카드
     function renderBatchRunHeader(run) {
         const el = $('.tw-batch-run-header', modalEl);
+        const subtitleEl = $('.tw-batch-meta', modalEl);
         if (!el) return;
         if (!run) {
             el.classList.add('tw-hidden');
             el.innerHTML = '';
+            if (subtitleEl) subtitleEl.classList.remove('tw-hidden');
             return;
         }
         el.classList.remove('tw-hidden');
+        if (subtitleEl) subtitleEl.classList.add('tw-hidden'); // run 있으면 안내 문구 숨김
         const runIdShort = String(run.runId || '').slice(-12) || '?';
         const stamp = run.updatedAt ? String(run.updatedAt).slice(0, 19).replace('T', ' ') : '';
         const overrides = (function () {
@@ -3435,8 +3451,11 @@
     }
     function phaseStateDetail(phase) {
         const c = phase?.validation?.coverage;
-        if (c && (c.actualCount != null) && (c.expectedCount != null)) return `${c.actualCount}/${c.expectedCount}`;
-        return '';
+        if (!c) return '';
+        const a = c.actualCount, e = c.expectedCount;
+        if ((a == null) && (e == null)) return '';
+        if (!a && !e) return ''; // 0/0은 숨김
+        return `${a || 0}/${e || 0}`;
     }
 
     // v0.6.9 (G1-d): 수집/검증 결과 카드 — 클릭 시 review 탭 필터 자동 적용
