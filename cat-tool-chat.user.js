@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.6
+// @version      0.6.7
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -141,14 +141,16 @@
             window.catToast[type](msg);
             return;
         }
-        // 폴백: 간단한 자체 토스트
+        // 폴백: 간단한 자체 토스트 (v0.6.7 D2: 색상은 모달의 design token과 동일)
+        const PALETTE = { error: '#e74c3c', success: '#27ae60', warn: '#fbbf24', info: '#3498db' };
+        const bg = PALETTE[type] || PALETTE.info;
         const el = document.createElement('div');
         el.textContent = msg;
         el.style.cssText = `
             position:fixed; top:20px; right:20px; z-index:999999;
             padding:10px 16px; border-radius:6px; color:#fff;
             font-size:13px; font-family:system-ui;
-            background:${type === 'error' ? '#e74c3c' : type === 'success' ? '#27ae60' : '#3498db'};
+            background:${bg};
             box-shadow:0 4px 12px rgba(0,0,0,0.2);
         `;
         document.body.appendChild(el);
@@ -1355,6 +1357,148 @@
         };
     }
 
+    // v0.6.7 (C2): 같은 project/file/language 컨텍스트의 직전 run 후보 목록.
+    // - currentRun을 제외하고 updatedAt 내림차순 정렬.
+    // - phase3 결과가 있는 run만 비교 의미가 있으므로 그것만 노출.
+    function findPriorRunsForCurrent(runs, currentRun) {
+        if (!currentRun) return [];
+        const list = Object.values(runs || {})
+            .filter(r => r && r.runId && r.runId !== currentRun.runId)
+            .filter(r =>
+                String(r.projectId) === String(currentRun.projectId) &&
+                String(r.fileId) === String(currentRun.fileId) &&
+                String(r.languageId) === String(currentRun.languageId))
+            .filter(r => Array.isArray(r.phase3?.parsed?.translations) && r.phase3.parsed.translations.length > 0)
+            .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+        return list;
+    }
+
+    // v0.6.7 (C2): 두 run 사이의 phase3/phase45 final 텍스트 diff 행 빌드.
+    // override는 의도적으로 무시 — "LLM 결과 자체"의 drift만 보기 위함.
+    function buildRunCompareRows(currentRun, priorRun) {
+        if (!currentRun || !priorRun) return [];
+        const overlay = (run, id) => {
+            const phase3 = (run.phase3?.parsed?.translations || []).find(t => normalizeId(t.id) === id);
+            const rev = (run.phase45?.parsed?.revisions || []).find(r => normalizeId(r.id) === id);
+            const phase45Ok = !!run.phase45?.validation?.ok;
+            let finalText = phase3?.t || '';
+            if (phase45Ok && rev) {
+                if (rev.t !== null && rev.t !== undefined) finalText = String(rev.t);
+            }
+            return { phase3Text: phase3?.t || '', finalText, src: phase3?.src || '', gid: phase3?.gid || '' };
+        };
+        const ids = new Set();
+        (currentRun.phase3?.parsed?.translations || []).forEach(t => ids.add(normalizeId(t.id)));
+        (priorRun.phase3?.parsed?.translations || []).forEach(t => ids.add(normalizeId(t.id)));
+        const rows = [];
+        for (const id of ids) {
+            const cur = overlay(currentRun, id);
+            const prev = overlay(priorRun, id);
+            const sameFinal = cur.finalText === prev.finalText;
+            const samePhase3 = cur.phase3Text === prev.phase3Text;
+            rows.push({
+                id,
+                gid: cur.gid || prev.gid,
+                src: cur.src || prev.src,
+                priorPhase3: prev.phase3Text,
+                priorFinal: prev.finalText,
+                currentPhase3: cur.phase3Text,
+                currentFinal: cur.finalText,
+                sameFinal,
+                samePhase3,
+                onlyInCurrent: !prev.phase3Text && !!cur.phase3Text,
+                onlyInPrior: !cur.phase3Text && !!prev.phase3Text,
+            });
+        }
+        return rows.sort((a, b) => Number(a.id) - Number(b.id));
+    }
+
+    // v0.6.7 (C3): run 한 개를 CSV로 직렬화. RFC 4180 호환 (CRLF 줄바꿈, 큰따옴표 이스케이프).
+    function buildCsvFromRun(run) {
+        if (!run) return '';
+        const segById = new Map((run.segments || []).map(s => [normalizeId(s.id), s]));
+        const phase3ById = new Map((run.phase3?.parsed?.translations || []).map(t => [normalizeId(t.id), t]));
+        const revById = new Map((run.phase45?.parsed?.revisions || []).map(r => [normalizeId(r.id), r]));
+        const phase45Ok = !!run.phase45?.validation?.ok;
+        const overrides = lsGet(LS_KEYS.REVIEW_OVERRIDES, {})?.[run.runId] || {};
+        const ids = new Set();
+        for (const id of phase3ById.keys()) ids.add(id);
+        for (const id of segById.keys()) ids.add(id);
+        const idList = Array.from(ids).sort((a, b) => Number(a) - Number(b));
+
+        const headers = ['id', 'gid', 'origin', 'phase3', 'phase45_revision', 'phase45_reasons', 'override', 'final', 'has_override'];
+        const esc = (v) => {
+            const s = v == null ? '' : String(v);
+            if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+            return s;
+        };
+        const lines = [headers.join(',')];
+        for (const id of idList) {
+            const seg = segById.get(id);
+            const phase3 = phase3ById.get(id);
+            const rev = revById.get(id);
+            const overrideEntry = overrides[id];
+            const overrideText = overrideEntry == null ? ''
+                : (typeof overrideEntry === 'string' ? overrideEntry : (overrideEntry.text || ''));
+            let finalText = phase3?.t || '';
+            if (phase45Ok && rev && rev.t !== null && rev.t !== undefined) finalText = String(rev.t);
+            if (overrideText) finalText = overrideText;
+            lines.push([
+                id,
+                phase3?.gid || '',
+                seg?.origin_string || '',
+                phase3?.t || '',
+                rev ? (rev.t === null ? '<keep>' : (rev.t || '')) : '',
+                rev && Array.isArray(rev.r) ? rev.r.join('|') : '',
+                overrideText,
+                finalText,
+                overrideText ? '1' : '0',
+            ].map(esc).join(','));
+        }
+        return lines.join('\r\n') + '\r\n';
+    }
+
+    // v0.6.7 (C3): run 직렬화 JSON — raw 필드는 용량을 키워 별도 토글로 포함.
+    function buildJsonExportFromRun(run, options = {}) {
+        if (!run) return '';
+        const includeRaw = !!options.includeRaw;
+        const cloned = JSON.parse(JSON.stringify(run));
+        if (!includeRaw) {
+            if (cloned.phase12) delete cloned.phase12.raw;
+            if (cloned.phase3) delete cloned.phase3.raw;
+            if (cloned.phase45) delete cloned.phase45.raw;
+        }
+        cloned.exportedAt = new Date().toISOString();
+        cloned.exportedFromVersion = '0.6.7';
+        return JSON.stringify(cloned, null, 2);
+    }
+
+    // v0.6.7 (D1): 로그 행을 한 단위 객체로 정규화. type/level은 lower-case.
+    function buildFilteredLogLines(logs, level, query) {
+        const list = Array.isArray(logs) ? logs : [];
+        const lvl = (level || 'all').toLowerCase();
+        const q = (query || '').trim().toLowerCase();
+        return list
+            .filter(log => {
+                if (lvl !== 'all' && String(log.type || 'info').toLowerCase() !== lvl) return false;
+                if (q && !String(log.message || '').toLowerCase().includes(q)) return false;
+                return true;
+            })
+            .map(log => `[${log.at}] ${String(log.type || 'info').toUpperCase()} ${log.message || ''}`);
+    }
+
+    // v0.6.7 (C3/D1): 클라이언트 다운로드 헬퍼.
+    function downloadTextFile(filename, mime, content) {
+        const blob = new Blob([content], { type: mime + ';charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { try { document.body.removeChild(a); URL.revokeObjectURL(url); } catch {} }, 100);
+    }
+
     // ========================================================================
     // v0.6.0 L1: batch 결과를 chat 세션 system 메시지로 시드
     // ========================================================================
@@ -2009,7 +2153,11 @@
     let currentMainTab = 'chat';
     let batchRun = null;
     // v0.6.5 (A3): 리뷰 탭 필터/정렬 상태 (메모리 only — 세션 한정)
-    const reviewView = { filter: 'all', sort: 'id' };
+    // v0.6.7 (C2): 비교 모드 상태 추가 — compareMode/compareRunId 가 set 되면
+    // 검토 표 대신 직전 run 비교 표가 렌더된다.
+    const reviewView = { filter: 'all', sort: 'id', compareMode: false, compareRunId: null };
+    // v0.6.7 (D1): 로그 탭 필터/검색 상태
+    const logView = { level: 'all', query: '' };
 
     function createModal() {
         if (modalEl) return modalEl;
@@ -2136,13 +2284,31 @@
         </span>
         <span class="tw-review-apply-status tw-muted">입력은 textarea 값 주입까지만 수행합니다.</span>
         <button class="tw-btn tw-btn-ghost tw-btn-review-gc" title="현재 활성 batch run 외에 남아있는 직접 수정 데이터 정리">override 정리</button>
+        <span class="tw-review-toolbar-divider"></span>
+        <label class="tw-review-filter-label" title="같은 project/file/language의 직전 run과 비교 (LLM 결과 drift 확인)">비교
+            <select class="tw-review-compare-select"><option value="">— 직전 run 선택 —</option></select>
+        </label>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-compare-exit tw-hidden" title="비교 모드 종료">↩ 검토로 돌아가기</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-export-json" title="현재 run 결과를 JSON으로 내려받기 (raw 제외)">📥 JSON</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-export-csv" title="현재 run 결과를 CSV로 내려받기 (id/원문/phase3/45/override/final)">📥 CSV</button>
     </div>
     <div class="tw-review-table"></div>
 </div>
 <div class="tw-log-panel tw-tab-content" data-tab-content="logs">
     <div class="tw-log-header">
         <div class="tw-panel-title">JSON/로그</div>
-        <button class="tw-btn tw-btn-ghost tw-btn-log-copy">📋 전체 복사</button>
+        <span class="tw-log-controls">
+            <select class="tw-log-level" title="레벨 필터">
+                <option value="all">전체</option>
+                <option value="info">INFO</option>
+                <option value="success">SUCCESS</option>
+                <option value="warn">WARN</option>
+                <option value="error">ERROR</option>
+            </select>
+            <input class="tw-log-search" type="search" placeholder="로그 본문 검색…" />
+            <button class="tw-btn tw-btn-ghost tw-btn-log-download" title="필터링된 로그를 .txt 파일로 다운로드">⬇ 다운로드</button>
+            <button class="tw-btn tw-btn-ghost tw-btn-log-copy">📋 전체 복사</button>
+        </span>
     </div>
     <pre class="tw-log-output">아직 로그가 없습니다.</pre>
 </div>
@@ -2164,6 +2330,25 @@
         const style = document.createElement('style');
         style.id = 'tms-workflow-styles';
         style.textContent = `
+/* v0.6.7 (D2): 디자인 토큰 — 색·간격을 한 곳에서 관리. 신규 컴포넌트는 var(--tw-*) 사용을 권장 */
+#tms-workflow-modal {
+    --tw-accent: #4ade80;
+    --tw-accent-soft: rgba(74, 222, 128, 0.18);
+    --tw-edit: #fbbf24;        /* 사용자 직접 수정 (✏️) */
+    --tw-edit-soft: rgba(251, 191, 36, 0.16);
+    --tw-warn: #facc15;        /* 길이 등 경고 */
+    --tw-warn-order: #93c5fd;  /* placeholder 순서 */
+    --tw-warn-tb: #f9a8d4;     /* TB 용어 */
+    --tw-danger: #e74c3c;
+    --tw-info: #3498db;
+    --tw-success: #27ae60;
+    --tw-bg-1: #1e1e1e;
+    --tw-bg-2: #252525;
+    --tw-bg-3: #2a2a2a;
+    --tw-fg: #e0e0e0;
+    --tw-muted: #888;
+    --tw-border: #3a3a3a;
+}
 #tms-workflow-modal {
     position: fixed;
     top: 50%;
@@ -2364,7 +2549,17 @@
 /* v0.6.4: revision 텍스트와 함께 표시될 때만 윗 여백 */
 .tw-review-text + .tw-review-flag-chip { margin-top: 4px; }
 .tw-review-flag-chip.tw-review-flag-keep { background: #1f2a1f; color: #86efac; border-color: #2f4a32; }
-.tw-review-flag-chip.tw-review-flag-edit { background: #2a1f33; color: #d8b4fe; border-color: #4a2f5a; }
+/* v0.6.7 (D2): "직접 수정" 의미는 amber(--tw-edit)로 통일 (✏️ chip / button / badge 공통 톤) */
+.tw-review-flag-chip.tw-review-flag-edit { background: var(--tw-edit-soft); color: var(--tw-edit); border-color: rgba(251, 191, 36, 0.4); }
+/* v0.6.7 (D2): 적용 자동화 배지 (renderReviewTable의 ${appliedBadge} 대상). 기존엔 룰 없음 — 토큰 톤으로 정의 */
+.tw-review-applied-badge {
+    margin-left: 6px; font-size: 11px; opacity: 0.85; cursor: help;
+    color: var(--tw-info);
+}
+/* v0.6.7 (D2): override 되어 있을 때 ✏️ 액션 버튼 강조 (주변 chip과 같은 amber) */
+.tw-review-row[data-has-override="1"] .tw-btn-edit-final {
+    color: var(--tw-edit); border-color: rgba(251, 191, 36, 0.4);
+}
 .tw-review-final-wrap { display: flex; flex-direction: column; gap: 4px; }
 .tw-review-final-edit { display: flex; flex-direction: column; gap: 6px; }
 .tw-review-final-edit textarea {
@@ -2387,6 +2582,50 @@
     display: flex; align-items: center; justify-content: space-between;
     gap: 8px; flex-shrink: 0;
 }
+/* v0.6.7 (D1): 로그 필터/검색/다운로드 컨트롤 */
+.tw-log-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tw-log-controls .tw-log-level,
+.tw-log-controls .tw-log-search {
+    background: var(--tw-bg-2); color: var(--tw-fg);
+    border: 1px solid var(--tw-border); border-radius: 4px;
+    padding: 3px 6px; font-size: 12px;
+}
+.tw-log-controls .tw-log-search { width: 160px; }
+.tw-log-controls .tw-log-search:focus,
+.tw-log-controls .tw-log-level:focus { outline: none; border-color: var(--tw-accent); }
+/* v0.6.7 (C2/C3): 검토 툴바 구분선 */
+.tw-review-toolbar-divider {
+    display: inline-block; width: 1px; height: 18px; background: var(--tw-border);
+    margin: 0 4px; align-self: center;
+}
+.tw-review-compare-select {
+    background: var(--tw-bg-2); color: var(--tw-fg);
+    border: 1px solid var(--tw-border); border-radius: 4px;
+    padding: 3px 6px; font-size: 12px; max-width: 220px;
+}
+/* v0.6.7 (C2): 비교 모드 표 */
+.tw-compare-banner {
+    margin: 4px 0 8px; padding: 6px 10px; border-radius: 6px;
+    background: var(--tw-accent-soft); color: var(--tw-accent);
+    border: 1px solid rgba(74, 222, 128, 0.35); font-size: 12px;
+}
+.tw-compare-table { display: flex; flex-direction: column; gap: 6px; padding: 4px 0; overflow: auto; }
+.tw-compare-row {
+    display: grid; grid-template-columns: 70px 1.4fr 1.6fr 1.6fr 90px;
+    gap: 8px; padding: 8px 10px; border: 1px solid var(--tw-border);
+    border-radius: 6px; background: var(--tw-bg-2); font-size: 12px;
+}
+.tw-compare-row.tw-compare-head { background: var(--tw-bg-3); color: var(--tw-accent); font-weight: 600; }
+.tw-compare-row.tw-compare-changed { border-color: var(--tw-edit); }
+.tw-compare-row.tw-compare-only { border-color: var(--tw-info); }
+.tw-compare-cell { word-break: break-word; }
+.tw-compare-status {
+    display: inline-block; padding: 2px 7px; border-radius: 10px;
+    font-size: 10px; line-height: 1.4; white-space: nowrap;
+}
+.tw-compare-status-same { background: #1f2a1f; color: #86efac; border: 1px solid #2f4a32; }
+.tw-compare-status-changed { background: var(--tw-edit-soft); color: var(--tw-edit); border: 1px solid rgba(251, 191, 36, 0.4); }
+.tw-compare-status-only { background: rgba(52, 152, 219, 0.18); color: #93c5fd; border: 1px solid rgba(52, 152, 219, 0.4); }
 @container (max-width: 760px) {
     .tw-context-panel { width: 220px; }
     .tw-batch-panel { flex-direction: column; }
@@ -2651,6 +2890,17 @@
         $('.tw-review-sort', el).addEventListener('change', (e) => { reviewView.sort = e.target.value || 'id'; renderReviewTable(); });
         // v0.6.6 (B1): 고아 override 정리
         $('.tw-btn-review-gc', el).addEventListener('click', onReviewOverrideGc);
+
+        // v0.6.7 (C2): 비교 모드 select / 종료 버튼
+        $('.tw-review-compare-select', el).addEventListener('change', onCompareSelectChange);
+        $('.tw-btn-review-compare-exit', el).addEventListener('click', onExitCompareMode);
+        // v0.6.7 (C3): export JSON/CSV
+        $('.tw-btn-review-export-json', el).addEventListener('click', onExportRunJson);
+        $('.tw-btn-review-export-csv', el).addEventListener('click', onExportRunCsv);
+        // v0.6.7 (D1): 로그 필터/검색/다운로드
+        $('.tw-log-level', el).addEventListener('change', onLogLevelChange);
+        $('.tw-log-search', el).addEventListener('input', onLogSearchInput);
+        $('.tw-btn-log-download', el).addEventListener('click', onDownloadLog);
 
         $('.tw-review-table', el).addEventListener('click', async (e) => {
             const copyBtn = e.target.closest('.tw-btn-copy-final');
@@ -3003,7 +3253,8 @@
             return;
         }
 
-        const logLines = (run.logs || []).map(log => `[${log.at}] ${log.type.toUpperCase()} ${log.message}`);
+        // v0.6.7 (D1): 레벨 필터/검색 적용
+        const logLines = buildFilteredLogLines(run.logs, logView.level, logView.query);
         const jsonBlocks = [];
         if (run.lastError) jsonBlocks.push(`\n\n=== Last error ===\n${run.lastError}`);
         if (run.validations && Object.keys(run.validations).length) {
@@ -3012,7 +3263,12 @@
         if (run.phase12?.raw) jsonBlocks.push(`\n\n=== Phase 1+2 raw ===\n${run.phase12.raw}`);
         if (run.phase3?.raw) jsonBlocks.push(`\n\n=== Phase 3 raw ===\n${run.phase3.raw}`);
         if (run.phase45?.raw) jsonBlocks.push(`\n\n=== Phase 4+5 raw ===\n${run.phase45.raw}`);
-        output.textContent = (logLines.join('\n') || '아직 로그가 없습니다.') + jsonBlocks.join('');
+        const totalLogs = (run.logs || []).length;
+        const filterTag = (logView.level !== 'all' || logView.query)
+            ? `[필터: 레벨=${logView.level}${logView.query ? `, q="${logView.query}"` : ''} → ${logLines.length}/${totalLogs}건]\n\n`
+            : '';
+        const body = logLines.length ? logLines.join('\n') : (totalLogs ? '(필터 결과 없음)' : '아직 로그가 없습니다.');
+        output.textContent = filterTag + body + jsonBlocks.join('');
     }
 
     async function onCopyLogOutput() {
@@ -3032,6 +3288,123 @@
         }
     }
 
+    // v0.6.7 (D1): 로그 레벨/검색/다운로드 핸들러
+    function onLogLevelChange(e) { logView.level = (e.target.value || 'all').toLowerCase(); renderLogOutput(); }
+    function onLogSearchInput(e) { logView.query = String(e.target.value || ''); renderLogOutput(); }
+    function onDownloadLog() {
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run) { toast('활성 batch run이 없어 다운로드할 로그가 없습니다.', 'info'); return; }
+        const lines = buildFilteredLogLines(run.logs, logView.level, logView.query);
+        if (!lines.length) { toast('필터 결과가 비어 있어 다운로드할 내용이 없습니다.', 'info'); return; }
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const tag = logView.level === 'all' ? 'all' : logView.level;
+        downloadTextFile(`tms-${run.runId || 'run'}-log-${tag}-${stamp}.txt`, 'text/plain', lines.join('\n') + '\n');
+        toast(`로그 ${lines.length}건 다운로드 시작`, 'success');
+    }
+
+    // v0.6.7 (C2): 비교 select 옵션 채우기 — 직전 run 후보를 updatedAt 내림차순으로
+    function refreshCompareSelect(currentRun) {
+        if (!modalEl) return;
+        const sel = $('.tw-review-compare-select', modalEl);
+        const exitBtn = $('.tw-btn-review-compare-exit', modalEl);
+        if (!sel) return;
+        const runs = lsGet(LS_KEYS.BATCH_RUNS, {}) || {};
+        const priors = findPriorRunsForCurrent(runs, currentRun);
+        const selected = reviewView.compareRunId || '';
+        sel.innerHTML = '<option value="">— 직전 run 선택 —</option>' +
+            priors.map(r => {
+                const stamp = (r.updatedAt || '').slice(0, 19).replace('T', ' ');
+                const label = `${stamp} · ${r.runId}`;
+                const sel = String(r.runId) === String(selected) ? ' selected' : '';
+                return `<option value="${escapeHtml(r.runId)}"${sel}>${escapeHtml(label)}</option>`;
+            }).join('');
+        sel.disabled = !currentRun || priors.length === 0;
+        if (exitBtn) exitBtn.classList.toggle('tw-hidden', !reviewView.compareMode);
+    }
+
+    function onCompareSelectChange(e) {
+        const runId = String(e.target.value || '');
+        if (!runId) {
+            reviewView.compareMode = false;
+            reviewView.compareRunId = null;
+            renderReviewTable();
+            return;
+        }
+        reviewView.compareMode = true;
+        reviewView.compareRunId = runId;
+        renderReviewTable();
+    }
+
+    function onExitCompareMode() {
+        reviewView.compareMode = false;
+        reviewView.compareRunId = null;
+        renderReviewTable();
+    }
+
+    // v0.6.7 (C2): 비교 표 렌더 — current vs prior run, 같은 project/file/language
+    function renderCompareTable(currentRun, summaryEl, tableEl) {
+        const runs = lsGet(LS_KEYS.BATCH_RUNS, {}) || {};
+        const prior = runs[reviewView.compareRunId];
+        if (!prior) {
+            summaryEl.textContent = '비교 대상 run을 찾을 수 없습니다 (삭제되었을 수 있음).';
+            tableEl.innerHTML = '';
+            return;
+        }
+        const rows = buildRunCompareRows(currentRun, prior);
+        const changed = rows.filter(r => !r.sameFinal && !r.onlyInCurrent && !r.onlyInPrior).length;
+        const onlyCurrent = rows.filter(r => r.onlyInCurrent).length;
+        const onlyPrior = rows.filter(r => r.onlyInPrior).length;
+        summaryEl.textContent = `비교: 현재 run ${currentRun.runId} ↔ 직전 run ${prior.runId} · 총 ${rows.length}개 · 최종 변경 ${changed}개 · 현재만 ${onlyCurrent}개 · 직전만 ${onlyPrior}개`;
+        const head = `<div class="tw-compare-row tw-compare-head">
+            <div class="tw-compare-cell">ID</div>
+            <div class="tw-compare-cell">원문</div>
+            <div class="tw-compare-cell">직전 final</div>
+            <div class="tw-compare-cell">현재 final</div>
+            <div class="tw-compare-cell">상태</div>
+        </div>`;
+        const body = rows.map(r => {
+            let cls = 'tw-compare-row';
+            let status, statusCls;
+            if (r.onlyInCurrent) { cls += ' tw-compare-only'; status = '현재만'; statusCls = 'tw-compare-status-only'; }
+            else if (r.onlyInPrior) { cls += ' tw-compare-only'; status = '직전만'; statusCls = 'tw-compare-status-only'; }
+            else if (r.sameFinal) { status = '동일'; statusCls = 'tw-compare-status-same'; }
+            else { cls += ' tw-compare-changed'; status = '변경'; statusCls = 'tw-compare-status-changed'; }
+            const diffHtml = (!r.sameFinal && r.priorFinal && r.currentFinal)
+                ? renderDiffHtml(diffWords(r.priorFinal, r.currentFinal))
+                : escapeHtml(r.currentFinal || '');
+            return `<div class="${cls}">
+                <div class="tw-compare-cell">#${escapeHtml(r.id)}<div class="tw-muted" style="font-size:10px;margin-top:2px">${escapeHtml(r.gid || '')}</div></div>
+                <div class="tw-compare-cell">${escapeHtml(r.src || '')}</div>
+                <div class="tw-compare-cell">${escapeHtml(r.priorFinal || '')}</div>
+                <div class="tw-compare-cell">${diffHtml}</div>
+                <div class="tw-compare-cell"><span class="tw-compare-status ${statusCls}">${status}</span></div>
+            </div>`;
+        }).join('');
+        tableEl.innerHTML = `<div class="tw-compare-banner">⚖ 비교 모드 — 직전 run의 LLM 결과와 비교 (override는 미반영). 종료하려면 우측 상단 ↩ 버튼.</div>
+            <div class="tw-compare-table">${head}${body}</div>`;
+    }
+
+    // v0.6.7 (C3): 현재 run을 JSON / CSV로 다운로드
+    function onExportRunJson() {
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run) { toast('활성 batch run이 없어 내보낼 데이터가 없습니다.', 'info'); return; }
+        const json = buildJsonExportFromRun(run, { includeRaw: false });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        downloadTextFile(`tms-${run.runId || 'run'}-${stamp}.json`, 'application/json', json);
+        toast(`JSON 내보내기 완료 (${(json.length / 1024).toFixed(1)} KB)`, 'success');
+        appendBatchLog('현재 run을 JSON으로 내보냄', 'info');
+    }
+    function onExportRunCsv() {
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run) { toast('활성 batch run이 없어 내보낼 데이터가 없습니다.', 'info'); return; }
+        const csv = buildCsvFromRun(run);
+        const lineCount = csv.split('\r\n').length - 2; // header + trailing blank
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        // CSV는 Excel/Numbers 호환을 위해 BOM 부착
+        downloadTextFile(`tms-${run.runId || 'run'}-${stamp}.csv`, 'text/csv', '\uFEFF' + csv);
+        toast(`CSV 내보내기 완료 (${lineCount}행)`, 'success');
+        appendBatchLog(`현재 run을 CSV로 내보냄 (${lineCount}행)`, 'info');
+    }
     function getBatchFinalText(id) {
         const run = batchRun || restoreActiveBatchRun();
         if (!run?.phase3?.parsed || !run.phase3.validation?.ok) return '';
@@ -3338,6 +3711,9 @@
         if (!summaryEl || !tableEl) return;
         const run = batchRun || restoreActiveBatchRun();
 
+        // v0.6.7 (C2): 비교 select 옵션 갱신 (run 변경/재렌더 시 동기화)
+        refreshCompareSelect(run);
+
         if (!run?.phase3?.parsed) {
             summaryEl.textContent = '아직 Phase 3 결과가 없습니다.';
             tableEl.innerHTML = '';
@@ -3346,6 +3722,12 @@
         if (!run.phase3.validation?.ok) {
             summaryEl.textContent = 'Phase 3 검증이 실패해 결과 검토를 표시하지 않습니다. JSON/로그 탭에서 세부 오류를 확인하세요.';
             tableEl.innerHTML = '';
+            return;
+        }
+
+        // v0.6.7 (C2): 비교 모드 — 검토 표 자리에 비교 표를 렌더하고 종료
+        if (reviewView.compareMode && reviewView.compareRunId) {
+            renderCompareTable(run, summaryEl, tableEl);
             return;
         }
 
@@ -3534,7 +3916,7 @@
             }
             const warnChipsHtml = warnChips.length ? `<div class="tw-review-warn-row">${warnChips.join('')}</div>` : '';
             return `
-<div class="tw-review-row" data-row-id="${escapeHtml(id)}">
+<div class="tw-review-row" data-row-id="${escapeHtml(id)}" data-has-override="${hasOverride ? '1' : '0'}">
     <div class="tw-review-cell tw-review-check" data-label="선택"><input class="tw-review-select" type="checkbox" data-id="${escapeHtml(id)}"></div>
     <div class="tw-review-cell" data-label="ID">#${escapeHtml(id)}${chatBadge}${appliedBadge}</div>
     <div class="tw-review-cell" data-label="그룹">${escapeHtml(item.gid || '')}</div>
@@ -4574,11 +4956,15 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             getReviewOverride, setReviewOverride, clearReviewOverride,
             loadReviewOverrides, saveReviewOverrides, countReviewOverridesForRun,
             gcOrphanReviewOverrides,
+            // v0.6.7 (C2/C3/D1): export/compare/log 헬퍼
+            findPriorRunsForCurrent, buildRunCompareRows,
+            buildCsvFromRun, buildJsonExportFromRun,
+            buildFilteredLogLines,
             // misc
             escapeHtml, LS_KEYS,
         };
     }
 
-    console.log('%c[TMS Workflow v0.6.6] 로드됨. Alt+Z로 모달 오픈 (override GC + 추가 검증 룰 + chat 시드 강화)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.6.7] 로드됨. Alt+Z로 모달 오픈 (run 비교 + JSON/CSV export + 로그 필터 + 디자인 토큰)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
