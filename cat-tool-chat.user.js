@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.5.8
+// @version      0.5.9
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -1421,14 +1421,29 @@
 
     async function fetchBatchNotes(expectedIds) {
         if (!expectedIds.length) return {};
-        const query = expectedIds.map(id => `strings=${encodeURIComponent(id)}`).join('&');
-        const noteData = await apiJson(`/api/translate/string_notes/?${query}`);
+        // 레퍼런스 주의: string_notes 는 반복 파라미터 형식만 지원하며, URL 길이가 ~8KB를 넘으면 서버가 502/무응답이 될 수 있다.
+        // 100개 청크 (약 1.6KB)로 분할해 순차 조회 후 머지. dedupe 동일 id 중복 제거.
+        const CHUNK_SIZE = 100;
+        const uniqueIds = Array.from(new Set(expectedIds.map(id => String(id))));
         const notesByStringId = {};
-        for (const note of (noteData.data || [])) {
-            for (const sid of (note.strings || [])) {
-                const id = normalizeId(sid);
-                (notesByStringId[id] ||= []).push({ col: note.col, content: note.content });
+        for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
+            const chunk = uniqueIds.slice(i, i + CHUNK_SIZE);
+            const query = chunk.map(id => `strings=${encodeURIComponent(id)}`).join('&');
+            const noteData = await apiJson(`/api/translate/string_notes/?${query}`);
+            for (const note of (noteData.data || [])) {
+                for (const sid of (note.strings || [])) {
+                    const id = normalizeId(sid);
+                    const bucket = (notesByStringId[id] ||= []);
+                    // 청크가 나뉘어도 동일 note.id가 여러 청크에 속한 세그먼트를 공유할 수 있으므로
+                    // (note.strings 배열이 청크 경계를 걸칠 때) note.id 기준 dedupe.
+                    if (note.id != null && bucket.some(n => n._id === note.id)) continue;
+                    bucket.push({ col: note.col, content: note.content, _id: note.id });
+                }
             }
+        }
+        // 내부 _id 키는 소비측에 노출할 필요 없으므로 제거.
+        for (const id of Object.keys(notesByStringId)) {
+            notesByStringId[id] = notesByStringId[id].map(({ col, content }) => ({ col, content }));
         }
         return notesByStringId;
     }
@@ -3719,6 +3734,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.5.8] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.5.9] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
