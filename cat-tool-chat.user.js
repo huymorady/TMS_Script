@@ -3385,9 +3385,10 @@
         $('.tw-btn-batch-reset', el).addEventListener('click', onBatchReset);
         // v0.7.6 (#4): 컴팩트 모드 토글
         const compactBtn = $('.tw-btn-toggle-compact', el);
-        if (compactBtn) {
+        const batchPanel = $('.tw-batch-panel', el);
+        if (compactBtn && batchPanel) {
             const applyCompact = (on) => {
-                el.classList.toggle('tw-compact', !!on);
+                batchPanel.classList.toggle('tw-compact', !!on);
                 compactBtn.dataset.compact = on ? '1' : '0';
                 compactBtn.textContent = on ? '📐 컴팩트 ✓' : '📐 컴팩트';
                 compactBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
