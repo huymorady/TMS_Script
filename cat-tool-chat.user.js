@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.15
+// @version      0.7.16
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.15)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.16)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.15';
+    const SCRIPT_VERSION = '0.7.16';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -664,7 +664,31 @@
     , 'g');
 
     function extractPlaceholders(text) {
+        // presence(존재 여부) 검사용 — 중복 제거된 토큰 집합
         return Array.from(new Set(String(text || '').match(TOKEN_PATTERN) || []));
+    }
+
+    // v0.7.16 (#1): 중복 플레이스홀더(`%s %s`)도 정확히 비교하기 위한 카운트 맵.
+    // src/dst 토큰 카운트 차이를 비교하여 누락/초과 토큰을 토큰별 갯수까지 잡아낸다.
+    function countPlaceholders(text) {
+        const counts = new Map();
+        for (const m of String(text || '').match(TOKEN_PATTERN) || []) {
+            counts.set(m, (counts.get(m) || 0) + 1);
+        }
+        return counts;
+    }
+
+    // v0.7.16 (#1): 토큰 카운트 기반 missing 검사. src 카운트 > dst 카운트인 토큰만 반환.
+    // 반환 형식: [{ token, expected, actual }] — Phase3/45 검증의 missingPlaceholders로 그대로 쓸 수 있음.
+    function diffPlaceholderCounts(srcText, dstText) {
+        const src = countPlaceholders(srcText);
+        const dst = countPlaceholders(dstText);
+        const out = [];
+        for (const [token, n] of src) {
+            const m = dst.get(token) || 0;
+            if (m < n) out.push({ token, expected: n, actual: m });
+        }
+        return out;
     }
 
     function stripCodeFence(text) {
@@ -865,6 +889,17 @@
                 if (mismatched) placeholderOrderMismatch.push({ id, expected: srcSeq, actual: finalSeq });
             }
 
+            // v0.7.16 (#1): 중복 토큰 카운트 부족도 warn-only로 잡기
+            const phCountDiff = diffPlaceholderCounts(src, finalText);
+            if (phCountDiff.length) {
+                placeholderOrderMismatch.push({
+                    id,
+                    expected: phCountDiff.map(d => `${d.token}×${d.expected}`),
+                    actual: phCountDiff.map(d => `${d.token}×${d.actual}`),
+                    kind: 'count',
+                });
+            }
+
             // tb terms
             if (tb && tb.size && src) {
                 const missed = [];
@@ -907,11 +942,14 @@
         const missingPlaceholders = [];
         for (const item of translations) {
             const src = sourceById.get(normalizeId(item.id))?.origin_string || '';
-            const placeholders = extractPlaceholders(src);
             const translated = typeof item.t === 'string' ? item.t : '';
-            const missing = placeholders.filter(token => !translated.includes(token));
-            if (missing.length) {
-                missingPlaceholders.push({ id: normalizeId(item.id), missing });
+            // v0.7.16 (#1): 토큰 카운트 비교로 중복 누락(`%s %s` → `%s`)도 잡는다.
+            const diff = diffPlaceholderCounts(src, translated);
+            if (diff.length) {
+                missingPlaceholders.push({
+                    id: normalizeId(item.id),
+                    missing: diff.map(d => d.expected > 1 ? `${d.token}(×${d.actual}/${d.expected})` : d.token),
+                });
             }
         }
 
@@ -994,11 +1032,14 @@
         for (const item of revisions) {
             const id = normalizeId(item.id);
             const src = sourceById.get(id)?.origin_string || '';
-            const placeholders = extractPlaceholders(src);
             const finalText = finalTextById.get(id) || '';
-            const missing = placeholders.filter(token => !finalText.includes(token));
-            if (missing.length) {
-                missingPlaceholders.push({ id, missing });
+            // v0.7.16 (#1): 토큰 카운트 비교로 중복 누락도 잡는다.
+            const diff = diffPlaceholderCounts(src, finalText);
+            if (diff.length) {
+                missingPlaceholders.push({
+                    id,
+                    missing: diff.map(d => d.expected > 1 ? `${d.token}(×${d.actual}/${d.expected})` : d.token),
+                });
             }
         }
 
@@ -2502,8 +2543,17 @@
     }
 
     function makeBatchRunId(params) {
-        const stamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
-        return `${stamp}-file${params.fileId || 'unknown'}`;
+        // v0.7.16 (#3): 충돌 방지 — 1초 안에 같은 파일에서 두 번 수집해도 고유 ID.
+        //   yyyyMMddHHmmssMMM-pPID-fFID-lLID-RAND4
+        // 과거 형식 (yyyyMMddHHmmss-fileFID) 도 LS에 그대로 호환 — 새로 생성되는 것만 신형식.
+        const now = new Date();
+        const stamp = now.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+        const ms = String(now.getUTCMilliseconds()).padStart(3, '0');
+        const rand = Math.random().toString(36).slice(2, 6).padEnd(4, '0');
+        const pid = params.projectId || '?';
+        const fid = params.fileId || '?';
+        const lid = params.languageId || '?';
+        return `${stamp}${ms}-p${pid}-f${fid}-l${lid}-${rand}`;
     }
 
     function batchRunMatchesCurrentUrl(run) {
@@ -3442,6 +3492,11 @@
 .tw-batch-run-header .tw-batch-run-meta b { color: var(--tw-fg); font-weight: 500; }
 .tw-batch-run-header .tw-batch-run-stamp {
     margin-left: auto; color: var(--tw-muted); font-size: 10px; white-space: nowrap;
+}
+/* v0.7.16 (#4): run.page와 현재 URL의 page가 다를 때 경고 배지 */
+.tw-batch-run-header .tw-run-page-mismatch {
+    background: rgba(250,204,21,0.18); color: #facc15; border: 1px solid rgba(250,204,21,0.4);
+    padding: 1px 6px; border-radius: 4px; font-size: 10px; white-space: nowrap; cursor: help;
 }
 /* Phase stepper — 좁은 사이드바(290px)에서도 깨지지 않게 세로 스택 */
 .tw-batch-stepper {
@@ -4895,10 +4950,22 @@
                 return Object.keys(all[run.runId] || {}).length;
             } catch (_) { return 0; }
         })();
+        // v0.7.16 (#4): 현재 URL의 page와 run.page가 다르면 경고 배지.
+        // batchRunMatchesCurrentUrl이 page를 의도적으로 무시하므로 사용자에게 명시.
+        let pageBadge = '';
+        try {
+            const cur = getUrlParams();
+            const curPage = String(cur.page || '');
+            const runPage = String(run.page || '');
+            if (runPage && curPage && runPage !== curPage) {
+                pageBadge = `<span class="tw-run-page-mismatch" title="이 run은 page=${escapeHtml(runPage)}에서 수집됨. 현재 URL은 page=${escapeHtml(curPage)}. 같은 file/lang이라 활성 run으로 유지되지만, 적용 대상 세그먼트가 다를 수 있습니다.">⚠ run page=${escapeHtml(runPage)} · 현재 page=${escapeHtml(curPage)}</span>`;
+            }
+        } catch (_) { /* URL parse 실패 — 배지 생략 */ }
         el.innerHTML = `
             <span class="tw-batch-run-id" title="runId: ${escapeHtml(String(run.runId || ''))}${run.label ? `\n라벨: ${run.label}` : ''}">🏃 ${escapeHtml(run.label || runIdShort)}</span>
             <span class="tw-batch-run-meta">project <b>${escapeHtml(String(run.projectId || '?'))}</b> / file <b>${escapeHtml(String(run.fileId || '?'))}</b> / lang <b>${escapeHtml(String(run.languageId || '?'))}</b></span>
             <span class="tw-batch-run-meta">override <b>${overrides}</b></span>
+            ${pageBadge}
             <span class="tw-batch-run-stamp">${escapeHtml(stamp)}</span>
         `;
     }
@@ -6430,9 +6497,19 @@
 
     function validateParsedPhase(run, phaseTag, parsed) {
         if (phaseTag === '1+2') return validatePhase12Compact(parsed, run.segments);
-        // warn-only 추가 검증을 위해 visible TB term 매핑 주입 (DOM 의존 — 없으면 빈 Map)
-        let tbTerms;
-        try { tbTerms = extractVisibleTbTerms(); } catch (_) { tbTerms = new Map(); }
+        // v0.7.16 (#2): warn-only TB 검증에 run.tbSummary (API + visible 합본)를 우선 사용.
+        // 수집 시점에 buildBatchTbSummary로 저장해 둔 전체 용어가 있으면 그걸 쓰고,
+        // 비어 있으면(과거 run/마이그레이션) DOM의 visible terms로 폴백.
+        const tbTerms = new Map();
+        if (Array.isArray(run.tbSummary) && run.tbSummary.length) {
+            for (const t of run.tbSummary) {
+                if (t && t.source && t.target) tbTerms.set(t.source, t.target);
+            }
+        } else {
+            try {
+                for (const [s, d] of extractVisibleTbTerms()) tbTerms.set(s, d);
+            } catch (_) { /* DOM 미준비 — 빈 Map로 진행 */ }
+        }
         const opts = { tbTerms };
         if (phaseTag === '3') return validatePhase3Compact(run.phase12.parsed, parsed, run.segments, opts);
         if (phaseTag === '4+5') return validatePhase45Compact(run.phase3.parsed, parsed, run.segments, opts);
