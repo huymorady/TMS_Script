@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.14
+// @version      0.7.15
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,10 +14,41 @@
     'use strict';
 
     // ========================================================================
-    // 상수 & 설정
+    // 📑 모듈 ToC (v0.7.15)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // ------------------------------------------------------------------------
+    //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
+    //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
+    //   §3  Activity ring (감사 로그)                          ............ ~319
+    //   §4  API 래퍼 (apiJson, maskSensitive)                  ............ ~414
+    //   §5  Batch compact workflow helpers                     ............ ~575
+    //   §6  번역 입력창 탐색 & 값 주입                         ............ ~1080
+    //   §7  세션 관리 (TTL 자동 정리)                          ............ ~1162
+    //   §8  IndexedDB ring 백업 (snapshots)                    ............ ~1622
+    //   §9  시스템 프롬프트 관리                               ............ ~1817
+    //   §10 활성 세그먼트 식별 / 통합 상태                     ............ ~1882
+    //   §11 applied-from-batch 추적                            ............ ~2028
+    //   §12 리뷰 override (run+id 키)                          ............ ~2067
+    //   §13 batch → chat 시드                                  ............ ~2314
+    //   §14 컨텍스트 수집 / 프롬프트 조립                      ............ ~2398
+    //   §15 Batch workflow state + prompt builders             ............ ~2471
+    //   §16 모달 UI (HTML 템플릿 + CSS)                        ............ ~2964
+    //   §17 이벤트 핸들러 (배치/리뷰/세션/워크스페이스)        ............ ~4235
+    //   §18 모달 Show/Hide + 세그먼트 자동 감지                ............ ~6587
+    //   §19 채팅 흐름                                          ............ ~6767
+    //   §20 시스템 프롬프트/설정 패널 (모달 우측)              ............ ~7108
+    //   §21 단축키 등록 (Alt+Z) + 디버그 export                ............ ~8150
     // ========================================================================
-    // v0.7.12: @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.14';
+    // 버전 주석 정책 (v0.7.15~):
+    //   - v0.7.x : 변경 맥락이 살아있을 동안 inline 유지
+    //   - v0.6.x : prefix 제거 (이력은 git blame). 설명만 보존.
+    //   - v0.5.x : 동일 (현재 0건)
+    // ========================================================================
+
+    // ========================================================================
+    // §1  상수 & 설정
+    // ========================================================================
+    // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
+    const SCRIPT_VERSION = '0.7.15';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -31,8 +62,8 @@
         MODAL_SIZE: 'tms_workflow_modal_size_v1',
         BATCH_RUNS: 'tms_workflow_batch_runs_v1',
         ACTIVE_BATCH_RUN: 'tms_workflow_active_batch_run_v1',
-        APPLIED_FROM_BATCH: 'tms_workflow_applied_from_batch_v1', // v0.6.0 L3: textarea가 배치에서 자동 적용된 세그먼트 추적
-        REVIEW_OVERRIDES: 'tms_workflow_review_overrides_v1', // v0.6.2: 사용자가 리뷰 탭에서 직접 수정한 최종 후보 (run+id 키)
+        APPLIED_FROM_BATCH: 'tms_workflow_applied_from_batch_v1', // textarea가 배치에서 자동 적용된 세그먼트 추적
+        REVIEW_OVERRIDES: 'tms_workflow_review_overrides_v1', // 사용자가 리뷰 탭에서 직접 수정한 최종 후보 (run+id 키)
         COMPACT_MODE: 'tms_workflow_compact_mode_v1', // v0.7.6 (#4): 배치 패널 컴팩트 모드 (stepper + 카드 접기)
         SCHEMA_VERSION: 'tms_workflow_schema_version', // v0.7.7 (#10): LS 스키마 버전 가드 (정수). 향후 마이그레이션 분기점.
         BACKUP_NEXT_SLOT: 'tms_workflow_backup_next_slot', // v0.7.7 (#12): IDB ring 안의 다음 쓸 slot 인덱스 (0..N-1)
@@ -114,7 +145,7 @@
 - 원문에 있던 플레이스홀더(%s, {0}, \\n 등)와 태그는 그대로 유지하세요.`.trim();
 
     // ========================================================================
-    // 유틸리티
+    // §2  유틸리티
     // ========================================================================
     const $ = (sel, root = document) => root.querySelector(sel);
     const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -220,7 +251,7 @@
             window.catToast[type](msg);
             return;
         }
-        // 폴백: 간단한 자체 토스트 (v0.6.7 D2: 색상은 모달의 design token과 동일)
+        // 폴백: 간단한 자체 토스트 (색상은 모달의 design token과 동일)
         const PALETTE = { error: '#e74c3c', success: '#27ae60', warn: '#fbbf24', info: '#3498db' };
         const bg = PALETTE[type] || PALETTE.info;
         const el = document.createElement('div');
@@ -382,7 +413,7 @@
     }
 
     // ========================================================================
-    // API 래퍼
+    // §4  API 래퍼
     // ========================================================================
     async function apiJson(url, options = {}) {
         const csrf = getCsrfToken();
@@ -543,7 +574,7 @@
     }
 
     // ========================================================================
-    // Batch compact workflow helpers
+    // §5  Batch compact workflow helpers
     // ========================================================================
     function normalizeSegmentListResponse(listData) {
         const payload = listData?.data;
@@ -792,7 +823,7 @@
         return expectedGroupById;
     }
 
-    // v0.6.6 (B3): warn-only 추가 검증 (char 길이, placeholder 순서, TB term 미사용)
+    // warn-only 추가 검증 (char 길이, placeholder 순서, TB term 미사용)
     // - charLimitOver: segment.char_limit이 있을 때 final 길이가 limit 초과 (없으면 origin_string 길이 * 2.5 + 30 임시 cap)
     // - placeholderOrderMismatch: source/target placeholder 출현 순서가 다름
     // - tbTermsMissed: tbTerms Map에 source가 있지만 final이 target을 포함하지 않음
@@ -888,7 +919,7 @@
             .filter(item => typeof item.t === 'string' && /[\u4e00-\u9fff]/.test(item.t))
             .map(item => normalizeId(item.id));
 
-        // v0.6.6 (B3): warn-only 추가 검증 (ok에 영향 없음)
+        // warn-only 추가 검증 (ok에 영향 없음)
         const warnings = computeTranslationWarnings(translations, sourceById, options.tbTerms);
 
         return {
@@ -933,7 +964,7 @@
             .filter(item => Object.prototype.hasOwnProperty.call(item, 't') && item.t !== null && typeof item.t !== 'string')
             .map(item => normalizeId(item.id));
 
-        // v0.6.4: phase3와 동일한 텍스트가 들어온 revision은 사실상 no-op으로 간주 → reason 요구에서 제외
+        // phase3와 동일한 텍스트가 들어온 revision은 사실상 no-op으로 간주 → reason 요구에서 제외
         const effectiveNoOpIds = new Set(
             revisions
                 .filter(item => typeof item.t === 'string' && item.t === (phase3ById.get(normalizeId(item.id))?.t ?? null))
@@ -975,10 +1006,10 @@
             .filter(item => /[\u4e00-\u9fff]/.test(finalTextById.get(normalizeId(item.id)) || ''))
             .map(item => normalizeId(item.id));
 
-        // v0.6.4: \uc0ac\uc2e4\uc0c1 no-op\uc744 \uc81c\uc678\ud55c \uc2e4\uc81c \ubcc0\uacbd \uac74\uc218
+        // \uc0ac\uc2e4\uc0c1 no-op\uc744 \uc81c\uc678\ud55c \uc2e4\uc81c \ubcc0\uacbd \uac74\uc218
         const changedCount = revisions.filter(item => item.t !== null && !effectiveNoOpIds.has(normalizeId(item.id))).length;
 
-        // v0.6.6 (B3): warn-only 추가 검증 (final 텍스트 기준)
+        // warn-only 추가 검증 (final 텍스트 기준)
         const warnInputs = revisions.map(item => ({ id: normalizeId(item.id), gid: item.gid, t: finalTextById.get(normalizeId(item.id)) || '' }));
         const warnings = computeTranslationWarnings(warnInputs, sourceById, options.tbTerms);
 
@@ -1048,7 +1079,7 @@
     }
 
     // ========================================================================
-    // 번역 입력창 탐색 & 값 주입 (SPA가 변경을 감지하도록)
+    // §6  번역 입력창 탐색 & 값 주입 (SPA가 변경을 감지하도록)
     // ========================================================================
 
     // 현재 활성 세그먼트의 번역 입력 textarea 찾기
@@ -1130,7 +1161,7 @@
     }
 
     // ========================================================================
-    // 세션 관리 (TTL 기반 자동 정리 + 수동 관리)
+    // §7  세션 관리 (TTL 기반 자동 정리 + 수동 관리)
     // ========================================================================
     function loadSessions() {
         return lsGet(LS_KEYS.SESSIONS, {});
@@ -1785,7 +1816,7 @@
     }
 
     // ========================================================================
-    // 시스템 프롬프트 관리
+    // §9  시스템 프롬프트 관리
     // ========================================================================
     function loadPrompts() {
         const prompts = lsGet(LS_KEYS.SYSTEM_PROMPTS);
@@ -1850,7 +1881,7 @@
     }
 
     // ========================================================================
-    // 활성 세그먼트 식별 (TMS Naive UI 기반, API Logger 독립)
+    // §10 활성 세그먼트 식별 (TMS Naive UI 기반, API Logger 독립)
     // ========================================================================
     function findActiveStringItem() {
         // 1순위: .string-item.active (포커스된 세그먼트)
@@ -1891,7 +1922,7 @@
     }
 
     // ========================================================================
-    // 현재 세그먼트 ID 추출 (DOM만 사용, API Logger 불필요)
+    // §10b 현재 세그먼트 ID 추출 (DOM만 사용, API Logger 불필요)
     // ========================================================================
     // 폴링으로 자주 호출되므로 로그는 verbose=false일 때 생략
     function getCurrentStringId(verbose = false) {
@@ -1916,7 +1947,7 @@
     }
 
     // ========================================================================
-    // 세그먼트 통합 상태 (채팅·배치 합쳐서 조회)
+    // §10c 세그먼트 통합 상태 (채팅·배치 합쳐서 조회)
     // ========================================================================
     /**
      * 세그먼트 하나에 대해 채팅 세션과 배치 실행 결과를 통합 조회.
@@ -1996,7 +2027,7 @@
     }
 
     // ========================================================================
-    // v0.6.0 L3: applied-from-batch 추적 (textarea가 배치 자동 적용분인지 식별)
+    // applied-from-batch 추적 (textarea가 배치 자동 적용분인지 식별)
     // ========================================================================
     // 짧은 동기 해시 (djb2 32-bit). crypto.subtle은 비동기·과대 — 여기선 변경 감지만 하므로 충돌 무시 가능.
     function hashTextShort(s) {
@@ -2035,7 +2066,7 @@
     }
 
     // ========================================================================
-    // v0.6.2: 리뷰 탭 인라인 수정 override (run+id 키, phase 데이터는 불변 유지)
+    // 리뷰 탭 인라인 수정 override (run+id 키, phase 데이터는 불변 유지)
     // ========================================================================
     function loadReviewOverrides() {
         return lsGet(LS_KEYS.REVIEW_OVERRIDES, {});
@@ -2049,7 +2080,7 @@
         const bucket = all[runId];
         if (!bucket) return null;
         const v = bucket[normalizeId(stringId)];
-        // v0.6.5: migration — 과거에는 string, 이제는 { text, updatedAt }
+        // migration — 과거에는 string, 이제는 { text, updatedAt }
         if (typeof v === 'string') return v;
         if (v && typeof v === 'object' && typeof v.text === 'string') return v.text;
         return null;
@@ -2072,14 +2103,14 @@
         saveReviewOverrides(all);
         try { _bumpOverrideWriteCounter(); } catch (e) { dwarn('backup counter bump 실패', e); }
     }
-    // v0.6.5: 활성 run의 override 개수 계산 (phase 재실행 가드용)
+    // 활성 run의 override 개수 계산 (phase 재실행 가드용)
     function countReviewOverridesForRun(runId) {
         if (!runId) return 0;
         const bucket = loadReviewOverrides()[runId];
         return bucket ? Object.keys(bucket).length : 0;
     }
 
-    // v0.6.6 (B1): 고아 override 정리 — 알려진 batch run 또는 활성 run 외 버킷 + 활성 run 내 phase3에 없는 ID 정리
+    // 고아 override 정리 — 알려진 batch run 또는 활성 run 외 버킷 + 활성 run 내 phase3에 없는 ID 정리
     function gcOrphanReviewOverrides(options = {}) {
         const all = loadReviewOverrides();
         const allRunIds = Object.keys(all);
@@ -2123,7 +2154,7 @@
         };
     }
 
-    // v0.6.7 (C2): 같은 project/file/language 컨텍스트의 직전 run 후보 목록.
+    // 같은 project/file/language 컨텍스트의 직전 run 후보 목록.
     // - currentRun을 제외하고 updatedAt 내림차순 정렬.
     // - phase3 결과가 있는 run만 비교 의미가 있으므로 그것만 노출.
     function findPriorRunsForCurrent(runs, currentRun) {
@@ -2139,7 +2170,7 @@
         return list;
     }
 
-    // v0.6.7 (C2): 두 run 사이의 phase3/phase45 final 텍스트 diff 행 빌드.
+    // 두 run 사이의 phase3/phase45 final 텍스트 diff 행 빌드.
     // override는 의도적으로 무시 — "LLM 결과 자체"의 drift만 보기 위함.
     // v0.7.0 B5: options.includeOverrides=true 면 override를 final에 덮어 비교한다
     //           (사용자가 실제 적용한 결과 기준 drift 확인용)
@@ -2195,7 +2226,7 @@
         return rows.sort((a, b) => Number(a.id) - Number(b.id));
     }
 
-    // v0.6.7 (C3): run 한 개를 CSV로 직렬화. RFC 4180 호환 (CRLF 줄바꿈, 큰따옴표 이스케이프).
+    // run 한 개를 CSV로 직렬화. RFC 4180 호환 (CRLF 줄바꿈, 큰따옴표 이스케이프).
     function buildCsvFromRun(run) {
         if (!run) return '';
         const segById = new Map((run.segments || []).map(s => [normalizeId(s.id), s]));
@@ -2240,7 +2271,7 @@
         return lines.join('\r\n') + '\r\n';
     }
 
-    // v0.6.7 (C3): run 직렬화 JSON — raw 필드는 용량을 키워 별도 토글로 포함.
+    // run 직렬화 JSON — raw 필드는 용량을 키워 별도 토글로 포함.
     function buildJsonExportFromRun(run, options = {}) {
         if (!run) return '';
         const includeRaw = !!options.includeRaw;
@@ -2255,7 +2286,7 @@
         return JSON.stringify(cloned, null, 2);
     }
 
-    // v0.6.7 (D1): 로그 행을 한 단위 객체로 정규화. type/level은 lower-case.
+    // 로그 행을 한 단위 객체로 정규화. type/level은 lower-case.
     function buildFilteredLogLines(logs, level, query) {
         const list = Array.isArray(logs) ? logs : [];
         const lvl = (level || 'all').toLowerCase();
@@ -2269,7 +2300,7 @@
             .map(log => `[${log.at}] ${String(log.type || 'info').toUpperCase()} ${log.message || ''}`);
     }
 
-    // v0.6.7 (C3/D1): 클라이언트 다운로드 헬퍼.
+    // 클라이언트 다운로드 헬퍼.
     function downloadTextFile(filename, mime, content) {
         const blob = new Blob([content], { type: mime + ';charset=utf-8' });
         const url = URL.createObjectURL(blob);
@@ -2282,7 +2313,7 @@
     }
 
     // ========================================================================
-    // v0.6.0 L1: batch 결과를 chat 세션 system 메시지로 시드
+    // batch 결과를 chat 세션 system 메시지로 시드
     // ========================================================================
     function importBatchResultToChat(stringId, run, options = {}) {
         const id = normalizeId(stringId);
@@ -2316,7 +2347,7 @@
             }
         }
 
-        // v0.6.6 (C1): 같은 gid의 다른 세그먼트 샘플 (톤/스타일 일관성 참고용, 최대 5개)
+        // 같은 gid의 다른 세그먼트 샘플 (톤/스타일 일관성 참고용, 최대 5개)
         if (phase3Item?.gid) {
             const segById = new Map((run.segments || []).map(s => [normalizeId(s.id), s]));
             const revById = new Map(((run.phase45?.parsed?.revisions) || []).map(r => [normalizeId(r.id), r]));
@@ -2335,7 +2366,7 @@
             }
         }
 
-        // v0.6.6 (C1): 세그먼트별 TB 용어 매핑 (segment.match_terms)
+        // 세그먼트별 TB 용어 매핑 (segment.match_terms)
         if (Array.isArray(segItem?.match_terms) && segItem.match_terms.length) {
             const terms = segItem.match_terms
                 .map(t => {
@@ -2347,7 +2378,7 @@
             if (terms.length) sysLines.push(`[적용 용어 (TB)]\n${terms.join('\n')}`);
         }
 
-        // v0.6.6 (C1): 글자수 제한
+        // 글자수 제한
         if (segItem?.char_limit && segItem.char_limit > 0) {
             sysLines.push(`[글자수 제한] ${segItem.char_limit}자`);
         }
@@ -2366,7 +2397,7 @@
     }
 
     // ========================================================================
-    // 컨텍스트 수집
+    // §14a 컨텍스트 수집
     // ========================================================================
     function buildSegmentContext(segment) {
         if (!segment) return '';
@@ -2399,7 +2430,7 @@
     }
 
     // ========================================================================
-    // 프롬프트 조립
+    // §14b 프롬프트 조립
     // ========================================================================
     function buildPrefixPrompt(systemPrompt, segmentContext, history, userMessage, sessionSystem) {
         const sections = [];
@@ -2408,7 +2439,7 @@
             sections.push(`=== 시스템 지침 ===\n${systemPrompt.trim()}`);
         }
 
-        // v0.6.0 L1: batch import 시드된 컬텍스트 (segment context 보다 먼저 표시)
+        // batch import 시드된 컬텍스트 (segment context 보다 먼저 표시)
         if (sessionSystem && String(sessionSystem).trim()) {
             sections.push(`=== 배치 컬텍스트 ===\n${String(sessionSystem).trim()}`);
         }
@@ -2439,7 +2470,7 @@
     }
 
     // ========================================================================
-    // Batch workflow state + prompt builders
+    // §15 Batch workflow state + prompt builders
     // ========================================================================
     function loadBatchRuns() {
         return lsGet(LS_KEYS.BATCH_RUNS, {});
@@ -2932,18 +2963,18 @@
     }
 
     // ========================================================================
-    // 모달 UI
+    // §16 모달 UI (HTML 템플릿 + CSS)
     // ========================================================================
     let modalEl = null;
     let currentStringId = null;
     let currentSegment = null;
     let currentMainTab = 'chat';
     let batchRun = null;
-    // v0.6.5 (A3): 리뷰 탭 필터/정렬 상태 (메모리 only — 세션 한정)
-    // v0.6.7 (C2): 비교 모드 상태 추가 — compareMode/compareRunId 가 set 되면
+    // 리뷰 탭 필터/정렬 상태 (메모리 only — 세션 한정)
+    // 비교 모드 상태 추가 — compareMode/compareRunId 가 set 되면
     // 검토 표 대신 직전 run 비교 표가 렌더된다.
     const reviewView = { filter: 'all', sort: 'id', compareMode: false, compareRunId: null, compareIncludeOverrides: false, lastFailedIds: [], showOnlyFailed: false };
-    // v0.6.7 (D1): 로그 탭 필터/검색 상태
+    // 로그 탭 필터/검색 상태
     const logView = { level: 'all', query: '' };
 
     function createModal() {
@@ -3005,21 +3036,21 @@
                 <div class="tw-batch-status">대기 중</div>
             </div>
         </div>
-        <!-- v0.6.9 (G1-a): 활성 run 헤더 카드 -->
+        <!-- 활성 run 헤더 카드 -->
         <div class="tw-batch-run-header tw-hidden"></div>
-        <!-- v0.6.9 (G1-b): Phase stepper -->
+        <!-- Phase stepper -->
         <div class="tw-batch-stepper"></div>
-        <!-- v0.6.9 (G1-d): 수집/검증 결과 카드 (클릭 시 review 탭 필터 자동 적용) -->
+        <!-- 수집/검증 결과 카드 (클릭 시 review 탭 필터 자동 적용) -->
         <div class="tw-batch-summary-cards"></div>
-        <!-- v0.6.9 hotfix2: 사용 모델/프롬프트 표시 -->
+        <!-- 사용 모델/프롬프트 표시 -->
         <div class="tw-batch-config-row tw-muted"></div>
         <div class="tw-batch-warning tw-muted"></div>
-        <!-- v0.6.9 hotfix2: 세그먼트 미리보기는 버튼 클릭 시 오버레이로 -->
+        <!-- 세그먼트 미리보기는 버튼 클릭 시 오버레이로 -->
         <button type="button" class="tw-btn tw-btn-ghost tw-btn-show-segments" disabled>📋 수집 세그먼트 보기</button>
     </div>
     <div class="tw-batch-chat-panel">
         <div class="tw-batch-timeline"></div>
-        <!-- v0.6.9 hotfix2: 세그먼트 오버레이 (배치 패널 우측 영역 위로 떠오름) -->
+        <!-- 세그먼트 오버레이 (배치 패널 우측 영역 위로 떠오름) -->
         <div class="tw-batch-segments-overlay tw-hidden">
             <div class="tw-batch-segments-overlay-header">
                 <span class="tw-batch-segments-overlay-title">수집 세그먼트</span>
@@ -3163,7 +3194,7 @@
         const style = document.createElement('style');
         style.id = 'tms-workflow-styles';
         style.textContent = `
-/* v0.6.7 (D2): 디자인 토큰 — 색·간격을 한 곳에서 관리. 신규 컴포넌트는 var(--tw-*) 사용을 권장 */
+/* 디자인 토큰 — 색·간격을 한 곳에서 관리. 신규 컴포넌트는 var(--tw-*) 사용을 권장 */
 #tms-workflow-modal {
     --tw-accent: #4ade80;
     --tw-accent-soft: rgba(74, 222, 128, 0.18);
@@ -3272,7 +3303,7 @@
     text-align: center; padding: 4px; font-size: 11px; }
 .tw-msg-system { max-width: 100%; }
 .tw-msg-progress { color: #fbbf24; }
-/* v0.6.10 C2-신: AI 메시지 인라인 액션 버튼 */
+/* AI 메시지 인라인 액션 버튼 */
 .tw-msg-actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
 .tw-msg-progress .tw-msg-actions { display: none; }
 .tw-msg-action {
@@ -3350,7 +3381,7 @@
     word-break: break-word;
 }
 .tw-batch-warning:empty { display: none; }
-/* v0.6.9 hotfix2: 사용 모델/프롬프트 미니 표시 (사이드바) */
+/* 사용 모델/프롬프트 미니 표시 (사이드바) */
 .tw-batch-config-row {
     display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 11px;
     padding: 8px 12px; border: 1px dashed var(--tw-border); border-radius: 6px;
@@ -3363,14 +3394,14 @@
     color: var(--tw-fg); font-weight: 500;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px;
 }
-/* v0.6.9 hotfix2: 세그먼트 보기 버튼 */
+/* 세그먼트 보기 버튼 */
 .tw-btn-show-segments {
     width: 100%; text-align: left; padding: 8px 10px; font-size: 12px;
     background: var(--tw-bg-2); border: 1px solid var(--tw-border); color: var(--tw-fg);
 }
 .tw-btn-show-segments:not(:disabled):hover { background: var(--tw-bg-3); border-color: var(--tw-accent); }
 .tw-btn-show-segments:disabled { opacity: 0.5; cursor: not-allowed; }
-/* v0.6.9 hotfix2: 세그먼트 오버레이 (chat-panel 위로 떠오름) */
+/* 세그먼트 오버레이 (chat-panel 위로 떠오름) */
 .tw-batch-chat-panel { position: relative; }
 .tw-batch-segments-overlay {
     position: absolute; inset: 0; z-index: 20;
@@ -3395,7 +3426,7 @@
     font-size: 12px; line-height: 1.6;
 }
 /* .tw-batch-segments는 v0.6.9 hotfix2부터 overlay-body 안에서만 사용됨 */
-/* v0.6.9 (G1-a): 활성 run 헤더 카드 — 사이드바에 맞게 줄당 1~2 항목으로 wrap */
+/* 활성 run 헤더 카드 — 사이드바에 맞게 줄당 1~2 항목으로 wrap */
 .tw-batch-run-header {
     display: flex; gap: 8px 12px; align-items: center; flex-wrap: wrap;
     padding: 8px 10px; border: 1px solid var(--tw-border); border-radius: 8px;
@@ -3412,7 +3443,7 @@
 .tw-batch-run-header .tw-batch-run-stamp {
     margin-left: auto; color: var(--tw-muted); font-size: 10px; white-space: nowrap;
 }
-/* v0.6.9 (G1-b): Phase stepper — 좁은 사이드바(290px)에서도 깨지지 않게 세로 스택 */
+/* Phase stepper — 좁은 사이드바(290px)에서도 깨지지 않게 세로 스택 */
 .tw-batch-stepper {
     display: flex; align-items: stretch; gap: 0; flex-wrap: nowrap;
     padding: 0; background: transparent;
@@ -3452,7 +3483,7 @@
 /* v0.7.0 G1-b 보강: fail/warn step은 클릭 가능 (로그 탭으로 점프) */
 .tw-batch-step.tw-step-actionable { cursor: pointer; transition: filter 0.12s ease; }
 .tw-batch-step.tw-step-actionable:hover { filter: brightness(1.25); }
-/* v0.6.9 (G1-d): 수집/검증 결과 카드 그리드 — 290px 사이드바에서 2열 정도 들어가게 */
+/* 수집/검증 결과 카드 그리드 — 290px 사이드바에서 2열 정도 들어가게 */
 .tw-batch-summary-cards {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
     gap: 8px;
@@ -3508,7 +3539,7 @@
     background: linear-gradient(135deg, #202820 0%, #181818 70%);
 }
 .tw-review-apply-status { margin-left: auto; font-size: 12px; }
-/* v0.6.8 (A1): 일괄 입력 실패 ID 칩 */
+/* 일괄 입력 실패 ID 칩 */
 .tw-review-failed-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; max-width: 360px; }
 .tw-review-failed-chip {
     display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 9999px;
@@ -3522,17 +3553,17 @@
     0% { background: rgba(251, 191, 36, 0.45); }
     100% { background: transparent; }
 }
-/* v0.6.5 (A3): 필터/정렬 컨트롤 */
+/* 필터/정렬 컨트롤 */
 .tw-review-filter-group { display: flex; gap: 8px; align-items: center; }
 .tw-review-filter-label { display: flex; align-items: center; gap: 4px; font-size: 12px; color: #aaa; }
 .tw-review-filter, .tw-review-sort {
     background: #1a1a1a; color: #e0e0e0; border: 1px solid #3a3a3a;
     padding: 3px 6px; border-radius: 4px; font-size: 12px;
 }
-/* v0.6.5 (A4): phase3 ↔ phase4+5 단어 단위 diff */
+/* phase3 ↔ phase4+5 단어 단위 diff */
 .tw-diff-add { background: rgba(74, 222, 128, 0.18); color: #86efac; border-radius: 2px; padding: 0 2px; }
 .tw-diff-del { background: rgba(248, 113, 113, 0.18); color: #fca5a5; text-decoration: line-through; border-radius: 2px; padding: 0 2px; opacity: 0.85; }
-/* v0.6.6 (B3): warn-only chip (final 셀에 부착) — v0.6.10 B4: 클릭 시 행 스크롤/flash */
+/* warn-only chip (final 셀에 부착) — 클릭 시 행 스크롤/flash */
 .tw-review-warn-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .tw-review-warn-chip {
     display: inline-flex; align-items: center; padding: 1px 6px; border-radius: 9999px;
@@ -3552,7 +3583,7 @@
 }
 .tw-review-row:last-child { border-bottom: none; }
 .tw-review-head { color: #4ade80; font-weight: 600; background: #202020; position: sticky; top: 0; z-index: 1; }
-/* v0.6.3: 기본 셀은 normal whitespace, 텍스트 보존이 필요한 셀만 pre-wrap */
+/* 기본 셀은 normal whitespace, 텍스트 보존이 필요한 셀만 pre-wrap */
 .tw-review-cell { word-break: break-word; line-height: 1.45; }
 .tw-review-cell.tw-review-text { white-space: pre-wrap; }
 .tw-review-row:not(.tw-review-head):hover { background: #1d241f; }
@@ -3571,17 +3602,17 @@
     font-size: 10px; line-height: 1.4; background: #25304a; color: #cbd5e1; border: 1px solid #334155;
     white-space: nowrap; align-self: flex-start;
 }
-/* v0.6.4: revision 텍스트와 함께 표시될 때만 윗 여백 */
+/* revision 텍스트와 함께 표시될 때만 윗 여백 */
 .tw-review-text + .tw-review-flag-chip { margin-top: 4px; }
 .tw-review-flag-chip.tw-review-flag-keep { background: #1f2a1f; color: #86efac; border-color: #2f4a32; }
-/* v0.6.7 (D2): "직접 수정" 의미는 amber(--tw-edit)로 통일 (✏️ chip / button / badge 공통 톤) */
+/* "직접 수정" 의미는 amber(--tw-edit)로 통일 (✏️ chip / button / badge 공통 톤) */
 .tw-review-flag-chip.tw-review-flag-edit { background: var(--tw-edit-soft); color: var(--tw-edit); border-color: rgba(251, 191, 36, 0.4); }
-/* v0.6.7 (D2): 적용 자동화 배지 (renderReviewTable의 appliedBadge 대상). 기존엔 룰 없음 — 토큰 톤으로 정의 */
+/* 적용 자동화 배지 (renderReviewTable의 appliedBadge 대상). 기존엔 룰 없음 — 토큰 톤으로 정의 */
 .tw-review-applied-badge {
     margin-left: 6px; font-size: 11px; opacity: 0.85; cursor: help;
     color: var(--tw-info);
 }
-/* v0.6.7 (D2): override 되어 있을 때 ✏️ 액션 버튼 강조 (주변 chip과 같은 amber) */
+/* override 되어 있을 때 ✏️ 액션 버튼 강조 (주변 chip과 같은 amber) */
 .tw-review-row[data-has-override="1"] .tw-btn-edit-final {
     color: var(--tw-edit); border-color: rgba(251, 191, 36, 0.4);
 }
@@ -3607,7 +3638,7 @@
     display: flex; align-items: center; justify-content: space-between;
     gap: 8px; flex-shrink: 0;
 }
-/* v0.6.7 (D1): 로그 필터/검색/다운로드 컨트롤 */
+/* 로그 필터/검색/다운로드 컨트롤 */
 .tw-log-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .tw-log-controls .tw-log-level,
 .tw-log-controls .tw-log-search {
@@ -3618,7 +3649,7 @@
 .tw-log-controls .tw-log-search { width: 160px; }
 .tw-log-controls .tw-log-search:focus,
 .tw-log-controls .tw-log-level:focus { outline: none; border-color: var(--tw-accent); }
-/* v0.6.7 (C2/C3): 검토 툴바 구분선 */
+/* 검토 툴바 구분선 */
 .tw-review-toolbar-divider {
     display: inline-block; width: 1px; height: 18px; background: var(--tw-border);
     margin: 0 4px; align-self: center;
@@ -3628,7 +3659,7 @@
     border: 1px solid var(--tw-border); border-radius: 4px;
     padding: 3px 6px; font-size: 12px; max-width: 220px;
 }
-/* v0.6.7 (C2): 비교 모드 표 */
+/* 비교 모드 표 */
 .tw-compare-banner {
     margin: 4px 0 8px; padding: 6px 10px; border-radius: 6px;
     background: var(--tw-accent-soft); color: var(--tw-accent);
@@ -4203,7 +4234,7 @@
     }
 
     // ========================================================================
-    // 이벤트 핸들러
+    // §17 이벤트 핸들러
     // ========================================================================
     function attachHandlers(el) {
         $$('.tw-main-tab', el).forEach(btn => {
@@ -4236,7 +4267,7 @@
         // 번역 채택
         $('.tw-btn-adopt', el).addEventListener('click', onAdoptTranslation);
 
-        // v0.6.10 C2-신: AI 메시지 인라인 액션 (셀로 적용 / 복사)
+        // AI 메시지 인라인 액션 (셀로 적용 / 복사)
         const messagesEl = $('.tw-chat-messages', el);
         if (messagesEl) messagesEl.addEventListener('click', onChatMessageAction);
 
@@ -4269,23 +4300,23 @@
         $('.tw-btn-log-copy', el).addEventListener('click', onCopyLogOutput);
         $('.tw-btn-review-apply-selected', el).addEventListener('click', () => applyBatchTranslationsByIds(getSelectedReviewIds()));
         $('.tw-btn-review-apply-all', el).addEventListener('click', () => applyBatchTranslationsByIds(getReviewTranslationIds()));
-        // v0.6.5 (A1): 수정만 입력
+        // 수정만 입력
         $('.tw-btn-review-apply-edited', el).addEventListener('click', () => applyBatchTranslationsByIds(getEditedReviewIds()));
-        // v0.6.5 (A3): 필터/정렬 변경 → 재렌더
+        // 필터/정렬 변경 → 재렌더
         $('.tw-review-filter', el).addEventListener('change', (e) => { reviewView.filter = e.target.value || 'all'; renderReviewTable(); });
         $('.tw-review-sort', el).addEventListener('change', (e) => { reviewView.sort = e.target.value || 'id'; renderReviewTable(); });
-        // v0.6.6 (B1): 고아 override 정리
+        // 고아 override 정리
         $('.tw-btn-review-gc', el).addEventListener('click', onReviewOverrideGc);
 
-        // v0.6.8 (A1): 실패만 보기 토글 + 실패 ID 칩 클릭
+        // 실패만 보기 토글 + 실패 ID 칩 클릭
         $('.tw-btn-review-failed-toggle', el).addEventListener('click', onToggleFailedOnly);
         $('.tw-review-failed-chips', el).addEventListener('click', onFailedChipClick);
 
-        // v0.6.9 (G1-d): 배치 패널 요약 카드 → review 탭 점프
+        // 배치 패널 요약 카드 → review 탭 점프
         const batchCards = $('.tw-batch-summary-cards', el);
         if (batchCards) batchCards.addEventListener('click', onBatchSummaryCardClick);
 
-        // v0.6.9 hotfix2: 세그먼트 보기 버튼 / 오버레이 닫기
+        // 세그먼트 보기 버튼 / 오버레이 닫기
         const segBtn = $('.tw-btn-show-segments', el);
         if (segBtn) segBtn.addEventListener('click', openSegmentsOverlay);
         const segCloseBtn = $('.tw-btn-close-segments', el);
@@ -4296,17 +4327,17 @@
             segOverlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSegmentsOverlay(); });
         }
 
-        // v0.6.7 (C2): 비교 모드 select / 종료 버튼
+        // 비교 모드 select / 종료 버튼
         $('.tw-btn-review-compare-exit', el).addEventListener('click', onExitCompareMode);
         // v0.7.0 B5: override 포함 토글 — compare 모드에서만 노출
         $('.tw-review-compare-overrides', el).addEventListener('change', (e) => {
             reviewView.compareIncludeOverrides = !!e.target.checked;
             renderReviewTable();
         });
-        // v0.6.7 (C3): export JSON/CSV
+        // export JSON/CSV
         $('.tw-btn-review-export-json', el).addEventListener('click', onExportRunJson);
         $('.tw-btn-review-export-csv', el).addEventListener('click', onExportRunCsv);
-        // v0.6.10 E1: override export/import
+        // override export/import
         $('.tw-btn-review-export-overrides', el).addEventListener('click', onExportOverrides);
         $('.tw-btn-review-import-overrides', el).addEventListener('click', () => {
             $('.tw-review-import-overrides-file', el)?.click();
@@ -4326,7 +4357,7 @@
             const del = e.target.closest('.tw-btn-history-delete');
             if (del) { onDeleteRun(del.getAttribute('data-run-id')); return; }
         });
-        // v0.6.7 (D1): 로그 필터/검색/다운로드
+        // 로그 필터/검색/다운로드
         $('.tw-log-level', el).addEventListener('change', onLogLevelChange);
         $('.tw-log-search', el).addEventListener('input', onLogSearchInput);
         $('.tw-btn-log-download', el).addEventListener('click', onDownloadLog);
@@ -4381,36 +4412,36 @@
             const applyBtn = e.target.closest('.tw-btn-apply-final');
             if (applyBtn) {
                 await applyBatchTranslationsByIds([Number(applyBtn.dataset.id)]);
-                renderReviewTable(); // v0.6.0: applied 배지 즉시 반영
+                renderReviewTable(); // applied 배지 즉시 반영
                 return;
             }
 
-            // v0.6.0 L2: review → chat 점프
+            // review → chat 점프
             const refineBtn = e.target.closest('.tw-btn-chat-refine');
             if (refineBtn) {
                 await onChatRefineFromReview(Number(refineBtn.dataset.id));
                 return;
             }
 
-            // v0.6.2: 인라인 직접 수정 진입
+            // 인라인 직접 수정 진입
             const editBtn = e.target.closest('.tw-btn-edit-final');
             if (editBtn) {
                 openInlineFinalEditor(normalizeId(editBtn.dataset.id));
                 return;
             }
-            // v0.6.2: 인라인 수정 저장
+            // 인라인 수정 저장
             const saveBtn = e.target.closest('.tw-btn-edit-save');
             if (saveBtn) {
                 commitInlineFinalEditor(normalizeId(saveBtn.dataset.id));
                 return;
             }
-            // v0.6.2: 인라인 수정 취소
+            // 인라인 수정 취소
             const cancelBtn = e.target.closest('.tw-btn-edit-cancel');
             if (cancelBtn) {
                 renderReviewTable();
                 return;
             }
-            // v0.6.2: override 되돌리기
+            // override 되돌리기
             const revertBtn = e.target.closest('.tw-btn-revert-final');
             if (revertBtn) {
                 const id = normalizeId(revertBtn.dataset.id);
@@ -4514,7 +4545,7 @@
         if (el) el.textContent = message;
     }
 
-    // v0.6.8 (A1): 실패 ID 칩/토글 영역 갱신
+    // 실패 ID 칩/토글 영역 갱신
     function refreshFailedChips() {
         if (!modalEl) return;
         const wrap = $('.tw-review-failed-chips', modalEl);
@@ -4539,7 +4570,7 @@
         wrap.innerHTML = preview + more;
     }
 
-    // v0.6.8 (A1): 특정 review row로 스크롤 + 짧은 하이라이트
+    // 특정 review row로 스크롤 + 짧은 하이라이트
     function scrollToReviewRow(id) {
         if (!modalEl) return false;
         const norm = normalizeId(id);
@@ -4706,7 +4737,7 @@
         return `주의 필요${counts}${issueStr}`;
     }
 
-    // v0.6.9 (G1-d): 배치 패널 카드용 요약 통계 — 순수 함수, run만 보고 집계
+    // 배치 패널 카드용 요약 통계 — 순수 함수, run만 보고 집계
     // 반환 구조:
     //   { segments, phase3:{state,actual,expected}, phase45:{state,changed,kept,total},
     //     warns:{charLimit,order,tb,total}, applied:{count,drifted,unknown}, lastError }
@@ -4806,7 +4837,7 @@
         renderReviewTable();
     }
 
-    // v0.6.9 hotfix2: 사용 모델/프롬프트 미니 표시
+    // 사용 모델/프롬프트 미니 표시
     function renderBatchConfigRow(run) {
         const el = $('.tw-batch-config-row', modalEl);
         if (!el) return;
@@ -4843,7 +4874,7 @@
         if (overlay) overlay.classList.add('tw-hidden');
     }
 
-    // v0.6.9 (G1-a): 활성 run 헤더 카드
+    // 활성 run 헤더 카드
     function renderBatchRunHeader(run) {
         const el = $('.tw-batch-run-header', modalEl);
         const subtitleEl = $('.tw-batch-meta', modalEl);
@@ -4872,7 +4903,7 @@
         `;
     }
 
-    // v0.6.9 (G1-b): Phase stepper — 단계별 상태 시각화
+    // Phase stepper — 단계별 상태 시각화
     function renderBatchPhaseStepper(run) {
         const el = $('.tw-batch-stepper', modalEl);
         if (!el) return;
@@ -4949,7 +4980,7 @@
         return `${a || 0}/${e || 0}`;
     }
 
-    // v0.6.9 (G1-d): 수집/검증 결과 카드 — 클릭 시 review 탭 필터 자동 적용
+    // 수집/검증 결과 카드 — 클릭 시 review 탭 필터 자동 적용
     function renderBatchSummaryCards(run) {
         const el = $('.tw-batch-summary-cards', modalEl);
         if (!el) return;
@@ -5061,7 +5092,7 @@
         return out;
     }
 
-    // v0.6.9 (G1-d): 카드 클릭 → review 탭으로 이동 + 필터 적용
+    // 카드 클릭 → review 탭으로 이동 + 필터 적용
     function onBatchSummaryCardClick(e) {
         const card = e.target.closest('.tw-summary-card.tw-summary-clickable');
         if (!card) return;
@@ -5150,7 +5181,7 @@
             return;
         }
 
-        // v0.6.7 (D1): 레벨 필터/검색 적용
+        // 레벨 필터/검색 적용
         const logLines = buildFilteredLogLines(run.logs, logView.level, logView.query);
         const jsonBlocks = [];
         if (run.lastError) jsonBlocks.push(`\n\n=== Last error ===\n${run.lastError}`);
@@ -5185,7 +5216,7 @@
         }
     }
 
-    // v0.6.7 (D1): 로그 레벨/검색/다운로드 핸들러
+    // 로그 레벨/검색/다운로드 핸들러
     function onLogLevelChange(e) { logView.level = (e.target.value || 'all').toLowerCase(); renderLogOutput(); }
     function onLogSearchInput(e) { logView.query = String(e.target.value || ''); renderLogOutput(); }
     function onDownloadLog() {
@@ -5223,7 +5254,7 @@
         renderHistoryPanel();
     }
 
-    // v0.6.7 (C2): 비교 표 렌더 — current vs prior run, 같은 project/file/language
+    // 비교 표 렌더 — current vs prior run, 같은 project/file/language
     function renderCompareTable(currentRun, summaryEl, tableEl) {
         const runs = lsGet(LS_KEYS.BATCH_RUNS, {}) || {};
         const prior = runs[reviewView.compareRunId];
@@ -5271,7 +5302,7 @@
             <div class="tw-compare-table">${head}${body}</div>`;
     }
 
-    // v0.6.7 (C3): 현재 run을 JSON / CSV로 다운로드
+    // 현재 run을 JSON / CSV로 다운로드
     function onExportRunJson() {
         const run = batchRun || restoreActiveBatchRun();
         if (!run) { toast('활성 batch run이 없어 내보낼 데이터가 없습니다.', 'info'); return; }
@@ -5293,7 +5324,7 @@
         appendBatchLog(`현재 run을 CSV로 내보냄 (${lineCount}행)`, 'info');
     }
 
-    // v0.6.10 E1: override export/import
+    // override export/import
     function onExportOverrides() {
         const all = loadReviewOverrides() || {};
         const runIds = Object.keys(all);
@@ -5579,7 +5610,7 @@
     function getBatchFinalText(id) {
         const run = batchRun || restoreActiveBatchRun();
         if (!run?.phase3?.parsed || !run.phase3.validation?.ok) return '';
-        // v0.6.2: 사용자 인라인 수정 override 우선
+        // 사용자 인라인 수정 override 우선
         const override = getReviewOverride(run.runId, id);
         if (typeof override === 'string') return override;
         const phase3 = (run.phase3.parsed.translations || []).find(item => normalizeId(item.id) === normalizeId(id));
@@ -5590,7 +5621,7 @@
         return revision && revision.t !== null ? String(revision.t || '') : String(phase3.t || '');
     }
 
-    // v0.6.2: 최종 후보 직접 수정 — v0.7.6 (#5) 부터는 인라인 textarea 대신 모달로 전환.
+    // 최종 후보 직접 수정 — v0.7.6 (#5) 부터는 인라인 textarea 대신 모달로 전환.
     //  - 좌측: 원문 / Phase3 / Phase4+5 (read-only)
     //  - 우측: 최종 후보 textarea (편집)
     // 단축키: Ctrl/Cmd+Enter 저장, Esc 취소
@@ -5790,7 +5821,7 @@
             .filter(id => Number.isFinite(Number(id)));
     }
 
-    // v0.6.5 (A1): Phase 4+5에서 실제 수정이 일어났거나 직접 수정된 ID만 (no-op 유지는 제외)
+    // Phase 4+5에서 실제 수정이 일어났거나 직접 수정된 ID만 (no-op 유지는 제외)
     function getEditedReviewIds() {
         const run = batchRun || restoreActiveBatchRun();
         if (!run?.phase3?.parsed || !run.phase3.validation?.ok) return [];
@@ -5805,7 +5836,7 @@
         return ids;
     }
 
-    // v0.6.5 (A4): 단어 단위 diff (Korean/CJK 안전 — 공백/문장부호 분할 LCS)
+    // 단어 단위 diff (Korean/CJK 안전 — 공백/문장부호 분할 LCS)
     function tokenizeForDiff(text) {
         return String(text || '').split(/(\s+|[.,!?…·\-\/()\[\]{}'"`~:;])/).filter(t => t.length > 0);
     }
@@ -5865,7 +5896,7 @@
         }
 
         injectTextareaValue(textarea, text);
-        // v0.6.0 L3: 적용 성공 기록 (drift 감지 용)
+        // 적용 성공 기록 (drift 감지 용)
         try {
             const run = batchRun || restoreActiveBatchRun();
             if (run?.runId) {
@@ -5890,7 +5921,7 @@
         const failures = [];
         const total = uniqueIds.length;
         updateReviewApplyStatus(`${total}개 입력 시작...`);
-        // v0.6.5 (A1): 일괄 입력 시작 토스트 (1개일 때는 생략)
+        // 일괄 입력 시작 토스트 (1개일 때는 생략)
         if (total > 1) toast(`${total}개 일괄 입력을 시작합니다.`, 'info', 2500);
 
         for (let i = 0; i < uniqueIds.length; i += 1) {
@@ -5919,14 +5950,14 @@
         }
         updateReviewApplyStatus(message);
         toast(message, failures.length ? 'info' : 'success', 4500);
-        // v0.6.8 (A1): 실패 ID를 reviewView에 보존하고 칩 영역을 갱신
+        // 실패 ID를 reviewView에 보존하고 칩 영역을 갱신
         reviewView.lastFailedIds = failures.map(f => normalizeId(f.id));
         if (!reviewView.lastFailedIds.length) reviewView.showOnlyFailed = false;
-        // v0.6.5: 입력 후 applied 배지/필터 갱신
+        // 입력 후 applied 배지/필터 갱신
         if (success > 0 || failures.length > 0) renderReviewTable();
     }
 
-    // v0.6.6 (B1): 고아 override 정리 클릭 핸들러
+    // 고아 override 정리 클릭 핸들러
     async function onReviewOverrideGc() {
         const all = loadReviewOverrides();
         const totalRuns = Object.keys(all).length;
@@ -5964,7 +5995,7 @@
         renderReviewTable();
     }
 
-    // v0.6.0 L2: review 행 → chat 탭 점프 (단일 세그먼트 다듬기 모드)
+    // review 행 → chat 탭 점프 (단일 세그먼트 다듬기 모드)
     async function onChatRefineFromReview(stringId) {
         const id = normalizeId(stringId);
         const run = batchRun || restoreActiveBatchRun();
@@ -6009,16 +6040,16 @@
 
     function renderReviewTable() {
         if (!modalEl) return;
-        // v0.6.10 F1: 렌더 시작 시각 기록 (대량 run 감시용)
+        // 렌더 시작 시각 기록 (대량 run 감시용)
         renderReviewTable._t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
         const summaryEl = $('.tw-review-summary', modalEl);
         const tableEl = $('.tw-review-table', modalEl);
         if (!summaryEl || !tableEl) return;
         const run = batchRun || restoreActiveBatchRun();
 
-        // v0.6.7 (C2): 비교 select 옵션 갱신 (run 변경/재렌더 시 동기화)
+        // 비교 select 옵션 갱신 (run 변경/재렌더 시 동기화)
         refreshCompareSelect(run);
-        // v0.6.8 (A1): 일괄 입력 실패 ID 칩/토글 갱신
+        // 일괄 입력 실패 ID 칩/토글 갱신
         refreshFailedChips();
 
         if (!run?.phase3?.parsed) {
@@ -6034,7 +6065,7 @@
             return;
         }
 
-        // v0.6.7 (C2): 비교 모드 — 검토 표 자리에 비교 표를 렌더하고 종료
+        // 비교 모드 — 검토 표 자리에 비교 표를 렌더하고 종료
         if (reviewView.compareMode && reviewView.compareRunId) {
             renderCompareTable(run, summaryEl, tableEl);
             return;
@@ -6047,7 +6078,7 @@
         const segmentById = new Map((run.segments || []).map(seg => [normalizeId(seg.id), seg]));
         const changedCount = revisions.filter(item => item.t !== null).length;
 
-        // v0.6.1 P3: applied 기록 집계 (현 run에 속한 것만)
+        // applied 기록 집계 (현 run에 속한 것만)
         let appliedCount = 0;
         let driftedCount = 0;
         let unknownCount = 0;
@@ -6073,7 +6104,7 @@
             ? `자동 적용 ${appliedCount}개 (수정 ${driftedCount}, 확인 불가 ${unknownCount})`
             : '자동 적용 없음';
 
-        // v0.6.5 (A3): 필터/정렬 컨트롤 동기화 + 분류 메타 사전 계산
+        // 필터/정렬 컨트롤 동기화 + 분류 메타 사전 계산
         const filterSel = $('.tw-review-filter', modalEl);
         const sortSel = $('.tw-review-sort', modalEl);
         if (filterSel && filterSel.value !== reviewView.filter) filterSel.value = reviewView.filter;
@@ -6083,7 +6114,7 @@
         const phase45Validation = run.phase45?.validation || {};
         const missingPlaceholderIds = new Set((phase45Validation.missingPlaceholders || []).map(item => normalizeId(item.id)));
         const hanjaIds = new Set((phase45Validation.hanjaLike || []).map(id => normalizeId(id)));
-        // v0.6.6 (B3): warn-only 분류 (phase45 우선, 없으면 phase3로 폴백)
+        // warn-only 분류 (phase45 우선, 없으면 phase3로 폴백)
         const warnSource = (phase45Validation.warnings ? phase45Validation : (run.phase3?.validation || {})).warnings || {};
         const warnCharLimitIds = new Set((warnSource.charLimitOver || []).map(w => normalizeId(w.id)));
         const warnOrderIds = new Set((warnSource.placeholderOrderMismatch || []).map(w => normalizeId(w.id)));
@@ -6206,7 +6237,7 @@
             const finalText = getBatchFinalText(id);
             const isEffectiveKeep = d.isEffectiveKeep;
             const revisionText = revision && !isEffectiveKeep ? String(revision.t || '') : '';
-            // v0.6.2: flag chip (action 셀에서 분리, Phase 4+5 셀로 이동)
+            // flag chip (action 셀에서 분리, Phase 4+5 셀로 이동)
             let flagChipClass = 'tw-review-flag-chip';
             let flagChipText;
             if (revision) {
@@ -6215,7 +6246,7 @@
             } else {
                 flagChipText = 'Phase3';
             }
-            // v0.6.2: override 적용 여부
+            // override 적용 여부
             const hasOverride = d.hasOverride;
             const overrideChip = hasOverride
                 ? `<span class="tw-review-flag-chip tw-review-flag-edit" title="사용자가 직접 수정한 최종 후보">✏️ 직접 수정</span>`
@@ -6224,7 +6255,7 @@
             const chatBadge = workState.chat.hasSession
                 ? `<span class="tw-review-chat-badge" title="채팅 세션 ${workState.chat.messageCount}개 메시지">💬</span>`
                 : '';
-            // v0.6.0 L3: applied-from-batch 배지
+            // applied-from-batch 배지
             let appliedBadge = '';
             if (d.appliedActive) {
                 const applied = getAppliedFromBatch(id);
@@ -6233,11 +6264,11 @@
                 const icon = d.appliedState === 'drifted' ? '🤖→✏️' : d.appliedState === 'unknown' ? '🤖❓' : '🤖';
                 appliedBadge = ` <span class="tw-review-applied-badge" title="${escapeHtml(tip)}">${icon}</span>`;
             }
-            // v0.6.5 (A4): revisionText가 있으면 phase3 ↔ revision diff로 렌더
+            // revisionText가 있으면 phase3 ↔ revision diff로 렌더
             const revisionHtml = revisionText
                 ? `<div class="tw-review-text" title="phase3 대비 변경: 초록=추가, 빨강=삭제">${renderDiffHtml(diffWords(item.t || '', revisionText))}</div>`
                 : '';
-            // v0.6.6 (B3): warn-only chip들 (final 셀에 부착)
+            // warn-only chip들 (final 셀에 부착)
             const warnChips = [];
             if (d.warnCharLimit) {
                 const w = (warnSource.charLimitOver || []).find(x => normalizeId(x.id) === id);
@@ -6321,7 +6352,7 @@
         }
 
         updateReviewApplyStatus('입력은 textarea 값 주입까지만 수행합니다.');
-        // v0.6.10 F1: 대용량 run 감시 (200+ 항목일 때 콘솔에 렌더 시간 기록)
+        // 대용량 run 감시 (200+ 항목일 때 콘솔에 렌더 시간 기록)
         if (descriptors.length >= 200) {
             const dt = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - (renderReviewTable._t0 || 0);
             dverbose(`renderReviewTable: ${descriptors.length}개 행 / ${dt.toFixed(1)}ms (filtered=${filtered.length})`);
@@ -6399,7 +6430,7 @@
 
     function validateParsedPhase(run, phaseTag, parsed) {
         if (phaseTag === '1+2') return validatePhase12Compact(parsed, run.segments);
-        // v0.6.6 (B3): warn-only 추가 검증을 위해 visible TB term 매핑 주입 (DOM 의존 — 없으면 빈 Map)
+        // warn-only 추가 검증을 위해 visible TB term 매핑 주입 (DOM 의존 — 없으면 빈 Map)
         let tbTerms;
         try { tbTerms = extractVisibleTbTerms(); } catch (_) { tbTerms = new Map(); }
         const opts = { tbTerms };
@@ -6439,7 +6470,7 @@
             return;
         }
 
-        // v0.6.5 (B2): override 보호 — phase 재실행은 최종 후보에 영향 줄 수 있음
+        // override 보호 — phase 재실행은 최종 후보에 영향 줄 수 있음
         if ((phaseTag === '3' || phaseTag === '4+5') && run.runId) {
             const overrideCount = countReviewOverridesForRun(run.runId);
             if (overrideCount > 0) {
@@ -6555,7 +6586,7 @@
     }
 
     // ========================================================================
-    // 모달 Show/Hide + 세그먼트 로드 + 자동 감지 폴링
+    // §18 모달 Show/Hide + 세그먼트 로드 + 자동 감지 폴링
     // ========================================================================
     let segmentWatcherId = null;
     // race 가드: 이전 watcher의 in-flight loadSegmentInfo()가 다음 watcher가 시작된 뒤
@@ -6735,14 +6766,14 @@
     }
 
     // ========================================================================
-    // 채팅 흐름
+    // §19 채팅 흐름
     // ========================================================================
     function renderChatHistory() {
         const messagesEl = $('.tw-chat-messages', modalEl);
         const session = getSession(currentStringId);
         messagesEl.innerHTML = '';
 
-        // v0.6.0 L1: batch import 시드 배지 노출
+        // batch import 시드 배지 노출
         // v0.7.8 (#3): runId가 있으면 클릭 가능한 태그로 표시 — review 탭 점프
         if (session.system && session.source === 'batch_import') {
             const runId = session.importedFromRunId || '';
@@ -6791,7 +6822,7 @@
         const msg = document.createElement('div');
         msg.className = `tw-msg tw-msg-${role}`;
         const label = role === 'user' ? '나' : role === 'ai' ? 'AI' : '';
-        // v0.6.10 C2-신: AI 메시지마다 인라인 적용/복사 액션 부착
+        // AI 메시지마다 인라인 적용/복사 액션 부착
         // v0.7.8 (#1): "✓ override 굳히기" 추가 — 채팅 결과를 현재 run의 review override로 반영
         const actions = role === 'ai'
             ? `<div class="tw-msg-actions">
@@ -6920,7 +6951,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         toast('세션 초기화됨', 'success');
     }
 
-    // v0.6.10 C2-신: AI 메시지 인라인 액션 (셀로 적용 / 복사)
+    // AI 메시지 인라인 액션 (셀로 적용 / 복사)
     function onChatMessageAction(e) {
         // v0.7.8 (#3): runId 태그 클릭 → review 탭 점프
         const runTag = e.target.closest('.tw-chat-runid-tag');
@@ -7064,7 +7095,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         // 값 주입
         try {
             injectTextareaValue(textarea, translation);
-            // v0.6.0 L3: chat에서 채택한 순간 출처가 batch→chat으로 전환되므로 applied 기록 제거
+            // chat에서 채택한 순간 출처가 batch→chat으로 전환되므로 applied 기록 제거
             try { clearAppliedFromBatch(currentStringId); } catch (err) { console.warn('[TMS-WF] applied 기록 제거 실패', err); }
             toast('번역 입력창에 채웠습니다. 확인 후 저장하세요.', 'success');
             dverbose('textarea 주입 완료:', translation.slice(0, 50) + '...');
@@ -7076,7 +7107,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
     }
 
     // ========================================================================
-    // 시스템 프롬프트 설정 패널
+    // §20 시스템 프롬프트 설정 패널
     // ========================================================================
     function showSettingsPanel() {
         if ($('.tw-settings-overlay', modalEl)) return;
@@ -8118,7 +8149,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
     }
 
     // ========================================================================
-    // 단축키 등록 (Alt+Z)
+    // §21 단축키 등록 (Alt+Z) + 디버그 export
     // ========================================================================
     document.addEventListener('keydown', (e) => {
         // Alt+Z (Mac에선 Option+Z, key가 'Ω'일 수 있음)
@@ -8179,7 +8210,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    // v0.6.6 (D3): node 테스트 환경에서만 내부 순수 함수를 노출 (브라우저에서는 영향 없음)
+    // node 테스트 환경에서만 내부 순수 함수를 노출 (브라우저에서는 영향 없음)
     if (typeof globalThis !== 'undefined' && globalThis.__TMS_TEST_HOOK__) {
         globalThis.__TMS_TEST_EXPORTS__ = {
             // validators
@@ -8191,11 +8222,11 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             getReviewOverride, setReviewOverride, clearReviewOverride,
             loadReviewOverrides, saveReviewOverrides, countReviewOverridesForRun,
             gcOrphanReviewOverrides,
-            // v0.6.7 (C2/C3/D1): export/compare/log 헬퍼
+            // export/compare/log 헬퍼
             findPriorRunsForCurrent, buildRunCompareRows,
             buildCsvFromRun, buildJsonExportFromRun,
             buildFilteredLogLines,
-            // v0.6.9 (G1-d): 배치 패널 카드 통계
+            // 배치 패널 카드 통계
             buildBatchSummaryStats,
             // misc
             escapeHtml, LS_KEYS,
