@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.6
+// @version      0.7.7
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -31,7 +31,26 @@
         APPLIED_FROM_BATCH: 'tms_workflow_applied_from_batch_v1', // v0.6.0 L3: textarea가 배치에서 자동 적용된 세그먼트 추적
         REVIEW_OVERRIDES: 'tms_workflow_review_overrides_v1', // v0.6.2: 사용자가 리뷰 탭에서 직접 수정한 최종 후보 (run+id 키)
         COMPACT_MODE: 'tms_workflow_compact_mode_v1', // v0.7.6 (#4): 배치 패널 컴팩트 모드 (stepper + 카드 접기)
+        SCHEMA_VERSION: 'tms_workflow_schema_version', // v0.7.7 (#10): LS 스키마 버전 가드 (정수). 향후 마이그레이션 분기점.
+        BACKUP_NEXT_SLOT: 'tms_workflow_backup_next_slot', // v0.7.7 (#12): IDB ring 안의 다음 쓸 slot 인덱스 (0..N-1)
+        OVERRIDE_WRITE_COUNTER: 'tms_workflow_override_write_counter', // v0.7.7 (#12): override 쓰기 누적 카운터 (threshold마다 backup trigger)
     };
+
+    // v0.7.7 (#10): 현재 스키마 버전. 신규 LS key/필드를 추가하거나 기존 구조를 변경할 때 +1.
+    // 마이그레이션 step은 SCHEMA_MIGRATIONS에 등록한다 (현재는 비어 있음 — infra만 도입).
+    const CURRENT_SCHEMA_VERSION = 1;
+    const SCHEMA_MIGRATIONS = {
+        // 예: 2: function migrateTo2() { /* mutate LS keys */ },
+    };
+
+    // v0.7.7 (#12): IndexedDB ring 백업 설정. LS 손실(quota/수동 삭제/다른 유저스크립트 충돌) 시 복구용.
+    // 대상: REVIEW_OVERRIDES 전체 + BATCH_RUNS (raw 제외) + SESSIONS 전체. raw segments/raw LLM 응답은 백업하지 않음 (크기 이유).
+    // trigger: override 수정 누적 OVERRIDE_BACKUP_THRESHOLD회 또는 phase45 완료.
+    const BACKUP_DB_NAME = 'tms-workflow-backup';
+    const BACKUP_DB_VERSION = 1;
+    const BACKUP_STORE = 'snapshots';
+    const BACKUP_SLOT_COUNT = 5;
+    const OVERRIDE_BACKUP_THRESHOLD = 10;
 
     const DEFAULT_PROMPT = {
         id: 'default',
@@ -135,6 +154,54 @@
         catch (e) { console.error('[TMS Workflow] localStorage write failed', e); }
     }
 
+    // v0.7.7 (#10): LS 스키마 버전 가드.
+    // - 저장된 버전이 없으면(=신규 설치 또는 v0.7.6 이전) CURRENT로 도장만 찍는다.
+    // - 저장 버전 < CURRENT: SCHEMA_MIGRATIONS의 step을 순서대로 실행 후 도장 갱신.
+    // - 저장 버전 > CURRENT: 다운그레이드 시나리오. 스키마 변경 없이 경고만 남긴다 (데이터 보존 우선).
+    function ensureSchemaVersion() {
+        let stored;
+        try { stored = lsGet(LS_KEYS.SCHEMA_VERSION, null); } catch { stored = null; }
+        if (stored == null) {
+            lsSet(LS_KEYS.SCHEMA_VERSION, CURRENT_SCHEMA_VERSION);
+            return { migrated: false, from: null, to: CURRENT_SCHEMA_VERSION };
+        }
+        const from = Number(stored);
+        if (!Number.isInteger(from) || from < 0) {
+            console.warn('[TMS Workflow] schema version invalid, resetting to current', stored);
+            lsSet(LS_KEYS.SCHEMA_VERSION, CURRENT_SCHEMA_VERSION);
+            return { migrated: false, from: null, to: CURRENT_SCHEMA_VERSION };
+        }
+        if (from > CURRENT_SCHEMA_VERSION) {
+            console.warn(`[TMS Workflow] stored schema (v${from}) is newer than this script (v${CURRENT_SCHEMA_VERSION}). 데이터 변경 없이 진행합니다.`);
+            return { migrated: false, from, to: from, downgrade: true };
+        }
+        if (from === CURRENT_SCHEMA_VERSION) {
+            return { migrated: false, from, to: from };
+        }
+        // from < CURRENT: 마이그레이션 실행
+        let cur = from;
+        while (cur < CURRENT_SCHEMA_VERSION) {
+            const next = cur + 1;
+            const step = SCHEMA_MIGRATIONS[next];
+            if (typeof step !== 'function') {
+                console.warn(`[TMS Workflow] migration step v${next} 없음 — 스키마 도장만 갱신합니다.`);
+                cur = next;
+                continue;
+            }
+            try {
+                step();
+                cur = next;
+            } catch (e) {
+                console.error(`[TMS Workflow] migration v${cur}→v${next} 실패`, e);
+                // 실패 시 도장 갱신 중단 → 다음 실행에서 재시도
+                lsSet(LS_KEYS.SCHEMA_VERSION, cur);
+                return { migrated: true, from, to: cur, error: e };
+            }
+        }
+        lsSet(LS_KEYS.SCHEMA_VERSION, cur);
+        return { migrated: true, from, to: cur };
+    }
+
     function escapeHtml(s) {
         if (s == null) return '';
         return String(s)
@@ -182,6 +249,26 @@
     function dinfo(...args) { if (LOG_RANK >= 3) console.log(LOG_TAG, ...args); }
     function dwarn(...args) { if (LOG_RANK >= 2) console.warn(LOG_TAG, ...args); }
     function derror(...args) { if (LOG_RANK >= 1) console.error(LOG_TAG, ...args); }
+
+    // v0.7.7 (#13): 민감 데이터 마스킹.
+    // 에러 메시지가 toast/배치 로그/스크린샷으로 새어나갈 때 응답 본문을 그대로 노출하지 않는다.
+    // - 기본: { length, hash, head: 첫 N자 } 요약 문자열 반환
+    // - verbose 모드(LOG_RANK >= 4): 원문 그대로 반환 (디버깅용)
+    // hash는 의존성 없이 빠른 djb2 32bit hex (식별/대조용, 보안용 아님)
+    function maskSensitive(value, { headChars = 80, force = false } = {}) {
+        if (value == null) return '<null>';
+        const s = typeof value === 'string' ? value : (() => {
+            try { return JSON.stringify(value); } catch { return String(value); }
+        })();
+        if (!force && LOG_RANK >= 4) return s; // verbose: 그대로
+        const len = s.length;
+        let h = 5381;
+        for (let i = 0; i < len; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+        const hex = (h >>> 0).toString(16).padStart(8, '0');
+        const head = s.slice(0, headChars).replace(/\s+/g, ' ').trim();
+        const ellipsis = len > headChars ? '…' : '';
+        return `len=${len} hash=${hex} head="${head}${ellipsis}"`;
+    }
     // 사용자가 콘솔에서 즉시 토글 — window.tmsLog('verbose') / 'silent' 등
     try {
         window.tmsLog = function (level) {
@@ -260,20 +347,25 @@
         const isJson = contentType.includes('application/json') || contentType.includes('+json');
         if (!isJson) {
             const text = await res.text().catch(() => '');
-            const snippet = String(text || '').slice(0, 200).replace(/\s+/g, ' ').trim();
+            // v0.7.7 (#13): 응답 본문은 maskSensitive로 요약. verbose 모드에서만 원문 노출.
             const looksLikeLogin = /<form[^>]*login|<title[^>]*\bsign\s*in|csrf|\u767b\u5f55|\ub85c\uadf8\uc778/i.test(text);
             const hint = looksLikeLogin ? ' (로그인 세션 만료 가능성)' : '';
-            throw new Error(`API 응답이 JSON이 아닙니다 [${res.status}] content-type=${contentType || 'none'}${hint}: ${snippet}`);
+            const summary = maskSensitive(text);
+            throw new Error(`API 응답이 JSON이 아닙니다 [${res.status}] content-type=${contentType || 'none'}${hint}: ${summary}`);
         }
 
         let data;
         try {
             data = await res.json();
         } catch (error) {
-            throw new Error(`API JSON 파싱 실패 [${res.status}]: ${error.message}`);
+            // v0.7.7 (#13): 파서 에러 메시지에는 인덱스 등 위치 힌트가 들어 있어 보통 안전하지만 길이 제한.
+            throw new Error(`API JSON 파싱 실패 [${res.status}]: ${maskSensitive(error.message, { headChars: 120 })}`);
         }
         if (!res.ok || data.result === false) {
-            throw new Error(`API 오류: ${res.status} ${data.message || ''}`);
+            // v0.7.7 (#13): server message 자체도 마스킹 (에러 본문에 ID/path 노출 가능)
+            const rawMsg = data && (data.message || data.error || data.detail);
+            const msgPart = rawMsg ? ` ${maskSensitive(String(rawMsg), { headChars: 160 })}` : '';
+            throw new Error(`API 오류: ${res.status}${msgPart}`);
         }
         return data;
     }
@@ -1102,6 +1194,171 @@
     }
 
     // ========================================================================
+    // v0.7.7 (#12): IndexedDB ring 백업
+    // - 5 slot ring buffer. nextSlot은 LS에 보관(IDB 실패 시에도 진행).
+    // - snapshot 내용: sessions(전체) + overrides(전체) + runs(메타+parsed only, raw 제외)
+    // - trigger: override 누적 N회, 또는 phase45 완료, 또는 수동.
+    // - restore: LS의 sessions/runs/overrides가 모두 비어 있을 때만 prompt.
+    // ========================================================================
+    let _backupDbPromise = null;
+    function openBackupDb() {
+        if (_backupDbPromise) return _backupDbPromise;
+        if (typeof indexedDB === 'undefined') {
+            _backupDbPromise = Promise.reject(new Error('IndexedDB unavailable'));
+            return _backupDbPromise;
+        }
+        _backupDbPromise = new Promise((resolve, reject) => {
+            let req;
+            try { req = indexedDB.open(BACKUP_DB_NAME, BACKUP_DB_VERSION); }
+            catch (e) { reject(e); return; }
+            req.onupgradeneeded = (ev) => {
+                const db = ev.target.result;
+                if (!db.objectStoreNames.contains(BACKUP_STORE)) {
+                    db.createObjectStore(BACKUP_STORE, { keyPath: 'slot' });
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error || new Error('IDB open failed'));
+            req.onblocked = () => reject(new Error('IDB open blocked'));
+        });
+        return _backupDbPromise;
+    }
+
+    function _idbReq(req) {
+        return new Promise((resolve, reject) => {
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    async function writeBackupSlot(snapshot) {
+        const db = await openBackupDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(BACKUP_STORE, 'readwrite');
+            tx.oncomplete = () => resolve(snapshot.slot);
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error || new Error('tx aborted'));
+            tx.objectStore(BACKUP_STORE).put(snapshot);
+        });
+    }
+
+    async function readAllBackupSlots() {
+        const db = await openBackupDb();
+        const tx = db.transaction(BACKUP_STORE, 'readonly');
+        const all = await _idbReq(tx.objectStore(BACKUP_STORE).getAll());
+        return Array.isArray(all) ? all : [];
+    }
+
+    async function getLatestBackupSnapshot() {
+        const all = await readAllBackupSlots().catch(() => []);
+        if (!all.length) return null;
+        all.sort((a, b) => String(b.savedAt || '').localeCompare(String(a.savedAt || '')));
+        return all[0];
+    }
+
+    function _stripRunForBackup(run) {
+        if (!run || typeof run !== 'object') return run;
+        const out = { ...run };
+        // raw segments: 무겁고 서버에서 다시 받을 수 있음 — 백업 제외
+        delete out.segments;
+        // phase raw text도 제외 (parsed 만 보존)
+        for (const k of ['phase12', 'phase3', 'phase45']) {
+            if (out[k] && typeof out[k] === 'object') {
+                const phase = { ...out[k] };
+                delete phase.raw;
+                out[k] = phase;
+            }
+        }
+        return out;
+    }
+
+    function buildBackupSnapshot(trigger = 'manual') {
+        const sessions = (() => { try { return loadSessions(); } catch { return {}; } })();
+        const overrides = (() => { try { return loadReviewOverrides(); } catch { return {}; } })();
+        const runsRaw = (() => { try { return loadBatchRuns(); } catch { return {}; } })();
+        const runs = {};
+        for (const [id, r] of Object.entries(runsRaw)) {
+            runs[id] = _stripRunForBackup(r);
+        }
+        return {
+            // slot은 호출부에서 결정
+            savedAt: new Date().toISOString(),
+            schemaVersion: CURRENT_SCHEMA_VERSION,
+            trigger: String(trigger),
+            sessions,
+            overrides,
+            runs,
+        };
+    }
+
+    function _nextBackupSlot() {
+        const cur = Number(lsGet(LS_KEYS.BACKUP_NEXT_SLOT, 0)) || 0;
+        const slot = ((cur % BACKUP_SLOT_COUNT) + BACKUP_SLOT_COUNT) % BACKUP_SLOT_COUNT;
+        lsSet(LS_KEYS.BACKUP_NEXT_SLOT, (slot + 1) % BACKUP_SLOT_COUNT);
+        return slot;
+    }
+
+    // fire-and-forget. 실패해도 운영에는 영향 없음 (LS가 source of truth).
+    function triggerBackupAsync(trigger = 'manual') {
+        try {
+            const snap = buildBackupSnapshot(trigger);
+            snap.slot = _nextBackupSlot();
+            writeBackupSlot(snap)
+                .then(() => dverbose(`backup slot ${snap.slot} 작성 (${trigger})`))
+                .catch((e) => dwarn('IDB backup 실패', e));
+        } catch (e) {
+            dwarn('backup snapshot 빌드 실패', e);
+        }
+    }
+
+    function _bumpOverrideWriteCounter() {
+        const cur = Number(lsGet(LS_KEYS.OVERRIDE_WRITE_COUNTER, 0)) || 0;
+        const next = cur + 1;
+        if (next >= OVERRIDE_BACKUP_THRESHOLD) {
+            lsSet(LS_KEYS.OVERRIDE_WRITE_COUNTER, 0);
+            triggerBackupAsync('override-batch');
+        } else {
+            lsSet(LS_KEYS.OVERRIDE_WRITE_COUNTER, next);
+        }
+    }
+
+    // 모달 진입 시 호출. LS가 비어 있고 IDB에 백업이 있을 때만 사용자에게 복원 prompt.
+    async function maybeRestoreFromBackup() {
+        let sessions = {}, overrides = {}, runs = {};
+        try { sessions = loadSessions(); } catch {}
+        try { overrides = loadReviewOverrides(); } catch {}
+        try { runs = loadBatchRuns(); } catch {}
+        const lsEmpty = !Object.keys(sessions).length
+            && !Object.keys(overrides).length
+            && !Object.keys(runs).length;
+        if (!lsEmpty) return false;
+        const snap = await getLatestBackupSnapshot().catch(() => null);
+        if (!snap) return false;
+        const sCount = snap.sessions ? Object.keys(snap.sessions).length : 0;
+        const oCount = snap.overrides ? Object.keys(snap.overrides).length : 0;
+        const rCount = snap.runs ? Object.keys(snap.runs).length : 0;
+        if (sCount + oCount + rCount === 0) return false;
+        const ok = await twConfirm({
+            title: 'IDB 백업 복원',
+            message: `로컬 저장소가 비어 있는데 IDB에 백업이 남아 있습니다 (${snap.savedAt?.slice(0, 19) || '?'}, trigger=${snap.trigger}).\n`
+                + `복원: 세션 ${sCount}개 / override ${oCount}개 / run ${rCount}개\n\n`
+                + '복원하시겠습니까? (취소하면 빈 상태로 진행)',
+        });
+        if (!ok) return false;
+        try {
+            if (snap.sessions) saveSessions(snap.sessions);
+            if (snap.overrides) saveReviewOverrides(snap.overrides);
+            if (snap.runs) saveBatchRuns(snap.runs);
+            toast(`IDB 백업 복원: 세션 ${sCount} / override ${oCount} / run ${rCount}`, 'success');
+            return true;
+        } catch (e) {
+            derror('IDB 복원 실패', e);
+            toast(`복원 실패: ${e.message}`, 'error');
+            return false;
+        }
+    }
+
+    // ========================================================================
     // 시스템 프롬프트 관리
     // ========================================================================
     function loadPrompts() {
@@ -1377,6 +1634,7 @@
         const bucket = all[runId] || (all[runId] = {});
         bucket[normalizeId(stringId)] = { text: String(text ?? ''), updatedAt: Date.now() };
         saveReviewOverrides(all);
+        try { _bumpOverrideWriteCounter(); } catch (e) { dwarn('backup counter bump 실패', e); }
     }
     function clearReviewOverride(runId, stringId) {
         if (!runId) return;
@@ -1386,6 +1644,7 @@
         delete bucket[normalizeId(stringId)];
         if (!Object.keys(bucket).length) delete all[runId];
         saveReviewOverrides(all);
+        try { _bumpOverrideWriteCounter(); } catch (e) { dwarn('backup counter bump 실패', e); }
     }
     // v0.6.5: 활성 run의 override 개수 계산 (phase 재실행 가드용)
     function countReviewOverridesForRun(runId) {
@@ -1808,11 +2067,16 @@
             _batchPersistTimer = null;
             _batchPersistPending = null;
         }
+        const prevStatus = (() => { try { return loadBatchRuns()[run.runId]?.status; } catch { return null; } })();
         run.updatedAt = new Date().toISOString();
         const runs = loadBatchRuns();
         runs[run.runId] = run;
         saveBatchRuns(runs);
         setActiveBatchRunId(run.runId);
+        // v0.7.7 (#12): phase45 완료 전이(신규/재시도)에만 backup trigger
+        if (run.status === 'phase45_ready' && prevStatus !== 'phase45_ready') {
+            try { triggerBackupAsync('run-complete'); } catch (e) { dwarn('run-complete backup 실패', e); }
+        }
     }
 
     // appendBatchLog 같은 핫패스얩. 다음 중요 이벤트(persistBatchRun 직호출)
@@ -3321,7 +3585,7 @@
         const prompts = loadPrompts();
         const activeId = getChatActivePromptId();
         selectEl.innerHTML = prompts.map(p =>
-            `<option value="${p.id}" ${p.id === activeId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
+            `<option value="${escapeHtml(String(p.id))}" ${p.id === activeId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
         ).join('');
         selectEl.onchange = () => syncChatPromptSelects(selectEl.value);
     }
@@ -3331,7 +3595,7 @@
         const prompts = loadPrompts();
         const activeId = getBatchActivePromptId();
         selectEl.innerHTML = prompts.map(p =>
-            `<option value="${p.id}" ${p.id === activeId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
+            `<option value="${escapeHtml(String(p.id))}" ${p.id === activeId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
         ).join('');
         selectEl.onchange = () => syncBatchPromptSelects(selectEl.value);
     }
@@ -3577,6 +3841,8 @@
 
             if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
                 e.preventDefault();
+                // v0.7.7 (#6): 청크 렌더 중이면 동기 flush로 인덱스 일관성 확보
+                try { renderReviewTable._pendingFlush && renderReviewTable._pendingFlush(); } catch {}
                 const rows = $$('.tw-review-row[data-row-id]', el);
                 const idx = rows.indexOf(row);
                 if (idx < 0) return;
@@ -5322,7 +5588,10 @@
         }
         summaryEl.classList.add('tw-review-summary-chips');
         summaryEl.innerHTML = chips.join('');
-        const rows = filtered.map(d => {
+
+        // v0.7.7 (#6): chunked render — 50행 청크 + requestIdleCallback. renderToken 으로 중단.
+        const REVIEW_CHUNK_SIZE = 50;
+        const buildRowHtml = (d) => {
             const item = d.item;
             const id = d.id;
             const seg = segmentById.get(id);
@@ -5390,12 +5659,60 @@
     <div class="tw-review-cell" data-label="최종 후보"><div class="tw-review-final-wrap" data-final-id="${escapeHtml(id)}"><div class="tw-review-final-view tw-review-text">${escapeHtml(finalText)}</div>${overrideChip}${warnChipsHtml}</div></div>
     <div class="tw-review-cell tw-review-actions" data-label="동작"><button class="tw-btn tw-btn-primary tw-btn-apply-final" data-id="${escapeHtml(id)}" title="현재 textarea에 입력">입력</button><button class="tw-btn tw-btn-ghost tw-btn-edit-final" data-id="${escapeHtml(id)}" title="최종 후보를 직접 수정">✏️</button><button class="tw-btn tw-btn-ghost tw-btn-copy-final" data-id="${escapeHtml(id)}" title="최종 후보 복사">📋</button><button class="tw-btn tw-btn-ghost tw-btn-chat-refine" data-id="${escapeHtml(id)}" title="chat 탭에서 다듬기">💬</button>${hasOverride ? `<button class="tw-btn tw-btn-ghost tw-btn-revert-final" data-id="${escapeHtml(id)}" title="직접 수정 되돌리기">↺</button>` : ''}</div>
 </div>`;
-        }).join('');
+        };
 
-        tableEl.innerHTML = `
+        const headHtml = `
 <div class="tw-review-row tw-review-head">
     <div><input class="tw-review-select-all" type="checkbox" title="전체 선택"></div><div>ID</div><div>그룹</div><div>원문</div><div>Phase 3</div><div>Phase 4+5</div><div>최종 후보</div><div>동작</div>
-</div>${rows}`;
+</div>`;
+
+        // 첫 청크는 동기 렌더 (50행 또는 전체) — 이전 토큰의 비동기 청크를 무효화
+        renderReviewTable._token = (renderReviewTable._token || 0) + 1;
+        const myToken = renderReviewTable._token;
+        const firstChunk = filtered.slice(0, REVIEW_CHUNK_SIZE).map(buildRowHtml).join('');
+        tableEl.innerHTML = headHtml + firstChunk;
+
+        // 남은 행은 청크 단위로 비동기 렌더
+        if (filtered.length > REVIEW_CHUNK_SIZE) {
+            let cursor = REVIEW_CHUNK_SIZE;
+            const total = filtered.length;
+            const renderNextChunk = (deadline) => {
+                if (renderReviewTable._token !== myToken) return; // cancelled
+                if (cursor >= total) {
+                    renderReviewTable._pendingFlush = null;
+                    return;
+                }
+                const end = Math.min(cursor + REVIEW_CHUNK_SIZE, total);
+                const chunkHtml = filtered.slice(cursor, end).map(buildRowHtml).join('');
+                tableEl.insertAdjacentHTML('beforeend', chunkHtml);
+                cursor = end;
+                if (cursor < total) {
+                    scheduleNextChunk();
+                } else {
+                    renderReviewTable._pendingFlush = null;
+                }
+            };
+            const scheduleNextChunk = () => {
+                if (typeof requestIdleCallback === 'function') {
+                    requestIdleCallback(renderNextChunk, { timeout: 200 });
+                } else {
+                    setTimeout(() => renderNextChunk({ timeRemaining: () => 0, didTimeout: true }), 0);
+                }
+            };
+            // 동기 flush hook — 키보드 ↑↓ 점프 시 남은 행을 즉시 그려 인덱스 일관성 확보
+            renderReviewTable._pendingFlush = () => {
+                if (renderReviewTable._token !== myToken) return;
+                if (cursor >= total) return;
+                const restHtml = filtered.slice(cursor).map(buildRowHtml).join('');
+                tableEl.insertAdjacentHTML('beforeend', restHtml);
+                cursor = total;
+                renderReviewTable._pendingFlush = null;
+            };
+            scheduleNextChunk();
+        } else {
+            renderReviewTable._pendingFlush = null;
+        }
+
         updateReviewApplyStatus('입력은 textarea 값 주입까지만 수행합니다.');
         // v0.6.10 F1: 대용량 run 감시 (200+ 항목일 때 콘솔에 렌더 시간 기록)
         if (descriptors.length >= 200) {
@@ -5683,6 +6000,12 @@
             return;
         }
 
+        // v0.7.7 (#10): LS 스키마 버전 가드 — 마이그레이션 step 실행 (현재는 infra만)
+        try { ensureSchemaVersion(); } catch (e) { console.warn('schema version 가드 실패', e); }
+
+        // v0.7.7 (#12): IDB 백업 자동 복원 — LS가 비어 있고 백업이 있을 때만 prompt
+        try { await maybeRestoreFromBackup(); } catch (e) { dwarn('IDB 백업 복원 체크 실패', e); }
+
         // 만료된 세션 자동 정리 (백그라운드)
         try { pruneExpiredSessions(); } catch (e) { console.warn('세션 정리 실패', e); }
 
@@ -5741,7 +6064,7 @@
                 sections.push(`
 <div class="tw-context-section">
     <div class="tw-context-label">글자수 제한</div>
-    <div class="tw-context-value">${seg.char_limit}자</div>
+    <div class="tw-context-value">${Number(seg.char_limit) || 0}자</div>
 </div>`);
             }
             if (seg.match_terms && seg.match_terms.length) {
@@ -6186,7 +6509,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 if (p.id === batchActiveId) badges.push('<span class="tw-prompt-badge tw-prompt-badge-batch" title="배치 탭에서 활성">📦</span>');
                 const badgeHtml = badges.length ? `<span class="tw-prompt-badges">${badges.join('')}</span>` : '';
                 return `<div class="tw-settings-list-item ${p.id === currentEditingId ? 'active' : ''}"
-                              data-id="${p.id}">
+                              data-id="${escapeHtml(String(p.id))}">
                           <span class="tw-prompt-list-name">${escapeHtml(p.name)}</span>
                           ${badgeHtml}
                         </div>`;
