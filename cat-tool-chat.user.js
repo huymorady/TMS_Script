@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.5.4
+// @version      0.5.5
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -174,7 +174,25 @@
                 ...(options.headers || {}),
             },
         });
-        const data = await res.json();
+
+        // 컨텐츠 타입 먼저 검사. HTML 에러페이지/로그인 리다이렉트는 res.json()에서
+        // SyntaxError로 터져 원인 파악이 어렵다. 명시적 메시지로 교체.
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
+        const isJson = contentType.includes('application/json') || contentType.includes('+json');
+        if (!isJson) {
+            const text = await res.text().catch(() => '');
+            const snippet = String(text || '').slice(0, 200).replace(/\s+/g, ' ').trim();
+            const looksLikeLogin = /<form[^>]*login|<title[^>]*\bsign\s*in|csrf|\u767b\u5f55|\ub85c\uadf8\uc778/i.test(text);
+            const hint = looksLikeLogin ? ' (로그인 세션 만료 가능성)' : '';
+            throw new Error(`API 응답이 JSON이 아닙니다 [${res.status}] content-type=${contentType || 'none'}${hint}: ${snippet}`);
+        }
+
+        let data;
+        try {
+            data = await res.json();
+        } catch (error) {
+            throw new Error(`API JSON 파싱 실패 [${res.status}]: ${error.message}`);
+        }
         if (!res.ok || data.result === false) {
             throw new Error(`API 오류: ${res.status} ${data.message || ''}`);
         }
@@ -1235,6 +1253,8 @@
             lsSet(LS_KEYS.ACTIVE_BATCH_RUN, null);
             return null;
         }
+        // stale 마킹은 idempotent해야 한다. 이미 stale로 설정된 run을 다시 불러도
+        // 경고 로그가 중복 push되지 않는다.
         if (run && isBatchBusy(run.status)) {
             run.status = 'stale';
             run.lastError = '이전 실행이 진행 중 상태에서 중단되었습니다. 결과 다시 읽기 또는 Phase 재실행을 선택하세요.';
@@ -1248,6 +1268,20 @@
             saveBatchRuns(runs);
         }
         return run;
+    }
+
+    // LS를 단일 source-of-truth로 강제. 모달 재오픈/탭 변경 등 시점에서 호출하면
+    // 메모리의 stale batchRun을 LS 상태에 맞게 재동기화한다.
+    function syncBatchRunFromLs() {
+        const runId = getActiveBatchRunId();
+        if (!runId) {
+            // LS에 활성 run이 없으면 메모리도 비워 다른 URL의 stale 런이 남지 않게.
+            batchRun = null;
+            return null;
+        }
+        const restored = restoreActiveBatchRun();
+        batchRun = restored;
+        return restored;
     }
 
     function createBatchRunBase() {
@@ -2889,9 +2923,9 @@
         // 세그먼트 로드
         await loadSegmentInfo(stringId);
 
-        // 세션 복원
+        // 세션 복원 — LS를 단일 source-of-truth로 강제 (다른 URL 메모리의 stale run 방지)
         renderChatHistory();
-        batchRun = restoreActiveBatchRun() || batchRun;
+        syncBatchRunFromLs();
         setMainTab(currentMainTab);
 
         // 자동 감지 폴링 시작
@@ -3595,6 +3629,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.5.4] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.5.5] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
