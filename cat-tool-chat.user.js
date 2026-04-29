@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.5.7
+// @version      0.5.8
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -77,6 +77,7 @@
 === 필수 출력 규칙 ===
 - 오직 한국어 번역문만 출력하세요.
 - 설명, 해설, 주석, 마크다운(**, *, #, etc.), 한자 병기, 괄호 설명을 일체 금지합니다.
+- 코드펜스(\`\`\`), 양끝 따옴표 감싸기, '번역:' / '번역 결과:' 같은 라벨도 출력하지 마세요.
 - 원문에 있던 플레이스홀더(%s, {0}, \\n 등)와 태그는 그대로 유지하세요.`.trim();
 
     // ========================================================================
@@ -263,6 +264,49 @@
     async function fetchActiveResult(stringId) {
         const seg = await fetchSegmentDetail(stringId);
         return seg?.active_result?.result || '';
+    }
+
+    // chat 단건 결과 보수적 사니타이즈.
+    // 실측된 LLM 오염 패턴 (레퍼런스 주의사항 #1):
+    //   - 코드펜스 감싸기: \`\`\`...\`\`\` 또는 \`\`\`lang\n...\n\`\`\`
+    //   - 양끝 따옴표: " " “ ” ‘ ’ 「 」
+    //   - 양끝 마크다운 볼드/이탈릭: ** ... **, * ... *, _ ... _
+    //   - 첨머의 "번역:", "번역 결과:" 같은 라벨 한 줄
+    // batch 결과(JSON 원본 등)에는 적용하지 않음. chat 단일 세그먼트 경로에서만 호출.
+    function sanitizeChatTranslation(raw) {
+        if (typeof raw !== 'string') return '';
+        let s = raw.trim();
+        if (!s) return s;
+        // 1) 코드펜스 풀기 (양끝에 있을 때만)
+        const fence = s.match(/^```(?:[\w-]+)?\s*\n?([\s\S]*?)\n?```$/);
+        if (fence) s = fence[1].trim();
+        // 2) 앞의 "번역(문|결과)?\s*[:：]\s*" 라벨 한 줄 제거 (레이블 뒤가 비었으면 다음 줄로 넓혀)
+        s = s.replace(/^\s*번역(?:문|결과)?\s*[:：]\s*\n?/, '').trim();
+        // 3) 양끝 마크다운 볼드/이탈릭/밑줄 (양쪽이 짝이 맞을 때만)
+        const wraps = [
+            ['**', '**'], ['*', '*'], ['__', '__'], ['_', '_'],
+        ];
+        for (let pass = 0; pass < 2; pass++) {
+            for (const [open, close] of wraps) {
+                if (s.length > open.length + close.length
+                    && s.startsWith(open) && s.endsWith(close)) {
+                    const inner = s.slice(open.length, -close.length);
+                    // 내부에 같은 마커가 또 있으면 의미 있는 마크일 가능성 — 풀지 않음
+                    if (!inner.includes(open)) s = inner.trim();
+                }
+            }
+        }
+        // 4) 양끝 따옴표 한 겨어만 제거 (짝 맞는 경우)
+        const quotePairs = [
+            ['"', '"'], ["'", "'"], ['“', '”'], ['‘', '’'], ['「', '」'], ['『', '』'],
+        ];
+        for (const [open, close] of quotePairs) {
+            if (s.length > 1 && s.startsWith(open) && s.endsWith(close)) {
+                const inner = s.slice(open.length, -close.length);
+                if (!inner.includes(open) && !inner.includes(close)) s = inner.trim();
+            }
+        }
+        return s;
     }
 
     // ========================================================================
@@ -3168,7 +3212,11 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             });
 
             updateProgressMessage(progressMsg, '⏳ 결과 조회 중…');
-            const result = await fetchActiveResult(currentStringId);
+            const rawResult = await fetchActiveResult(currentStringId);
+            const result = sanitizeChatTranslation(rawResult);
+            if (rawResult && result !== rawResult) {
+                console.log('[TMS-WF] sanitize:', { before: rawResult, after: result });
+            }
 
             if (!result) {
                 updateProgressMessage(progressMsg, '⚠️ 결과가 비어있습니다. 세그먼트 상태를 확인하세요.');
@@ -3671,6 +3719,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.5.7] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.5.8] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();

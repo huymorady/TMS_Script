@@ -5,6 +5,13 @@ devtools_*.png
 test_v3*.js
 browser_use_handoff.md
 
+# 워크스페이스 내 설계·테스트 완전 로컬 운용
+spec-plan.md
+*.spec-plan.md
+*.test.js
+docs/
+tests/
+
 # 임시 체크/대화 로그
 체크용 문서/
 클로드 대화 내역
