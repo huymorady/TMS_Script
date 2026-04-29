@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.2
+// @version      0.6.3
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -2122,12 +2122,14 @@
     flex: 1; overflow: auto; border: 1px solid #333; border-radius: 10px; background: #151515;
 }
 .tw-review-row {
-    display: grid; grid-template-columns: 34px 78px 54px minmax(120px, 0.8fr) minmax(145px, 1fr) minmax(120px, 0.8fr) minmax(160px, 1fr) 132px;
+    display: grid; grid-template-columns: 34px 78px 54px minmax(120px, 0.8fr) minmax(130px, 0.95fr) minmax(120px, 0.85fr) minmax(150px, 1fr) 178px;
     gap: 8px; padding: 10px 12px; border-bottom: 1px solid #303030; align-items: start;
 }
 .tw-review-row:last-child { border-bottom: none; }
 .tw-review-head { color: #4ade80; font-weight: 600; background: #202020; position: sticky; top: 0; z-index: 1; }
-.tw-review-cell { white-space: pre-wrap; word-break: break-word; line-height: 1.45; }
+/* v0.6.3: 기본 셀은 normal whitespace, 텍스트 보존이 필요한 셀만 pre-wrap */
+.tw-review-cell { word-break: break-word; line-height: 1.45; }
+.tw-review-cell.tw-review-text { white-space: pre-wrap; }
 .tw-review-row:not(.tw-review-head):hover { background: #1d241f; }
 .tw-review-check { display: flex; align-items: center; justify-content: center; }
 .tw-review-select, .tw-review-select-all { accent-color: #4ade80; }
@@ -3097,25 +3099,11 @@
     <div class="tw-review-cell tw-review-check" data-label="선택"><input class="tw-review-select" type="checkbox" data-id="${escapeHtml(id)}"></div>
     <div class="tw-review-cell" data-label="ID">#${escapeHtml(id)}${chatBadge}${appliedBadge}</div>
     <div class="tw-review-cell" data-label="그룹">${escapeHtml(item.gid || '')}</div>
-    <div class="tw-review-cell tw-review-source" data-label="원문">${escapeHtml(seg?.origin_string || '')}</div>
-    <div class="tw-review-cell" data-label="Phase 3">${escapeHtml(item.t || '')}</div>
-    <div class="tw-review-cell" data-label="Phase 4+5">
-        <div>${escapeHtml(revisionText || (revision && revision.t === null ? '유지' : '—'))}</div>
-        <span class="${flagChipClass}">${escapeHtml(flagChipText)}</span>
-    </div>
-    <div class="tw-review-cell" data-label="최종 후보">
-        <div class="tw-review-final-wrap" data-final-id="${escapeHtml(id)}">
-            <div class="tw-review-final-view">${escapeHtml(finalText)}</div>
-            ${overrideChip}
-        </div>
-    </div>
-    <div class="tw-review-cell tw-review-actions" data-label="동작">
-        <button class="tw-btn tw-btn-primary tw-btn-apply-final" data-id="${escapeHtml(id)}" title="현재 textarea에 입력">입력</button>
-        <button class="tw-btn tw-btn-ghost tw-btn-edit-final" data-id="${escapeHtml(id)}" title="최종 후보를 직접 수정">✏️</button>
-        <button class="tw-btn tw-btn-ghost tw-btn-copy-final" data-id="${escapeHtml(id)}" title="최종 후보 복사">📋</button>
-        <button class="tw-btn tw-btn-ghost tw-btn-chat-refine" data-id="${escapeHtml(id)}" title="chat 탭에서 다듬기">💬</button>
-        ${hasOverride ? `<button class="tw-btn tw-btn-ghost tw-btn-revert-final" data-id="${escapeHtml(id)}" title="직접 수정 되돌리기">↺</button>` : ''}
-    </div>
+    <div class="tw-review-cell tw-review-source tw-review-text" data-label="원문">${escapeHtml(seg?.origin_string || '')}</div>
+    <div class="tw-review-cell tw-review-text" data-label="Phase 3">${escapeHtml(item.t || '')}</div>
+    <div class="tw-review-cell" data-label="Phase 4+5"><div class="tw-review-text">${escapeHtml(revisionText || (revision && revision.t === null ? '유지' : '—'))}</div><span class="${flagChipClass}">${escapeHtml(flagChipText)}</span></div>
+    <div class="tw-review-cell" data-label="최종 후보"><div class="tw-review-final-wrap" data-final-id="${escapeHtml(id)}"><div class="tw-review-final-view tw-review-text">${escapeHtml(finalText)}</div>${overrideChip}</div></div>
+    <div class="tw-review-cell tw-review-actions" data-label="동작"><button class="tw-btn tw-btn-primary tw-btn-apply-final" data-id="${escapeHtml(id)}" title="현재 textarea에 입력">입력</button><button class="tw-btn tw-btn-ghost tw-btn-edit-final" data-id="${escapeHtml(id)}" title="최종 후보를 직접 수정">✏️</button><button class="tw-btn tw-btn-ghost tw-btn-copy-final" data-id="${escapeHtml(id)}" title="최종 후보 복사">📋</button><button class="tw-btn tw-btn-ghost tw-btn-chat-refine" data-id="${escapeHtml(id)}" title="chat 탭에서 다듬기">💬</button>${hasOverride ? `<button class="tw-btn tw-btn-ghost tw-btn-revert-final" data-id="${escapeHtml(id)}" title="직접 수정 되돌리기">↺</button>` : ''}</div>
 </div>`;
         }).join('');
 
@@ -4114,6 +4102,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.6.2] 로드됨. Alt+Z로 모달 오픈 (리뷰 탭 UI 정리 + 인라인 수정)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.6.3] 로드됨. Alt+Z로 모달 오픈 (리뷰 셀 행정렬 수정 + 액션 1줄)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
