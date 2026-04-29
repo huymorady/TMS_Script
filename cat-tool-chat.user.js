@@ -2567,7 +2567,7 @@
 .tw-review-flag-chip.tw-review-flag-keep { background: #1f2a1f; color: #86efac; border-color: #2f4a32; }
 /* v0.6.7 (D2): "직접 수정" 의미는 amber(--tw-edit)로 통일 (✏️ chip / button / badge 공통 톤) */
 .tw-review-flag-chip.tw-review-flag-edit { background: var(--tw-edit-soft); color: var(--tw-edit); border-color: rgba(251, 191, 36, 0.4); }
-/* v0.6.7 (D2): 적용 자동화 배지 (renderReviewTable의 ${appliedBadge} 대상). 기존엔 룰 없음 — 토큰 톤으로 정의 */
+/* v0.6.7 (D2): 적용 자동화 배지 (renderReviewTable의 appliedBadge 대상). 기존엔 룰 없음 — 토큰 톤으로 정의 */
 .tw-review-applied-badge {
     margin-left: 6px; font-size: 11px; opacity: 0.85; cursor: help;
     color: var(--tw-info);
