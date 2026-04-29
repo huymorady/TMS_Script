@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.4
+// @version      0.6.5
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -1217,13 +1217,16 @@
         const bucket = all[runId];
         if (!bucket) return null;
         const v = bucket[normalizeId(stringId)];
-        return typeof v === 'string' ? v : null;
+        // v0.6.5: migration — 과거에는 string, 이제는 { text, updatedAt }
+        if (typeof v === 'string') return v;
+        if (v && typeof v === 'object' && typeof v.text === 'string') return v.text;
+        return null;
     }
     function setReviewOverride(runId, stringId, text) {
         if (!runId) return;
         const all = loadReviewOverrides();
         const bucket = all[runId] || (all[runId] = {});
-        bucket[normalizeId(stringId)] = String(text ?? '');
+        bucket[normalizeId(stringId)] = { text: String(text ?? ''), updatedAt: Date.now() };
         saveReviewOverrides(all);
     }
     function clearReviewOverride(runId, stringId) {
@@ -1234,6 +1237,12 @@
         delete bucket[normalizeId(stringId)];
         if (!Object.keys(bucket).length) delete all[runId];
         saveReviewOverrides(all);
+    }
+    // v0.6.5: 활성 run의 override 개수 계산 (phase 재실행 가드용)
+    function countReviewOverridesForRun(runId) {
+        if (!runId) return 0;
+        const bucket = loadReviewOverrides()[runId];
+        return bucket ? Object.keys(bucket).length : 0;
     }
 
     // ========================================================================
@@ -1852,6 +1861,8 @@
     let currentSegment = null;
     let currentMainTab = 'chat';
     let batchRun = null;
+    // v0.6.5 (A3): 리뷰 탭 필터/정렬 상태 (메모리 only — 세션 한정)
+    const reviewView = { filter: 'all', sort: 'id' };
 
     function createModal() {
         if (modalEl) return modalEl;
@@ -1950,7 +1961,29 @@
     <div class="tw-review-summary tw-muted">아직 Phase 3 결과가 없습니다.</div>
     <div class="tw-review-toolbar">
         <button class="tw-btn tw-btn-primary tw-btn-review-apply-selected">선택 입력</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-apply-edited" title="Phase 4+5에서 수정된 행만 일괄 입력">수정만 입력</button>
         <button class="tw-btn tw-btn-ghost tw-btn-review-apply-all">전체 입력</button>
+        <span class="tw-review-filter-group">
+            <label class="tw-review-filter-label">필터
+                <select class="tw-review-filter">
+                    <option value="all">전체</option>
+                    <option value="edited">Phase4+5 수정만</option>
+                    <option value="kept">유지만</option>
+                    <option value="overridden">직접 수정만</option>
+                    <option value="placeholder">placeholder 누락</option>
+                    <option value="hanja">한자 잔존</option>
+                    <option value="applied">자동 적용됨</option>
+                    <option value="drifted">적용 후 변경됨</option>
+                </select>
+            </label>
+            <label class="tw-review-filter-label">정렬
+                <select class="tw-review-sort">
+                    <option value="id">ID</option>
+                    <option value="group">그룹</option>
+                    <option value="state">상태</option>
+                </select>
+            </label>
+        </span>
         <span class="tw-review-apply-status tw-muted">입력은 textarea 값 주입까지만 수행합니다.</span>
     </div>
     <div class="tw-review-table"></div>
@@ -2130,6 +2163,16 @@
     background: linear-gradient(135deg, #202820 0%, #181818 70%);
 }
 .tw-review-apply-status { margin-left: auto; font-size: 12px; }
+/* v0.6.5 (A3): 필터/정렬 컨트롤 */
+.tw-review-filter-group { display: flex; gap: 8px; align-items: center; }
+.tw-review-filter-label { display: flex; align-items: center; gap: 4px; font-size: 12px; color: #aaa; }
+.tw-review-filter, .tw-review-sort {
+    background: #1a1a1a; color: #e0e0e0; border: 1px solid #3a3a3a;
+    padding: 3px 6px; border-radius: 4px; font-size: 12px;
+}
+/* v0.6.5 (A4): phase3 ↔ phase4+5 단어 단위 diff */
+.tw-diff-add { background: rgba(74, 222, 128, 0.18); color: #86efac; border-radius: 2px; padding: 0 2px; }
+.tw-diff-del { background: rgba(248, 113, 113, 0.18); color: #fca5a5; text-decoration: line-through; border-radius: 2px; padding: 0 2px; opacity: 0.85; }
 .tw-review-table {
     flex: 1; overflow: auto; border: 1px solid #333; border-radius: 10px; background: #151515;
 }
@@ -2441,6 +2484,11 @@
         $('.tw-btn-log-copy', el).addEventListener('click', onCopyLogOutput);
         $('.tw-btn-review-apply-selected', el).addEventListener('click', () => applyBatchTranslationsByIds(getSelectedReviewIds()));
         $('.tw-btn-review-apply-all', el).addEventListener('click', () => applyBatchTranslationsByIds(getReviewTranslationIds()));
+        // v0.6.5 (A1): 수정만 입력
+        $('.tw-btn-review-apply-edited', el).addEventListener('click', () => applyBatchTranslationsByIds(getEditedReviewIds()));
+        // v0.6.5 (A3): 필터/정렬 변경 → 재렌더
+        $('.tw-review-filter', el).addEventListener('change', (e) => { reviewView.filter = e.target.value || 'all'; renderReviewTable(); });
+        $('.tw-review-sort', el).addEventListener('change', (e) => { reviewView.sort = e.target.value || 'id'; renderReviewTable(); });
 
         $('.tw-review-table', el).addEventListener('click', async (e) => {
             const copyBtn = e.target.closest('.tw-btn-copy-final');
@@ -2910,6 +2958,62 @@
             .filter(id => Number.isFinite(Number(id)));
     }
 
+    // v0.6.5 (A1): Phase 4+5에서 실제 수정이 일어났거나 직접 수정된 ID만 (no-op 유지는 제외)
+    function getEditedReviewIds() {
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run?.phase3?.parsed || !run.phase3.validation?.ok) return [];
+        const phase3Map = new Map((run.phase3.parsed.translations || []).map(it => [normalizeId(it.id), it]));
+        const revisionMap = new Map(((run.phase45?.parsed?.revisions) || []).map(it => [normalizeId(it.id), it]));
+        const ids = [];
+        for (const [id, p3] of phase3Map) {
+            if (typeof getReviewOverride(run.runId, id) === 'string') { ids.push(id); continue; }
+            const rev = revisionMap.get(id);
+            if (rev && typeof rev.t === 'string' && rev.t !== p3.t) ids.push(id);
+        }
+        return ids;
+    }
+
+    // v0.6.5 (A4): 단어 단위 diff (Korean/CJK 안전 — 공백/문장부호 분할 LCS)
+    function tokenizeForDiff(text) {
+        return String(text || '').split(/(\s+|[.,!?…·\-\/()\[\]{}'"`~:;])/).filter(t => t.length > 0);
+    }
+    function diffWords(oldText, newText) {
+        const a = tokenizeForDiff(oldText);
+        const b = tokenizeForDiff(newText);
+        const n = a.length, m = b.length;
+        // LCS DP
+        const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+        for (let i = n - 1; i >= 0; i -= 1) {
+            for (let j = m - 1; j >= 0; j -= 1) {
+                dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+            }
+        }
+        const ops = []; // {type:'eq'|'add'|'del', text}
+        let i = 0, j = 0;
+        while (i < n && j < m) {
+            if (a[i] === b[j]) { ops.push({ type: 'eq', text: a[i] }); i += 1; j += 1; }
+            else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push({ type: 'del', text: a[i] }); i += 1; }
+            else { ops.push({ type: 'add', text: b[j] }); j += 1; }
+        }
+        while (i < n) { ops.push({ type: 'del', text: a[i] }); i += 1; }
+        while (j < m) { ops.push({ type: 'add', text: b[j] }); j += 1; }
+        // 인접한 같은 type 병합
+        const merged = [];
+        for (const op of ops) {
+            const last = merged[merged.length - 1];
+            if (last && last.type === op.type) last.text += op.text;
+            else merged.push({ ...op });
+        }
+        return merged;
+    }
+    function renderDiffHtml(ops) {
+        return ops.map(op => {
+            if (op.type === 'eq') return escapeHtml(op.text);
+            if (op.type === 'add') return `<span class="tw-diff-add">${escapeHtml(op.text)}</span>`;
+            return `<span class="tw-diff-del">${escapeHtml(op.text)}</span>`;
+        }).join('');
+    }
+
     async function applyBatchFinalToTextarea(id) {
         const text = getBatchFinalText(id);
         if (!text) throw new Error(`#${id} 최종 후보가 없습니다.`);
@@ -2952,9 +3056,13 @@
 
         let success = 0;
         const failures = [];
-        updateReviewApplyStatus(`${uniqueIds.length}개 입력 시작...`);
+        const total = uniqueIds.length;
+        updateReviewApplyStatus(`${total}개 입력 시작...`);
+        // v0.6.5 (A1): 일괄 입력 시작 토스트 (1개일 때는 생략)
+        if (total > 1) toast(`${total}개 일괄 입력을 시작합니다.`, 'info', 2500);
 
-        for (const id of uniqueIds) {
+        for (let i = 0; i < uniqueIds.length; i += 1) {
+            const id = uniqueIds[i];
             try {
                 await applyBatchFinalToTextarea(id);
                 success += 1;
@@ -2963,13 +3071,24 @@
                 failures.push({ id, message: error.message });
                 appendBatchLog(`#${id} textarea 입력 실패: ${error.message}`, 'warn');
             }
+            // 5개마다 또는 마지막에 진행 상태 갱신 (UI 업데이트 비용 절감)
+            if ((i + 1) % 5 === 0 || i === uniqueIds.length - 1) {
+                updateReviewApplyStatus(`진행 ${i + 1}/${total} · 성공 ${success} · 실패 ${failures.length}`);
+            }
         }
 
-        const message = failures.length
+        let message = failures.length
             ? `입력 완료 ${success}개, 실패 ${failures.length}개`
             : `입력 완료 ${success}개`;
+        if (failures.length) {
+            const previewIds = failures.slice(0, 5).map(f => `#${f.id}`).join(', ');
+            const more = failures.length > 5 ? ` 외 ${failures.length - 5}개` : '';
+            message += ` (실패: ${previewIds}${more})`;
+        }
         updateReviewApplyStatus(message);
-        toast(message, failures.length ? 'info' : 'success', 4000);
+        toast(message, failures.length ? 'info' : 'success', 4500);
+        // v0.6.5: 입력 후 applied 배지/필터 갱신
+        if (success > 0 || failures.length > 0) renderReviewTable();
     }
 
     // v0.6.0 L2: review 행 → chat 탭 점프 (단일 세그먼트 다듬기 모드)
@@ -3062,14 +3181,88 @@
         const appliedSummary = appliedCount
             ? `자동 적용 ${appliedCount}개 (수정 ${driftedCount}, 확인 불가 ${unknownCount})`
             : '자동 적용 없음';
-        summaryEl.textContent = `번역 ${translations.length}개 · Phase 4+5 ${usePhase45 ? `수정 ${changedCount}개` : '미적용 또는 검증 실패'} · ${appliedSummary}`;
-        const rows = translations.map(item => {
+
+        // v0.6.5 (A3): 필터/정렬 컨트롤 동기화 + 분류 메타 사전 계산
+        const filterSel = $('.tw-review-filter', modalEl);
+        const sortSel = $('.tw-review-sort', modalEl);
+        if (filterSel && filterSel.value !== reviewView.filter) filterSel.value = reviewView.filter;
+        if (sortSel && sortSel.value !== reviewView.sort) sortSel.value = reviewView.sort;
+
+        // phase45 validation에서 placeholder/hanja 분류 가져오기
+        const phase45Validation = run.phase45?.validation || {};
+        const missingPlaceholderIds = new Set((phase45Validation.missingPlaceholders || []).map(item => normalizeId(item.id)));
+        const hanjaIds = new Set((phase45Validation.hanjaLike || []).map(id => normalizeId(id)));
+
+        const stateOrder = { override: 0, edit: 1, keep: 2, none: 3 };
+        const descriptors = translations.map(item => {
             const id = normalizeId(item.id);
-            const seg = segmentById.get(id);
             const revision = revisionById.get(id);
-            const finalText = getBatchFinalText(id);
-            // v0.6.4: phase3와 동일한 t는 사실상 유지로 취급
             const isEffectiveKeep = revision && (revision.t === null || (typeof revision.t === 'string' && revision.t === item.t));
+            const hasOverride = typeof getReviewOverride(run.runId, id) === 'string';
+            let stateKey; // 'override' | 'edit' | 'keep' | 'none'
+            if (hasOverride) stateKey = 'override';
+            else if (revision && !isEffectiveKeep) stateKey = 'edit';
+            else if (revision && isEffectiveKeep) stateKey = 'keep';
+            else stateKey = 'none';
+            const applied = getAppliedFromBatch(id);
+            const appliedActive = !!(applied && (!run.runId || !applied.runId || applied.runId === run.runId));
+            let appliedState = 'none';
+            if (appliedActive) {
+                const ta = findTranslationTextareaForStringId(id);
+                if (ta) appliedState = ta.value === applied.text ? 'ok' : 'drifted';
+                else {
+                    const seg = segmentById.get(id);
+                    const cur = seg?.active_result?.result;
+                    appliedState = typeof cur === 'string' ? (cur === applied.text ? 'ok' : 'drifted') : 'unknown';
+                }
+            }
+            return {
+                id, item, revision, isEffectiveKeep, hasOverride, stateKey,
+                appliedActive, appliedState,
+                hasMissingPlaceholder: missingPlaceholderIds.has(id),
+                hasHanja: hanjaIds.has(id),
+            };
+        });
+
+        // 필터 적용
+        const filtered = descriptors.filter(d => {
+            switch (reviewView.filter) {
+                case 'edited': return d.stateKey === 'edit';
+                case 'kept': return d.stateKey === 'keep' || d.stateKey === 'none';
+                case 'overridden': return d.stateKey === 'override';
+                case 'placeholder': return d.hasMissingPlaceholder;
+                case 'hanja': return d.hasHanja;
+                case 'applied': return d.appliedActive;
+                case 'drifted': return d.appliedState === 'drifted';
+                case 'all':
+                default: return true;
+            }
+        });
+
+        // 정렬 적용
+        filtered.sort((a, b) => {
+            if (reviewView.sort === 'group') {
+                const cmp = String(a.item.gid || '').localeCompare(String(b.item.gid || ''));
+                return cmp !== 0 ? cmp : a.id - b.id;
+            }
+            if (reviewView.sort === 'state') {
+                const cmp = stateOrder[a.stateKey] - stateOrder[b.stateKey];
+                return cmp !== 0 ? cmp : a.id - b.id;
+            }
+            return a.id - b.id;
+        });
+
+        const totalCount = descriptors.length;
+        const shownCount = filtered.length;
+        const filterTag = reviewView.filter !== 'all' ? ` · 필터(${reviewView.filter}) ${shownCount}/${totalCount}` : '';
+        summaryEl.textContent = `번역 ${translations.length}개 · Phase 4+5 ${usePhase45 ? `수정 ${changedCount}개` : '미적용 또는 검증 실패'} · ${appliedSummary}${filterTag}`;
+        const rows = filtered.map(d => {
+            const item = d.item;
+            const id = d.id;
+            const seg = segmentById.get(id);
+            const revision = d.revision;
+            const finalText = getBatchFinalText(id);
+            const isEffectiveKeep = d.isEffectiveKeep;
             const revisionText = revision && !isEffectiveKeep ? String(revision.t || '') : '';
             // v0.6.2: flag chip (action 셀에서 분리, Phase 4+5 셀로 이동)
             let flagChipClass = 'tw-review-flag-chip';
@@ -3081,7 +3274,7 @@
                 flagChipText = 'Phase3';
             }
             // v0.6.2: override 적용 여부
-            const hasOverride = typeof getReviewOverride(run.runId, id) === 'string';
+            const hasOverride = d.hasOverride;
             const overrideChip = hasOverride
                 ? `<span class="tw-review-flag-chip tw-review-flag-edit" title="사용자가 직접 수정한 최종 후보">✏️ 직접 수정</span>`
                 : '';
@@ -3089,27 +3282,19 @@
             const chatBadge = workState.chat.hasSession
                 ? `<span class="tw-review-chat-badge" title="채팅 세션 ${workState.chat.messageCount}개 메시지">💬</span>`
                 : '';
-            // v0.6.0 L3: applied-from-batch 배지 (v0.6.1 P2: textarea 없으면 unknown 상태 표시)
-            const applied = getAppliedFromBatch(id);
+            // v0.6.0 L3: applied-from-batch 배지
             let appliedBadge = '';
-            if (applied) {
-                const ta = findTranslationTextareaForStringId(id);
-                let state; // 'ok' | 'drifted' | 'unknown'
-                if (ta) {
-                    state = ta.value === applied.text ? 'ok' : 'drifted';
-                } else {
-                    const cur = seg?.active_result?.result;
-                    if (typeof cur === 'string') {
-                        state = cur === applied.text ? 'ok' : 'drifted';
-                    } else {
-                        state = 'unknown';
-                    }
-                }
-                const stateLabel = state === 'drifted' ? ' — 이후 수정됨' : state === 'unknown' ? ' — 현재 값 확인 불가 (DOM에 없음)' : '';
+            if (d.appliedActive) {
+                const applied = getAppliedFromBatch(id);
+                const stateLabel = d.appliedState === 'drifted' ? ' — 이후 수정됨' : d.appliedState === 'unknown' ? ' — 현재 값 확인 불가 (DOM에 없음)' : '';
                 const tip = `배치에서 자동 적용됨 (run ${applied.runId || '?'}, ${applied.phase})${stateLabel}`;
-                const icon = state === 'drifted' ? '🤖→✏️' : state === 'unknown' ? '🤖❓' : '🤖';
+                const icon = d.appliedState === 'drifted' ? '🤖→✏️' : d.appliedState === 'unknown' ? '🤖❓' : '🤖';
                 appliedBadge = ` <span class="tw-review-applied-badge" title="${escapeHtml(tip)}">${icon}</span>`;
             }
+            // v0.6.5 (A4): revisionText가 있으면 phase3 ↔ revision diff로 렌더
+            const revisionHtml = revisionText
+                ? `<div class="tw-review-text" title="phase3 대비 변경: 초록=추가, 빨강=삭제">${renderDiffHtml(diffWords(item.t || '', revisionText))}</div>`
+                : '';
             return `
 <div class="tw-review-row" data-row-id="${escapeHtml(id)}">
     <div class="tw-review-cell tw-review-check" data-label="선택"><input class="tw-review-select" type="checkbox" data-id="${escapeHtml(id)}"></div>
@@ -3117,7 +3302,7 @@
     <div class="tw-review-cell" data-label="그룹">${escapeHtml(item.gid || '')}</div>
     <div class="tw-review-cell tw-review-source tw-review-text" data-label="원문">${escapeHtml(seg?.origin_string || '')}</div>
     <div class="tw-review-cell tw-review-text" data-label="Phase 3">${escapeHtml(item.t || '')}</div>
-    <div class="tw-review-cell" data-label="Phase 4+5">${revisionText ? `<div class="tw-review-text">${escapeHtml(revisionText)}</div>` : ''}<span class="${flagChipClass}">${escapeHtml(flagChipText)}</span></div>
+    <div class="tw-review-cell" data-label="Phase 4+5">${revisionHtml}<span class="${flagChipClass}">${escapeHtml(flagChipText)}</span></div>
     <div class="tw-review-cell" data-label="최종 후보"><div class="tw-review-final-wrap" data-final-id="${escapeHtml(id)}"><div class="tw-review-final-view tw-review-text">${escapeHtml(finalText)}</div>${overrideChip}</div></div>
     <div class="tw-review-cell tw-review-actions" data-label="동작"><button class="tw-btn tw-btn-primary tw-btn-apply-final" data-id="${escapeHtml(id)}" title="현재 textarea에 입력">입력</button><button class="tw-btn tw-btn-ghost tw-btn-edit-final" data-id="${escapeHtml(id)}" title="최종 후보를 직접 수정">✏️</button><button class="tw-btn tw-btn-ghost tw-btn-copy-final" data-id="${escapeHtml(id)}" title="최종 후보 복사">📋</button><button class="tw-btn tw-btn-ghost tw-btn-chat-refine" data-id="${escapeHtml(id)}" title="chat 탭에서 다듬기">💬</button>${hasOverride ? `<button class="tw-btn tw-btn-ghost tw-btn-revert-final" data-id="${escapeHtml(id)}" title="직접 수정 되돌리기">↺</button>` : ''}</div>
 </div>`;
@@ -3235,6 +3420,23 @@
         if (phaseTag === '4+5' && !run.phase3?.validation?.ok) {
             toast('Phase 3 검증 통과 후 실행할 수 있습니다.', 'error');
             return;
+        }
+
+        // v0.6.5 (B2): override 보호 — phase 재실행은 최종 후보에 영향 줄 수 있음
+        if ((phaseTag === '3' || phaseTag === '4+5') && run.runId) {
+            const overrideCount = countReviewOverridesForRun(run.runId);
+            if (overrideCount > 0) {
+                const ok = confirm(
+                    `이 run에 직접 수정한 최종 후보가 ${overrideCount}개 있습니다.\n` +
+                    `Phase ${phaseTag}을(를) 다시 실행하면 새 결과가 표시되지만 직접 수정값은 유지되어 우선 적용됩니다.\n` +
+                    `계속하시겠습니까? (취소하면 실행이 중단됩니다)`
+                );
+                if (!ok) {
+                    appendBatchLog(`Phase ${phaseTag} 재실행 취소됨 (직접 수정 ${overrideCount}개 유지)`, 'info');
+                    return;
+                }
+                appendBatchLog(`Phase ${phaseTag} 재실행 — 직접 수정 ${overrideCount}개는 유지됨`, 'warn');
+            }
         }
 
         try {
@@ -4118,6 +4320,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.6.4] 로드됨. Alt+Z로 모달 오픈 (Phase4+5 chip 단일행 + no-op revision 자동 인정)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.6.5] 로드됨. Alt+Z로 모달 오픈 (필터/정렬 + diff 하이라이트 + 수정만 입력 + override 가드)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
