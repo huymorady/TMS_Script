@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.3
+// @version      0.6.4
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -641,8 +641,19 @@
             .filter(item => Object.prototype.hasOwnProperty.call(item, 't') && item.t !== null && typeof item.t !== 'string')
             .map(item => normalizeId(item.id));
 
+        // v0.6.4: phase3와 동일한 텍스트가 들어온 revision은 사실상 no-op으로 간주 → reason 요구에서 제외
+        const effectiveNoOpIds = new Set(
+            revisions
+                .filter(item => typeof item.t === 'string' && item.t === (phase3ById.get(normalizeId(item.id))?.t ?? null))
+                .map(item => normalizeId(item.id))
+        );
+
         const invalidReasons = revisions
-            .filter(item => !Array.isArray(item.r) || (typeof item.t === 'string' && item.r.length === 0))
+            .filter(item => {
+                if (!Array.isArray(item.r)) return true;
+                if (typeof item.t === 'string' && item.r.length === 0 && !effectiveNoOpIds.has(normalizeId(item.id))) return true;
+                return false;
+            })
             .map(item => normalizeId(item.id));
 
         const finalTextById = new Map();
@@ -672,7 +683,8 @@
             .filter(item => /[\u4e00-\u9fff]/.test(finalTextById.get(normalizeId(item.id)) || ''))
             .map(item => normalizeId(item.id));
 
-        const changedCount = revisions.filter(item => item.t !== null).length;
+        // v0.6.4: \uc0ac\uc2e4\uc0c1 no-op\uc744 \uc81c\uc678\ud55c \uc2e4\uc81c \ubcc0\uacbd \uac74\uc218
+        const changedCount = revisions.filter(item => item.t !== null && !effectiveNoOpIds.has(normalizeId(item.id))).length;
 
         return {
             ok: phase45Compact?.phase === '4+5' &&
@@ -2142,10 +2154,12 @@
     width: auto; min-width: 0; padding: 4px 8px; font-size: 12px; line-height: 1.3;
 }
 .tw-review-flag-chip {
-    display: inline-block; margin-top: 4px; padding: 2px 7px; border-radius: 10px;
+    display: inline-block; padding: 2px 7px; border-radius: 10px;
     font-size: 10px; line-height: 1.4; background: #25304a; color: #cbd5e1; border: 1px solid #334155;
-    white-space: nowrap;
+    white-space: nowrap; align-self: flex-start;
 }
+/* v0.6.4: revision 텍스트와 함께 표시될 때만 윗 여백 */
+.tw-review-text + .tw-review-flag-chip { margin-top: 4px; }
 .tw-review-flag-chip.tw-review-flag-keep { background: #1f2a1f; color: #86efac; border-color: #2f4a32; }
 .tw-review-flag-chip.tw-review-flag-edit { background: #2a1f33; color: #d8b4fe; border-color: #4a2f5a; }
 .tw-review-final-wrap { display: flex; flex-direction: column; gap: 4px; }
@@ -3054,12 +3068,14 @@
             const seg = segmentById.get(id);
             const revision = revisionById.get(id);
             const finalText = getBatchFinalText(id);
-            const revisionText = revision && revision.t !== null ? String(revision.t || '') : '';
+            // v0.6.4: phase3와 동일한 t는 사실상 유지로 취급
+            const isEffectiveKeep = revision && (revision.t === null || (typeof revision.t === 'string' && revision.t === item.t));
+            const revisionText = revision && !isEffectiveKeep ? String(revision.t || '') : '';
             // v0.6.2: flag chip (action 셀에서 분리, Phase 4+5 셀로 이동)
             let flagChipClass = 'tw-review-flag-chip';
             let flagChipText;
             if (revision) {
-                if (revision.t === null) { flagChipClass += ' tw-review-flag-keep'; flagChipText = '유지'; }
+                if (isEffectiveKeep) { flagChipClass += ' tw-review-flag-keep'; flagChipText = '유지'; }
                 else { flagChipClass += ' tw-review-flag-edit'; flagChipText = `수정: ${(revision.r || []).join(', ') || 'reason 없음'}`; }
             } else {
                 flagChipText = 'Phase3';
@@ -3101,7 +3117,7 @@
     <div class="tw-review-cell" data-label="그룹">${escapeHtml(item.gid || '')}</div>
     <div class="tw-review-cell tw-review-source tw-review-text" data-label="원문">${escapeHtml(seg?.origin_string || '')}</div>
     <div class="tw-review-cell tw-review-text" data-label="Phase 3">${escapeHtml(item.t || '')}</div>
-    <div class="tw-review-cell" data-label="Phase 4+5"><div class="tw-review-text">${escapeHtml(revisionText || (revision && revision.t === null ? '유지' : '—'))}</div><span class="${flagChipClass}">${escapeHtml(flagChipText)}</span></div>
+    <div class="tw-review-cell" data-label="Phase 4+5">${revisionText ? `<div class="tw-review-text">${escapeHtml(revisionText)}</div>` : ''}<span class="${flagChipClass}">${escapeHtml(flagChipText)}</span></div>
     <div class="tw-review-cell" data-label="최종 후보"><div class="tw-review-final-wrap" data-final-id="${escapeHtml(id)}"><div class="tw-review-final-view tw-review-text">${escapeHtml(finalText)}</div>${overrideChip}</div></div>
     <div class="tw-review-cell tw-review-actions" data-label="동작"><button class="tw-btn tw-btn-primary tw-btn-apply-final" data-id="${escapeHtml(id)}" title="현재 textarea에 입력">입력</button><button class="tw-btn tw-btn-ghost tw-btn-edit-final" data-id="${escapeHtml(id)}" title="최종 후보를 직접 수정">✏️</button><button class="tw-btn tw-btn-ghost tw-btn-copy-final" data-id="${escapeHtml(id)}" title="최종 후보 복사">📋</button><button class="tw-btn tw-btn-ghost tw-btn-chat-refine" data-id="${escapeHtml(id)}" title="chat 탭에서 다듬기">💬</button>${hasOverride ? `<button class="tw-btn tw-btn-ghost tw-btn-revert-final" data-id="${escapeHtml(id)}" title="직접 수정 되돌리기">↺</button>` : ''}</div>
 </div>`;
@@ -4102,6 +4118,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.6.3] 로드됨. Alt+Z로 모달 오픈 (리뷰 셀 행정렬 수정 + 액션 1줄)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.6.4] 로드됨. Alt+Z로 모달 오픈 (Phase4+5 chip 단일행 + no-op revision 자동 인정)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
