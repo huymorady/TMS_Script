@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.0
+// @version      0.7.1
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -60,8 +60,11 @@
         idle: '대기 중',
         collecting: '수집 중',
         ready: '수집 완료',
+        phase12_running: 'Phase 1+2 실행 중',
         phase12_ready: 'Phase 1+2 완료',
+        phase3_running: 'Phase 3 실행 중',
         phase3_ready: 'Phase 3 완료',
+        phase45_running: 'Phase 4+5 실행 중',
         phase45_ready: 'Phase 4+5 완료',
         failed: '오류',
         stale: '저장본 불일치',
@@ -2639,6 +2642,9 @@
 .tw-batch-step.tw-step-fail .tw-batch-step-name { color: var(--tw-danger); }
 .tw-batch-step.tw-step-busy { background: rgba(52, 152, 219, 0.10); border-color: rgba(52, 152, 219, 0.4); }
 .tw-batch-step.tw-step-busy .tw-batch-step-name { color: var(--tw-info); }
+/* v0.7.1: 실행 중 phase의 아이콘을 회전시켜 작업 중임을 시각적으로 표시 */
+@keyframes tw-batch-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.tw-batch-step-icon-spin { display: inline-block; animation: tw-batch-spin 1.2s linear infinite; transform-origin: center; }
 /* v0.7.0 G1-b 보강: fail/warn step은 클릭 가능 (로그 탭으로 점프) */
 .tw-batch-step.tw-step-actionable { cursor: pointer; transition: filter 0.12s ease; }
 .tw-batch-step.tw-step-actionable:hover { filter: brightness(1.25); }
@@ -3650,10 +3656,22 @@
                 detail: phaseStateDetail(run.phase45),
             },
         ];
-        const ICON = { idle: '⭕', busy: '🔄', done: '✅', warn: '⚠', fail: '❌' };
+        const ICON = { idle: '⭕', busy: '◐', done: '✅', warn: '⚠', fail: '❌' };
         // v0.7.0 G1-b 보강: fail/warn step 클릭 → 로그 탭 + phase 이름으로 필터
         const PHASE_LOG_QUERY = { collect: '수집', phase12: 'Phase 1+2', phase3: 'Phase 3', phase45: 'Phase 4+5' };
+        // v0.7.1: 현재 실행 중인 phase는 busy 상태로 표시 (icon이 회전)
+        const RUNNING_KEY_FOR_STATUS = {
+            collecting: 'collect',
+            phase12_running: 'phase12',
+            phase3_running: 'phase3',
+            phase45_running: 'phase45',
+        };
+        const runningKey = RUNNING_KEY_FOR_STATUS[run.status];
         el.innerHTML = steps.map(s => {
+            // 현재 실행 중인 phase면 busy로 덮어쓰기 (단, 이미 done인 경우는 유지)
+            if (runningKey === s.key && s.state !== 'done') {
+                s.state = 'busy';
+            }
             const cls = s.state === 'done' ? 'tw-step-done'
                 : s.state === 'fail' ? 'tw-step-fail'
                 : s.state === 'warn' ? 'tw-step-warn'
@@ -3663,8 +3681,9 @@
             const dataAttr = actionable ? ` data-phase-key="${escapeHtml(s.key)}"` : '';
             const actionableCls = actionable ? ' tw-step-actionable' : '';
             const titleSuffix = actionable ? ' · 클릭 시 로그 탭에서 해당 phase 항목 필터' : '';
+            const iconCls = s.state === 'busy' ? ' tw-batch-step-icon-spin' : '';
             return `<div class="tw-batch-step ${cls}${actionableCls}"${dataAttr} title="${escapeHtml(s.name)}: ${escapeHtml(s.state)}${titleSuffix}">
-                <span class="tw-batch-step-icon">${ICON[s.state] || '⭕'}</span>
+                <span class="tw-batch-step-icon${iconCls}">${ICON[s.state] || '⭕'}</span>
                 <span class="tw-batch-step-name">${escapeHtml(s.name)}</span>
                 ${s.detail ? `<span class="tw-batch-step-detail">${escapeHtml(s.detail)}</span>` : ''}
             </div>`;
@@ -4178,9 +4197,10 @@
     function onToggleHistory() {
         const panel = $('.tw-review-history-panel', modalEl);
         if (!panel) return;
-        const willShow = panel.classList.contains('tw-hidden');
-        if (willShow) renderHistoryPanel();
+        // v0.7.1: 토글을 먼저 적용한 뒤 렌더링해야 함.
+        // (renderHistoryPanel은 panel이 hidden이면 early-return하므로 순서가 중요)
         panel.classList.toggle('tw-hidden');
+        if (!panel.classList.contains('tw-hidden')) renderHistoryPanel();
     }
     function renderHistoryPanel() {
         const panel = $('.tw-review-history-panel', modalEl);
