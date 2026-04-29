@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.5.3
+// @version      0.5.4
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -42,6 +42,10 @@
     const SESSION_TTL_DAYS = 30;        // 30일 지난 세션은 자동 삭제
     const SESSION_CHECK_INTERVAL = 500; // ms, 세그먼트 변경 감지 폴링 주기
     const BATCH_DEFAULT_PAGE_SIZE = 50;
+    // localStorage quota 보호용: 최근 N개 run만 보관. activeRunId는 잘리지 않음.
+    const BATCH_RUNS_LIMIT = 10;
+    // appendBatchLog 핫패스에서 LS쓰기를 묶어 처리하기 위한 디바운스 간격 (ms).
+    const BATCH_LOG_PERSIST_DEBOUNCE_MS = 400;
     const BATCH_POLL_INTERVAL_MS = 5000;
     const BATCH_MAX_POLL_ATTEMPTS = 90;
     const BATCH_RESULT_RETRY_INTERVAL_MS = 2000;
@@ -1136,6 +1140,19 @@
     }
 
     function saveBatchRuns(runs) {
+        // GC: 최근 updatedAt 기준 BATCH_RUNS_LIMIT개만 보관. activeRunId는 무조건 포함.
+        const ids = Object.keys(runs || {});
+        if (ids.length > BATCH_RUNS_LIMIT) {
+            const activeId = getActiveBatchRunId();
+            const sorted = ids
+                .map(id => ({ id, ts: runs[id]?.updatedAt || runs[id]?.createdAt || '' }))
+                .sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+            const keep = new Set(sorted.slice(0, BATCH_RUNS_LIMIT).map(x => x.id));
+            if (activeId) keep.add(activeId);
+            for (const id of ids) {
+                if (!keep.has(id)) delete runs[id];
+            }
+        }
         lsSet(LS_KEYS.BATCH_RUNS, runs);
     }
 
@@ -1164,12 +1181,38 @@
 
     function persistBatchRun(run) {
         if (!run) return;
+        // 이전 디바운스 예약이 있으면 모두 치우고 즉시 쓰기로 적용.
+        if (_batchPersistTimer) {
+            clearTimeout(_batchPersistTimer);
+            _batchPersistTimer = null;
+            _batchPersistPending = null;
+        }
         run.updatedAt = new Date().toISOString();
         const runs = loadBatchRuns();
         runs[run.runId] = run;
         saveBatchRuns(runs);
         setActiveBatchRunId(run.runId);
     }
+
+    // appendBatchLog 같은 핫패스얩. 다음 중요 이벤트(persistBatchRun 직호출)
+    // 또는 BATCH_LOG_PERSIST_DEBOUNCE_MS 경과 시 플러시된다.
+    let _batchPersistTimer = null;
+    let _batchPersistPending = null;
+    function persistBatchRunDebounced(run) {
+        if (!run) return;
+        _batchPersistPending = run;
+        if (_batchPersistTimer) return;
+        _batchPersistTimer = setTimeout(() => {
+            const pending = _batchPersistPending;
+            _batchPersistTimer = null;
+            _batchPersistPending = null;
+            if (pending) persistBatchRun(pending);
+        }, BATCH_LOG_PERSIST_DEBOUNCE_MS);
+    }
+    // 페이지 숨김/닫힘 시 디바운스 대기중인 로그를 손실하지 않도록 즉시 플러시.
+    window.addEventListener('pagehide', () => {
+        if (_batchPersistPending) persistBatchRun(_batchPersistPending);
+    });
 
     function clearActiveBatchRun() {
         const runId = batchRun?.runId || getActiveBatchRunId();
@@ -1255,7 +1298,10 @@
             message,
         });
         if (run.logs.length > 300) run.logs = run.logs.slice(-300);
-        persistBatchRun(run);
+        // 핫패스 LS 쓰기를 디바운스. 중요 상태 변경(setBatchStatus,
+        // phase 결과, error, clearActiveBatchRun 등)은 다른 경로에서 persistBatchRun으로
+        // 즉시 플러시되므로 일관성이 유지된다.
+        persistBatchRunDebounced(run);
         renderBatchRun();
     }
 
@@ -3549,6 +3595,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.5.3] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.5.4] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
