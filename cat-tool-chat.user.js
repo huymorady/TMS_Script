@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.1
+// @version      0.7.2
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -2318,9 +2318,6 @@
         <span class="tw-review-failed-chips tw-hidden" title="클릭하면 해당 행으로 이동"></span>
         <button class="tw-btn tw-btn-ghost tw-btn-review-gc" title="현재 활성 batch run 외에 남아있는 직접 수정 데이터 정리">override 정리</button>
         <span class="tw-review-toolbar-divider"></span>
-        <label class="tw-review-filter-label" title="같은 project/file/language의 직전 run과 비교 (LLM 결과 drift 확인)">비교
-            <select class="tw-review-compare-select"><option value="">— 직전 run 선택 —</option></select>
-        </label>
         <label class="tw-review-filter-label tw-hidden tw-review-compare-overrides-label" title="비교 시 직접 수정(override)을 final에 덮어 표시 (실제 적용 결과 기준 drift)">
             <input type="checkbox" class="tw-review-compare-overrides" /> override 포함
         </label>
@@ -2819,21 +2816,28 @@
 .tw-compare-status-same { background: #1f2a1f; color: #86efac; border: 1px solid #2f4a32; }
 .tw-compare-status-changed { background: var(--tw-edit-soft); color: var(--tw-edit); border: 1px solid rgba(251, 191, 36, 0.4); }
 .tw-compare-status-only { background: rgba(52, 152, 219, 0.18); color: #93c5fd; border: 1px solid rgba(52, 152, 219, 0.4); }
-/* v0.7.0 G1-c: history 패널 — 같은 file의 과거 run 목록 */
+/* v0.7.0 G1-c: history 패널 — 같은 file의 과거 run 목록 (v0.7.2: 라벨 수정 + 비교 액션) */
 .tw-review-history-panel {
     margin: 6px 0; padding: 6px;
     border: 1px solid var(--tw-border); border-radius: 6px;
-    background: var(--tw-bg-2); max-height: 240px; overflow: auto;
+    background: var(--tw-bg-2); max-height: 280px; overflow: auto;
 }
 .tw-history-row {
-    display: grid; grid-template-columns: 140px 1fr 70px 60px 130px;
+    display: grid; grid-template-columns: 130px 1fr 110px 50px 200px;
     gap: 8px; padding: 5px 8px; align-items: center; font-size: 12px;
     border-bottom: 1px solid var(--tw-border);
 }
 .tw-history-row:last-child { border-bottom: none; }
 .tw-history-row.tw-history-active { background: rgba(74, 222, 128, 0.08); }
+.tw-history-row.tw-history-comparing { background: rgba(52, 152, 219, 0.10); }
 .tw-history-row.tw-history-head { font-weight: 600; color: var(--tw-accent); border-bottom: 1px solid var(--tw-border); }
 .tw-history-row > div { word-break: break-all; }
+.tw-history-row .tw-history-status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tw-history-row .tw-history-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.tw-history-row .tw-history-name-text { font-weight: 500; color: var(--tw-fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tw-history-row .tw-history-runid { font-size: 10px; color: var(--tw-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tw-history-row .tw-history-badge { display: inline-block; padding: 1px 5px; margin-left: 4px; font-size: 10px; border-radius: 3px; background: rgba(74, 222, 128, 0.18); color: var(--tw-success); }
+.tw-history-row .tw-history-badge.tw-history-badge-compare { background: rgba(52, 152, 219, 0.18); color: var(--tw-info); }
 .tw-history-actions { display: flex; gap: 4px; flex-wrap: wrap; }
 .tw-history-actions .tw-btn { padding: 2px 7px; font-size: 11px; }
 .tw-history-empty { padding: 12px; text-align: center; color: var(--tw-muted, #888); font-size: 12px; }
@@ -3126,7 +3130,6 @@
         }
 
         // v0.6.7 (C2): 비교 모드 select / 종료 버튼
-        $('.tw-review-compare-select', el).addEventListener('change', onCompareSelectChange);
         $('.tw-btn-review-compare-exit', el).addEventListener('click', onExitCompareMode);
         // v0.7.0 B5: override 포함 토글 — compare 모드에서만 노출
         $('.tw-review-compare-overrides', el).addEventListener('change', (e) => {
@@ -3147,6 +3150,12 @@
         $('.tw-review-history-panel', el).addEventListener('click', (e) => {
             const act = e.target.closest('.tw-btn-history-activate');
             if (act) { onActivateRun(act.getAttribute('data-run-id')); return; }
+            const cmp = e.target.closest('.tw-btn-history-compare');
+            if (cmp) { onCompareWithRun(cmp.getAttribute('data-run-id')); return; }
+            const cmpExit = e.target.closest('.tw-btn-history-compare-exit');
+            if (cmpExit) { onExitCompareMode(); return; }
+            const ren = e.target.closest('.tw-btn-history-rename');
+            if (ren) { onRenameRun(ren.getAttribute('data-run-id')); return; }
             const del = e.target.closest('.tw-btn-history-delete');
             if (del) { onDeleteRun(del.getAttribute('data-run-id')); return; }
         });
@@ -3621,7 +3630,7 @@
             } catch (_) { return 0; }
         })();
         el.innerHTML = `
-            <span class="tw-batch-run-id" title="runId: ${escapeHtml(String(run.runId || ''))}">🏃 ${escapeHtml(runIdShort)}</span>
+            <span class="tw-batch-run-id" title="runId: ${escapeHtml(String(run.runId || ''))}${run.label ? `\n라벨: ${run.label}` : ''}">🏃 ${escapeHtml(run.label || runIdShort)}</span>
             <span class="tw-batch-run-meta">project <b>${escapeHtml(String(run.projectId || '?'))}</b> / file <b>${escapeHtml(String(run.fileId || '?'))}</b> / lang <b>${escapeHtml(String(run.languageId || '?'))}</b></span>
             <span class="tw-batch-run-meta">override <b>${overrides}</b></span>
             <span class="tw-batch-run-stamp">${escapeHtml(stamp)}</span>
@@ -3954,48 +3963,30 @@
         toast(`로그 ${lines.length}건 다운로드 시작`, 'success');
     }
 
-    // v0.6.7 (C2): 비교 select 옵션 채우기 — 직전 run 후보를 updatedAt 내림차순으로
+    // v0.7.2: 비교 select를 제거하고 history 패널로 일원화—
+    // refreshCompareSelect는 이제 컨트롤만(exit 버튼 / override 체크박스 / history 렌더) 갱신
     function refreshCompareSelect(currentRun) {
         if (!modalEl) return;
-        const sel = $('.tw-review-compare-select', modalEl);
         const exitBtn = $('.tw-btn-review-compare-exit', modalEl);
-        if (!sel) return;
-        const runs = lsGet(LS_KEYS.BATCH_RUNS, {}) || {};
-        const priors = findPriorRunsForCurrent(runs, currentRun);
-        const selected = reviewView.compareRunId || '';
-        sel.innerHTML = '<option value="">— 직전 run 선택 —</option>' +
-            priors.map(r => {
-                const stamp = (r.updatedAt || '').slice(0, 19).replace('T', ' ');
-                const label = `${stamp} · ${r.runId}`;
-                const sel = String(r.runId) === String(selected) ? ' selected' : '';
-                return `<option value="${escapeHtml(r.runId)}"${sel}>${escapeHtml(label)}</option>`;
-            }).join('');
-        sel.disabled = !currentRun || priors.length === 0;
         if (exitBtn) exitBtn.classList.toggle('tw-hidden', !reviewView.compareMode);
         // v0.7.0 B5: override 포함 토글은 compare 모드에서만 노출하고 상태도 동기화
         const ovrLabel = $('.tw-review-compare-overrides-label', modalEl);
         const ovrChk = $('.tw-review-compare-overrides', modalEl);
         if (ovrLabel) ovrLabel.classList.toggle('tw-hidden', !reviewView.compareMode);
         if (ovrChk) ovrChk.checked = !!reviewView.compareIncludeOverrides;
+        // v0.7.2: history 패널이 열려있으면 active/comparing 표시 갱신
+        const panel = $('.tw-review-history-panel', modalEl);
+        if (panel && !panel.classList.contains('tw-hidden')) renderHistoryPanel();
     }
 
-    function onCompareSelectChange(e) {
-        const runId = String(e.target.value || '');
-        if (!runId) {
-            reviewView.compareMode = false;
-            reviewView.compareRunId = null;
-            renderReviewTable();
-            return;
-        }
-        reviewView.compareMode = true;
-        reviewView.compareRunId = runId;
-        renderReviewTable();
-    }
+    // v0.7.2: 비교 select 제거 후에도 남겨둔 프로그래마틱 입구—history 패널의 '비교' 버튼에서 호출
+    function onCompareSelectChange(/* legacy */) { /* no-op (kept for backward refs) */ }
 
     function onExitCompareMode() {
         reviewView.compareMode = false;
         reviewView.compareRunId = null;
         renderReviewTable();
+        renderHistoryPanel();
     }
 
     // v0.6.7 (C2): 비교 표 렌더 — current vs prior run, 같은 project/file/language
@@ -4218,23 +4209,39 @@
             return;
         }
         const activeId = getActiveBatchRunId();
+        const compareId = reviewView.compareMode ? reviewView.compareRunId : null;
         const head = `<div class="tw-history-row tw-history-head">
-    <div>업데이트</div><div>Run ID</div><div>상태</div><div>항목</div><div>동작</div>
+    <div>업데이트</div><div>이름 / Run ID</div><div>상태</div><div>항목</div><div>동작</div>
 </div>`;
         const body = sameFile.map(r => {
             const stamp = (r.updatedAt || r.createdAt || '').slice(0, 19).replace('T', ' ');
             const itemCount = r.phase3?.parsed?.translations?.length || 0;
             const statusLabel = (typeof BATCH_STATUS_LABELS === 'object' && BATCH_STATUS_LABELS[r.status]) || r.status || '-';
             const isActive = r.runId === activeId;
+            const isComparing = compareId && r.runId === compareId;
+            const displayName = r.label || r.runId;
+            const badges = [];
+            if (isActive) badges.push('<span class="tw-history-badge">현재</span>');
+            if (isComparing) badges.push('<span class="tw-history-badge tw-history-badge-compare">비교 중</span>');
+            // v0.7.2: 비교 버튼은 활성/현재 비교 중 row에서는 숨김
+            const compareBtn = (!isActive && !isComparing)
+                ? `<button class="tw-btn tw-btn-ghost tw-btn-history-compare" data-run-id="${escapeHtml(r.runId)}" title="이 run을 활성 run과 비교 (LLM 결과 drift)">↔ 비교</button>`
+                : (isComparing ? `<button class="tw-btn tw-btn-ghost tw-btn-history-compare-exit" title="비교 종료">⨯ 비교 종료</button>` : '');
             const activateBtn = isActive
                 ? ''
                 : `<button class="tw-btn tw-btn-ghost tw-btn-history-activate" data-run-id="${escapeHtml(r.runId)}" title="이 run을 활성으로 전환 (이후 review/log/compare가 이 run 기준이 됨)">✓ 활성화</button>`;
-            return `<div class="tw-history-row${isActive ? ' tw-history-active' : ''}">
+            const renameBtn = `<button class="tw-btn tw-btn-ghost tw-btn-history-rename" data-run-id="${escapeHtml(r.runId)}" title="이 run에 라벨 지정 / 변경 (runId는 유지)">✏ 이름</button>`;
+            const deleteBtn = `<button class="tw-btn tw-btn-ghost tw-btn-history-delete" data-run-id="${escapeHtml(r.runId)}" title="이 run 삭제 (override는 별도 키이므로 보존됨)">🗑 삭제</button>`;
+            const rowCls = (isActive ? ' tw-history-active' : '') + (isComparing ? ' tw-history-comparing' : '');
+            return `<div class="tw-history-row${rowCls}">
     <div title="${escapeHtml(r.createdAt || '')}">${escapeHtml(stamp || '-')}</div>
-    <div title="${escapeHtml(r.runId)}">${escapeHtml(r.runId)}${isActive ? ' <span class="tw-muted">(현재)</span>' : ''}</div>
-    <div>${escapeHtml(statusLabel)}</div>
+    <div class="tw-history-name">
+        <span class="tw-history-name-text" title="${escapeHtml(displayName)}">${escapeHtml(displayName)}${badges.join('')}</span>
+        ${r.label ? `<span class="tw-history-runid" title="${escapeHtml(r.runId)}">${escapeHtml(r.runId)}</span>` : ''}
+    </div>
+    <div class="tw-history-status" title="${escapeHtml(statusLabel)}">${escapeHtml(statusLabel)}</div>
     <div>${itemCount}</div>
-    <div class="tw-history-actions">${activateBtn}<button class="tw-btn tw-btn-ghost tw-btn-history-delete" data-run-id="${escapeHtml(r.runId)}" title="이 run 삭제 (override는 별도 키이므로 보존됨)">🗑 삭제</button></div>
+    <div class="tw-history-actions">${activateBtn}${compareBtn}${renameBtn}${deleteBtn}</div>
 </div>`;
         }).join('');
         panel.innerHTML = head + body;
@@ -4243,6 +4250,11 @@
         if (!runId) return;
         const runs = loadBatchRuns();
         if (!runs[runId]) { toast('run을 찾을 수 없습니다.', 'error'); return; }
+        // v0.7.2: 새로 활성화하는 run을 비교 대상으로 두면 안 되므로 자기 비교 충돌 시 비교 종료
+        if (reviewView.compareMode && reviewView.compareRunId === runId) {
+            reviewView.compareMode = false;
+            reviewView.compareRunId = null;
+        }
         setActiveBatchRunId(runId);
         syncBatchRunFromLs();
         renderBatchRun();
@@ -4263,8 +4275,50 @@
             batchRun = null;
             renderBatchRun();
         }
+        // v0.7.2: 비교 대상이 삭제되면 비교 모드 종료
+        if (reviewView.compareMode && reviewView.compareRunId === runId) {
+            reviewView.compareMode = false;
+            reviewView.compareRunId = null;
+            renderBatchRun();
+        }
         renderHistoryPanel();
         toast(`run ${runId} 삭제됨`, 'success');
+    }
+    // v0.7.2: 라벨 변경 — runId는 유지하고 사용자 친화적 이름만 추가/수정
+    function onRenameRun(runId) {
+        if (!runId) return;
+        const runs = loadBatchRuns();
+        const run = runs[runId];
+        if (!run) { toast('run을 찾을 수 없습니다.', 'error'); return; }
+        const current = run.label || '';
+        const next = prompt(`라벨 입력 (빈 값 + 확인 → 라벨 제거)\n\nrunId: ${runId}`, current);
+        if (next === null) return; // cancel
+        const trimmed = String(next || '').trim().slice(0, 80);
+        if (trimmed) run.label = trimmed; else delete run.label;
+        run.updatedAt = run.updatedAt || new Date().toISOString();
+        runs[runId] = run;
+        saveBatchRuns(runs);
+        // 활성 run이면 메모리 사본도 동기화
+        if (batchRun && batchRun.runId === runId) {
+            if (trimmed) batchRun.label = trimmed; else delete batchRun.label;
+            renderBatchRun();
+        }
+        renderHistoryPanel();
+        toast(trimmed ? `라벨 변경: "${trimmed}"` : '라벨 제거됨', 'success');
+    }
+    // v0.7.2: history 패널의 '비교' 버튼 — 활성 run과 비교 모드 진입
+    function onCompareWithRun(runId) {
+        if (!runId) return;
+        const activeId = getActiveBatchRunId();
+        if (!activeId) { toast('활성 run이 없어 비교할 수 없습니다.', 'warn'); return; }
+        if (runId === activeId) { toast('활성 run은 자신과 비교할 수 없습니다.', 'warn'); return; }
+        const runs = loadBatchRuns();
+        if (!runs[runId]) { toast('run을 찾을 수 없습니다.', 'error'); return; }
+        reviewView.compareMode = true;
+        reviewView.compareRunId = runId;
+        renderReviewTable();
+        renderHistoryPanel();
+        toast(`${runs[runId].label || runId} 와 비교 시작`, 'info');
     }
     function getBatchFinalText(id) {
         const run = batchRun || restoreActiveBatchRun();
