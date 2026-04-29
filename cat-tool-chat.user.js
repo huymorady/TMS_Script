@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.5.9
+// @version      0.6.0
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -28,6 +28,7 @@
         MODAL_SIZE: 'tms_workflow_modal_size_v1',
         BATCH_RUNS: 'tms_workflow_batch_runs_v1',
         ACTIVE_BATCH_RUN: 'tms_workflow_active_batch_run_v1',
+        APPLIED_FROM_BATCH: 'tms_workflow_applied_from_batch_v1', // v0.6.0 L3: textarea가 배치에서 자동 적용된 세그먼트 추적
     };
 
     const DEFAULT_PROMPT = {
@@ -829,7 +830,7 @@
     }
     function getSession(stringId) {
         const sessions = loadSessions();
-        return sessions[stringId] || { messages: [], updated: Date.now() };
+        return sessions[stringId] || { messages: [], system: null, source: 'manual', importedFromRunId: null, importedAt: null, updated: Date.now() };
     }
     function setSession(stringId, session) {
         const sessions = loadSessions();
@@ -1150,6 +1151,92 @@
     }
 
     // ========================================================================
+    // v0.6.0 L3: applied-from-batch 추적 (textarea가 배치 자동 적용분인지 식별)
+    // ========================================================================
+    // 짧은 동기 해시 (djb2 32-bit). crypto.subtle은 비동기·과대 — 여기선 변경 감지만 하므로 충돌 무시 가능.
+    function hashTextShort(s) {
+        const str = String(s ?? '');
+        let h = 5381;
+        for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+        return (h >>> 0).toString(36);
+    }
+    function loadAppliedFromBatch() {
+        return lsGet(LS_KEYS.APPLIED_FROM_BATCH, {});
+    }
+    function saveAppliedFromBatch(map) {
+        lsSet(LS_KEYS.APPLIED_FROM_BATCH, map);
+    }
+    function recordAppliedFromBatch(stringId, runId, phase, text) {
+        const map = loadAppliedFromBatch();
+        map[normalizeId(stringId)] = {
+            runId: runId || null,
+            appliedAt: new Date().toISOString(),
+            phase: phase || 'phase3',
+            hash: hashTextShort(text),
+            text: String(text ?? ''),
+        };
+        saveAppliedFromBatch(map);
+    }
+    function clearAppliedFromBatch(stringId) {
+        const map = loadAppliedFromBatch();
+        if (map[normalizeId(stringId)] !== undefined) {
+            delete map[normalizeId(stringId)];
+            saveAppliedFromBatch(map);
+        }
+    }
+    function getAppliedFromBatch(stringId) {
+        const map = loadAppliedFromBatch();
+        return map[normalizeId(stringId)] || null;
+    }
+
+    // ========================================================================
+    // v0.6.0 L1: batch 결과를 chat 세션 system 메시지로 시드
+    // ========================================================================
+    function importBatchResultToChat(stringId, run, options = {}) {
+        const id = normalizeId(stringId);
+        if (!run) throw new Error('활성 batch run이 없습니다.');
+        const phase45Ok = !!run.phase45?.validation?.ok;
+        const requested = options.phase || 'auto';
+        const phase = (requested === 'phase45' || (requested === 'auto' && phase45Ok)) ? 'phase45' : 'phase3';
+
+        const phase3Item = (run.phase3?.parsed?.translations || []).find(t => normalizeId(t.id) === id);
+        const revisionItem = (run.phase45?.parsed?.revisions || []).find(r => normalizeId(r.id) === id);
+        const segItem = (run.segments || []).find(s => normalizeId(s.id) === id);
+
+        let candidateText = '';
+        if (phase === 'phase45' && revisionItem && revisionItem.t !== null && revisionItem.t !== undefined) {
+            candidateText = String(revisionItem.t);
+        } else if (phase3Item) {
+            candidateText = String(phase3Item.t || '');
+        }
+        if (!candidateText) throw new Error(`#${id} 배치 결과에서 사용할 텍스트가 없습니다.`);
+
+        const sysLines = [];
+        sysLines.push(`이 세션은 batch run ${run.runId || '?'} 의 ${phase} 결과로 시드되었습니다.`);
+        if (segItem?.origin_string) sysLines.push(`원문: ${segItem.origin_string}`);
+        if (phase3Item?.t) sysLines.push(`Phase 3 후보: ${phase3Item.t}`);
+        if (revisionItem) {
+            if (revisionItem.t === null) {
+                sysLines.push(`Phase 4+5: 유지 (Phase 3 그대로 사용)`);
+            } else if (revisionItem.t !== undefined) {
+                const reasons = Array.isArray(revisionItem.r) && revisionItem.r.length ? ` [근거: ${revisionItem.r.join(', ')}]` : '';
+                sysLines.push(`Phase 4+5 수정안: ${revisionItem.t}${reasons}`);
+            }
+        }
+        sysLines.push(`이 후보를 출발점으로, 이후 사용자 요청에 따라 다듬으세요.`);
+        const systemText = sysLines.join('\n');
+
+        const session = getSession(id);
+        session.messages = [{ role: 'ai', content: candidateText }];
+        session.system = systemText;
+        session.source = 'batch_import';
+        session.importedFromRunId = run.runId || null;
+        session.importedAt = new Date().toISOString();
+        setSession(id, session);
+        return { phase, text: candidateText };
+    }
+
+    // ========================================================================
     // 컨텍스트 수집
     // ========================================================================
     function buildSegmentContext(segment) {
@@ -1185,11 +1272,16 @@
     // ========================================================================
     // 프롬프트 조립
     // ========================================================================
-    function buildPrefixPrompt(systemPrompt, segmentContext, history, userMessage) {
+    function buildPrefixPrompt(systemPrompt, segmentContext, history, userMessage, sessionSystem) {
         const sections = [];
 
         if (systemPrompt && systemPrompt.trim()) {
             sections.push(`=== 시스템 지침 ===\n${systemPrompt.trim()}`);
+        }
+
+        // v0.6.0 L1: batch import 시드된 컬텍스트 (segment context 보다 먼저 표시)
+        if (sessionSystem && String(sessionSystem).trim()) {
+            sections.push(`=== 배치 컬텍스트 ===\n${String(sessionSystem).trim()}`);
         }
 
         if (segmentContext) {
@@ -2295,6 +2387,14 @@
             const applyBtn = e.target.closest('.tw-btn-apply-final');
             if (applyBtn) {
                 await applyBatchTranslationsByIds([Number(applyBtn.dataset.id)]);
+                renderReviewTable(); // v0.6.0: applied 배지 즉시 반영
+                return;
+            }
+
+            // v0.6.0 L2: review → chat 점프
+            const refineBtn = e.target.closest('.tw-btn-chat-refine');
+            if (refineBtn) {
+                await onChatRefineFromReview(Number(refineBtn.dataset.id));
             }
         });
 
@@ -2660,6 +2760,16 @@
         }
 
         injectTextareaValue(textarea, text);
+        // v0.6.0 L3: 적용 성공 기록 (drift 감지 용)
+        try {
+            const run = batchRun || restoreActiveBatchRun();
+            if (run?.runId) {
+                const phase = run.phase45?.validation?.ok ? 'phase45' : 'phase3';
+                recordAppliedFromBatch(id, run.runId, phase, text);
+            }
+        } catch (err) {
+            console.warn('[TMS-WF] applied-from-batch 기록 실패', err);
+        }
         return { id, ok: true };
     }
 
@@ -2691,6 +2801,46 @@
             : `입력 완료 ${success}개`;
         updateReviewApplyStatus(message);
         toast(message, failures.length ? 'info' : 'success', 4000);
+    }
+
+    // v0.6.0 L2: review 행 → chat 탭 점프 (단일 세그먼트 다듬기 모드)
+    async function onChatRefineFromReview(stringId) {
+        const id = normalizeId(stringId);
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run) { toast('활성 배치 실행이 없습니다.', 'error'); return; }
+        if (!getBatchFinalText(id)) { toast(`#${id} 적용 가능한 배치 결과가 없습니다.`, 'error'); return; }
+
+        // 페이지 DOM에 있으면 스크롤+클릭으로 활성화 (segmentWatcher가 자동 따라잡지만 확정성 위해 수동 호출도 함)
+        const item = findStringItemByStringId(id);
+        if (item) {
+            item.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            item.click();
+            await sleep(120);
+        } else {
+            toast(`#${id} 세그먼트가 현재 페이지 DOM에 없어 자동 활성화는 생략됩니다.`, 'info');
+        }
+
+        // 기존 chat 메시지가 있으면 덮어쓰기 confirm
+        const existing = getSession(id);
+        if (existing.messages && existing.messages.length > 0) {
+            if (!confirm(`#${id}에 이미 ${existing.messages.length}개의 chat 메시지가 있습니다.\n배치 결과로 새로 시드하면 기존 대화는 사라집니다. 계속하시겠습니까?`)) {
+                return;
+            }
+        }
+
+        try {
+            importBatchResultToChat(id, run);
+        } catch (err) {
+            toast(`시드 실패: ${err.message}`, 'error');
+            return;
+        }
+
+        currentStringId = id;
+        try { await loadSegmentInfo(id); } catch (err) { console.warn('[TMS-WF] loadSegmentInfo 실패', err); }
+        setMainTab('chat');
+        renderChatHistory();
+        appendBatchLog(`#${id} chat 다듬기 모드로 시드됨`, 'info');
+        toast(`#${id} chat 다듬기 모드로 전환됨`, 'success');
     }
 
     function renderReviewTable() {
@@ -2730,10 +2880,19 @@
             const chatBadge = workState.chat.hasSession
                 ? `<span class="tw-review-chat-badge" title="채팅 세션 ${workState.chat.messageCount}개 메시지">💬</span>`
                 : '';
+            // v0.6.0 L3: applied-from-batch 배지
+            const applied = getAppliedFromBatch(id);
+            let appliedBadge = '';
+            if (applied) {
+                const ta = findTranslationTextareaForStringId(id);
+                const drifted = ta && ta.value !== applied.text;
+                const tip = `배치에서 자동 적용됨 (run ${applied.runId || '?'}, ${applied.phase})${drifted ? ' — 이후 수정됨' : ''}`;
+                appliedBadge = ` <span class="tw-review-applied-badge" title="${escapeHtml(tip)}">${drifted ? '🤖→✏️' : '🤖'}</span>`;
+            }
             return `
 <div class="tw-review-row">
     <div class="tw-review-cell tw-review-check" data-label="선택"><input class="tw-review-select" type="checkbox" data-id="${escapeHtml(id)}"></div>
-    <div class="tw-review-cell" data-label="ID">#${escapeHtml(id)}${chatBadge}</div>
+    <div class="tw-review-cell" data-label="ID">#${escapeHtml(id)}${chatBadge}${appliedBadge}</div>
     <div class="tw-review-cell" data-label="그룹">${escapeHtml(item.gid || '')}</div>
     <div class="tw-review-cell tw-review-source" data-label="원문">${escapeHtml(seg?.origin_string || '')}</div>
     <div class="tw-review-cell" data-label="Phase 3">${escapeHtml(item.t || '')}</div>
@@ -2742,6 +2901,7 @@
     <div class="tw-review-cell tw-review-actions" data-label="동작">
         <button class="tw-btn tw-btn-primary tw-btn-apply-final" data-id="${escapeHtml(id)}">입력</button>
         <button class="tw-btn tw-btn-ghost tw-btn-copy-final" data-id="${escapeHtml(id)}">복사</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-chat-refine" data-id="${escapeHtml(id)}" title="chat 탭에서 이 세그먼트를 다듬기">다듬기</button>
         <div class="tw-muted">${escapeHtml(flag)}</div>
     </div>
 </div>`;
@@ -3140,6 +3300,12 @@
         const session = getSession(currentStringId);
         messagesEl.innerHTML = '';
 
+        // v0.6.0 L1: batch import 시드 배지 노출
+        if (session.system && session.source === 'batch_import') {
+            const tag = session.importedFromRunId ? ` (run ${session.importedFromRunId})` : '';
+            appendMessage('system', `📦 배치 결과로 시드됨${tag} — 아래 후보를 출발점으로 요청을 입력하세요.`);
+        }
+
         if (!session.messages.length) {
             appendMessage('system', '새 세션입니다. 번역 요청을 입력하세요.');
         } else {
@@ -3204,7 +3370,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
             // 대화 이력은 방금 추가한 user를 제외하고 과거만
             const history = session.messages.slice(0, -1);
-            const prefixPrompt = buildPrefixPrompt(systemPrompt, segmentCtx, history, userMessage);
+            const prefixPrompt = buildPrefixPrompt(systemPrompt, segmentCtx, history, userMessage, session.system || null);
 
             // 콘솔에 최종 프롬프트 출력 (디버그)
             console.groupCollapsed('[TMS Workflow] prefix_prompt 전송');
@@ -3298,6 +3464,8 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         // 값 주입
         try {
             injectTextareaValue(textarea, translation);
+            // v0.6.0 L3: chat에서 채택한 순간 출처가 batch→chat으로 전환되므로 applied 기록 제거
+            try { clearAppliedFromBatch(currentStringId); } catch (err) { console.warn('[TMS-WF] applied 기록 제거 실패', err); }
             toast('번역 입력창에 채웠습니다. 확인 후 저장하세요.', 'success');
             console.log('[TMS-WF] textarea 주입 완료:', translation.slice(0, 50) + '...');
             hideModal();
@@ -3734,6 +3902,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.5.9] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.6.0] 로드됨. Alt+Z로 모달 오픈 (L1 batch→chat import + L2 review→chat jump + L3 applied tracking)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
