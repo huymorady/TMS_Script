@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.8
+// @version      0.6.9
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -1469,7 +1469,7 @@
             if (cloned.phase45) delete cloned.phase45.raw;
         }
         cloned.exportedAt = new Date().toISOString();
-        cloned.exportedFromVersion = '0.6.8';
+        cloned.exportedFromVersion = '0.6.9';
         return JSON.stringify(cloned, null, 2);
     }
 
@@ -2215,13 +2215,15 @@
             </div>
             <div class="tw-batch-status">대기 중</div>
         </div>
+        <!-- v0.6.9 (G1-a): 활성 run 헤더 카드 -->
+        <div class="tw-batch-run-header tw-hidden"></div>
+        <!-- v0.6.9 (G1-b): Phase stepper -->
+        <div class="tw-batch-stepper"></div>
+        <!-- v0.6.9 (G1-d): 수집/검증 결과 카드 (클릭 시 review 탭 필터 자동 적용) -->
+        <div class="tw-batch-summary-cards"></div>
         <div class="tw-batch-card">
             <div class="tw-context-label">파일 정보</div>
             <div class="tw-batch-file-info tw-context-value">아직 수집 전입니다.</div>
-        </div>
-        <div class="tw-batch-card">
-            <div class="tw-context-label">검증 요약</div>
-            <div class="tw-batch-validation tw-context-value">Phase 결과가 여기에 표시됩니다.</div>
         </div>
         <div class="tw-batch-warning tw-muted"></div>
         <div class="tw-context-label">수집 세그먼트</div>
@@ -2494,6 +2496,66 @@
     flex: 1; overflow: auto; background: #181818; border: 1px solid #333;
     border-radius: 6px; padding: 10px; font-size: 12px; line-height: 1.5;
 }
+/* v0.6.9 (G1-a): 활성 run 헤더 카드 */
+.tw-batch-run-header {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    padding: 8px 10px; border: 1px solid var(--tw-border); border-radius: 8px;
+    background: linear-gradient(135deg, rgba(74,222,128,0.06) 0%, var(--tw-bg-2) 70%);
+    font-size: 12px;
+}
+.tw-batch-run-header .tw-batch-run-id {
+    font-family: monospace; color: var(--tw-accent); font-weight: 600;
+    background: rgba(74,222,128,0.1); padding: 2px 8px; border-radius: 4px;
+}
+.tw-batch-run-header .tw-batch-run-meta { color: var(--tw-muted); }
+.tw-batch-run-header .tw-batch-run-meta b { color: var(--tw-fg); font-weight: 500; }
+.tw-batch-run-header .tw-batch-run-stamp { margin-left: auto; color: var(--tw-muted); font-size: 11px; }
+/* v0.6.9 (G1-b): Phase stepper */
+.tw-batch-stepper {
+    display: flex; align-items: stretch; gap: 0; flex-wrap: nowrap;
+    padding: 0; background: transparent; min-height: 36px;
+}
+.tw-batch-stepper:empty { display: none; }
+.tw-batch-step {
+    flex: 1; display: flex; align-items: center; gap: 6px;
+    padding: 6px 10px; border: 1px solid var(--tw-border);
+    background: var(--tw-bg-1); font-size: 11px; color: var(--tw-muted);
+    position: relative; min-width: 0;
+}
+.tw-batch-step:not(:last-child) { border-right: none; }
+.tw-batch-step:first-child { border-top-left-radius: 6px; border-bottom-left-radius: 6px; }
+.tw-batch-step:last-child { border-top-right-radius: 6px; border-bottom-right-radius: 6px; }
+.tw-batch-step .tw-batch-step-icon { font-size: 14px; line-height: 1; flex-shrink: 0; }
+.tw-batch-step .tw-batch-step-name { font-weight: 500; color: var(--tw-fg); }
+.tw-batch-step .tw-batch-step-detail { font-size: 10px; color: var(--tw-muted); margin-left: auto; white-space: nowrap; }
+.tw-batch-step.tw-step-done { background: rgba(39, 174, 96, 0.10); border-color: rgba(39, 174, 96, 0.4); }
+.tw-batch-step.tw-step-done .tw-batch-step-name { color: var(--tw-success); }
+.tw-batch-step.tw-step-warn { background: rgba(250, 204, 21, 0.08); border-color: rgba(250, 204, 21, 0.4); }
+.tw-batch-step.tw-step-warn .tw-batch-step-name { color: var(--tw-warn); }
+.tw-batch-step.tw-step-fail { background: rgba(231, 76, 60, 0.10); border-color: rgba(231, 76, 60, 0.4); }
+.tw-batch-step.tw-step-fail .tw-batch-step-name { color: var(--tw-danger); }
+.tw-batch-step.tw-step-busy { background: rgba(52, 152, 219, 0.10); border-color: rgba(52, 152, 219, 0.4); }
+.tw-batch-step.tw-step-busy .tw-batch-step-name { color: var(--tw-info); }
+/* v0.6.9 (G1-d): 수집/검증 결과 카드 그리드 */
+.tw-batch-summary-cards {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 8px;
+}
+.tw-batch-summary-cards:empty { display: none; }
+.tw-summary-card {
+    padding: 8px 10px; border: 1px solid var(--tw-border); border-radius: 6px;
+    background: var(--tw-bg-2); display: flex; flex-direction: column; gap: 2px;
+    min-height: 60px; transition: transform 0.08s ease, border-color 0.12s ease;
+}
+.tw-summary-card.tw-summary-clickable { cursor: pointer; }
+.tw-summary-card.tw-summary-clickable:hover { border-color: var(--tw-accent); transform: translateY(-1px); }
+.tw-summary-card .tw-summary-label { font-size: 11px; color: var(--tw-muted); text-transform: uppercase; letter-spacing: 0.4px; }
+.tw-summary-card .tw-summary-value { font-size: 16px; font-weight: 600; color: var(--tw-fg); line-height: 1.2; }
+.tw-summary-card .tw-summary-sub { font-size: 11px; color: var(--tw-muted); margin-top: 2px; }
+.tw-summary-card.tw-summary-ok .tw-summary-value { color: var(--tw-success); }
+.tw-summary-card.tw-summary-warn .tw-summary-value { color: var(--tw-warn); }
+.tw-summary-card.tw-summary-fail .tw-summary-value { color: var(--tw-danger); }
+.tw-summary-card.tw-summary-info .tw-summary-value { color: var(--tw-info); }
 .tw-review-summary { flex-shrink: 0; }
 .tw-review-toolbar {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -2911,6 +2973,10 @@
         $('.tw-btn-review-failed-toggle', el).addEventListener('click', onToggleFailedOnly);
         $('.tw-review-failed-chips', el).addEventListener('click', onFailedChipClick);
 
+        // v0.6.9 (G1-d): 배치 패널 요약 카드 → review 탭 점프
+        const batchCards = $('.tw-batch-summary-cards', el);
+        if (batchCards) batchCards.addEventListener('click', onBatchSummaryCardClick);
+
         // v0.6.7 (C2): 비교 모드 select / 종료 버튼
         $('.tw-review-compare-select', el).addEventListener('change', onCompareSelectChange);
         $('.tw-btn-review-compare-exit', el).addEventListener('click', onExitCompareMode);
@@ -3196,6 +3262,42 @@
         return `주의 필요${counts}${issueStr}`;
     }
 
+    // v0.6.9 (G1-d): 배치 패널 카드용 요약 통계 — 순수 함수, run만 보고 집계
+    // 반환 구조:
+    //   { segments, phase3:{state,actual,expected}, phase45:{state,changed,kept,total},
+    //     warns:{charLimit,order,tb,total}, applied:{count,drifted,unknown}, lastError }
+    function buildBatchSummaryStats(run) {
+        if (!run) return null;
+        const segments = (run.segments || []).length;
+        // phase3
+        const p3v = run.phase3?.validation;
+        const p3 = { state: 'pending', actual: 0, expected: 0 };
+        if (p3v) {
+            const cov = p3v.coverage || {};
+            p3.actual = cov.actualCount || 0;
+            p3.expected = cov.expectedCount || 0;
+            p3.state = p3v.ok ? 'ok' : 'fail';
+        }
+        // phase45
+        const p45v = run.phase45?.validation;
+        const revisions = run.phase45?.parsed?.revisions || [];
+        const changed = revisions.filter(r => r.t !== null && r.t !== undefined).length;
+        const kept = revisions.length - changed;
+        const p45 = {
+            state: p45v ? (p45v.ok ? 'ok' : 'fail') : 'pending',
+            changed, kept, total: revisions.length,
+        };
+        // warn-only (phase45 우선, 없으면 phase3 폴백)
+        const warnSrc = (p45v?.warnings ? p45v : (run.phase3?.validation || {})).warnings || {};
+        const warns = {
+            charLimit: (warnSrc.charLimitOver || []).length,
+            order: (warnSrc.placeholderOrderMismatch || []).length,
+            tb: (warnSrc.tbTermsMissed || []).length,
+        };
+        warns.total = warns.charLimit + warns.order + warns.tb;
+        return { segments, phase3: p3, phase45: p45, warns, lastError: run.lastError || null };
+    }
+
     function renderBatchRun() {
         if (!modalEl) return;
         const run = batchRun || restoreActiveBatchRun();
@@ -3203,17 +3305,18 @@
 
         const statusEl = $('.tw-batch-status', modalEl);
         const fileInfoEl = $('.tw-batch-file-info', modalEl);
-        const validationEl = $('.tw-batch-validation', modalEl);
         const warningEl = $('.tw-batch-warning', modalEl);
         const segmentsEl = $('.tw-batch-segments', modalEl);
-        if (!statusEl || !fileInfoEl || !validationEl || !warningEl || !segmentsEl) return;
+        if (!statusEl || !fileInfoEl || !warningEl || !segmentsEl) return;
 
         if (!run) {
             statusEl.textContent = '대기 중';
             fileInfoEl.textContent = '아직 수집 전입니다.';
-            validationEl.textContent = 'Phase 결과가 여기에 표시됩니다.';
             warningEl.textContent = '';
             segmentsEl.innerHTML = '<span class="tw-muted">현재 페이지 수집을 먼저 실행하세요.</span>';
+            renderBatchRunHeader(null);
+            renderBatchPhaseStepper(null);
+            renderBatchSummaryCards(null);
             updateBatchButtons(null);
             renderBatchTimeline(null);
             renderLogOutput();
@@ -3230,12 +3333,9 @@
             `model=${run.model || '-'}`,
         ].join('\n');
 
-        validationEl.textContent = [
-            `Phase 1+2: ${formatPhaseValidation(run.phase12?.validation)}`,
-            `Phase 3: ${formatPhaseValidation(run.phase3?.validation)}`,
-            `Phase 4+5: ${formatPhaseValidation(run.phase45?.validation)}`,
-            run.lastError ? `마지막 오류: ${run.lastError}` : null,
-        ].filter(Boolean).join('\n');
+        renderBatchRunHeader(run);
+        renderBatchPhaseStepper(run);
+        renderBatchSummaryCards(run);
 
         warningEl.textContent = run.storageStringId
             ? `주의: Phase 실행 결과는 storageStringId ${run.storageStringId}의 번역 칸에 저장됩니다. 테스트 후 수동 정리가 필요해요.`
@@ -3255,6 +3355,213 @@
         updateBatchButtons(run);
         renderBatchTimeline(run);
         renderLogOutput();
+        renderReviewTable();
+    }
+
+    // v0.6.9 (G1-a): 활성 run 헤더 카드
+    function renderBatchRunHeader(run) {
+        const el = $('.tw-batch-run-header', modalEl);
+        if (!el) return;
+        if (!run) {
+            el.classList.add('tw-hidden');
+            el.innerHTML = '';
+            return;
+        }
+        el.classList.remove('tw-hidden');
+        const runIdShort = String(run.runId || '').slice(-12) || '?';
+        const stamp = run.updatedAt ? String(run.updatedAt).slice(0, 19).replace('T', ' ') : '';
+        const overrides = (function () {
+            try {
+                const all = loadReviewOverrides();
+                return Object.keys(all[run.runId] || {}).length;
+            } catch (_) { return 0; }
+        })();
+        el.innerHTML = `
+            <span class="tw-batch-run-id" title="runId: ${escapeHtml(String(run.runId || ''))}">🏃 ${escapeHtml(runIdShort)}</span>
+            <span class="tw-batch-run-meta">project <b>${escapeHtml(String(run.projectId || '?'))}</b> / file <b>${escapeHtml(String(run.fileId || '?'))}</b> / lang <b>${escapeHtml(String(run.languageId || '?'))}</b></span>
+            <span class="tw-batch-run-meta">override <b>${overrides}</b></span>
+            <span class="tw-batch-run-stamp">${escapeHtml(stamp)}</span>
+        `;
+    }
+
+    // v0.6.9 (G1-b): Phase stepper — 단계별 상태 시각화
+    function renderBatchPhaseStepper(run) {
+        const el = $('.tw-batch-stepper', modalEl);
+        if (!el) return;
+        if (!run) { el.innerHTML = ''; return; }
+        const busyStatus = run.status === 'collecting';
+        const steps = [
+            {
+                key: 'collect', name: '수집',
+                state: (run.segments && run.segments.length) ? 'done' : (busyStatus ? 'busy' : 'idle'),
+                detail: run.segments?.length ? `${run.segments.length}개` : '',
+            },
+            {
+                key: 'phase12', name: 'Phase 1+2',
+                state: phaseStateFor(run.phase12),
+                detail: phaseStateDetail(run.phase12),
+            },
+            {
+                key: 'phase3', name: 'Phase 3',
+                state: phaseStateFor(run.phase3),
+                detail: phaseStateDetail(run.phase3),
+            },
+            {
+                key: 'phase45', name: 'Phase 4+5',
+                state: phaseStateFor(run.phase45),
+                detail: phaseStateDetail(run.phase45),
+            },
+        ];
+        const ICON = { idle: '⭕', busy: '🔄', done: '✅', warn: '⚠', fail: '❌' };
+        el.innerHTML = steps.map(s => {
+            const cls = s.state === 'done' ? 'tw-step-done'
+                : s.state === 'fail' ? 'tw-step-fail'
+                : s.state === 'warn' ? 'tw-step-warn'
+                : s.state === 'busy' ? 'tw-step-busy'
+                : '';
+            return `<div class="tw-batch-step ${cls}" title="${escapeHtml(s.name)}: ${escapeHtml(s.state)}">
+                <span class="tw-batch-step-icon">${ICON[s.state] || '⭕'}</span>
+                <span class="tw-batch-step-name">${escapeHtml(s.name)}</span>
+                ${s.detail ? `<span class="tw-batch-step-detail">${escapeHtml(s.detail)}</span>` : ''}
+            </div>`;
+        }).join('');
+    }
+
+    function phaseStateFor(phase) {
+        if (!phase) return 'idle';
+        if (phase.validation) return phase.validation.ok ? 'done' : 'fail';
+        if (phase.parsed || phase.raw) return 'warn'; // 결과는 있는데 검증 미완
+        return 'idle';
+    }
+    function phaseStateDetail(phase) {
+        const c = phase?.validation?.coverage;
+        if (c && (c.actualCount != null) && (c.expectedCount != null)) return `${c.actualCount}/${c.expectedCount}`;
+        return '';
+    }
+
+    // v0.6.9 (G1-d): 수집/검증 결과 카드 — 클릭 시 review 탭 필터 자동 적용
+    function renderBatchSummaryCards(run) {
+        const el = $('.tw-batch-summary-cards', modalEl);
+        if (!el) return;
+        if (!run) { el.innerHTML = ''; return; }
+        const stats = buildBatchSummaryStats(run);
+        if (!stats) { el.innerHTML = ''; return; }
+
+        const cards = [];
+        // 세그먼트 카드 (정보용, 클릭 비활성)
+        cards.push({
+            cls: 'tw-summary-info',
+            label: '세그먼트',
+            value: `${stats.segments}개`,
+            sub: stats.segments ? '수집 OK' : '미수집',
+        });
+        // Phase 3
+        if (stats.phase3.state !== 'pending') {
+            const okCls = stats.phase3.state === 'ok' ? 'tw-summary-ok' : 'tw-summary-fail';
+            cards.push({
+                cls: okCls,
+                label: 'Phase 3',
+                value: `${stats.phase3.actual}/${stats.phase3.expected}`,
+                sub: stats.phase3.state === 'ok' ? '검증 통과' : '검증 실패',
+            });
+        }
+        // Phase 4+5 — changed/kept 클릭 가능
+        if (stats.phase45.state !== 'pending') {
+            cards.push({
+                cls: stats.phase45.state === 'ok' ? 'tw-summary-ok' : 'tw-summary-warn',
+                label: 'Phase 4+5 변경',
+                value: `${stats.phase45.changed}`,
+                sub: `유지 ${stats.phase45.kept} · 합 ${stats.phase45.total}`,
+                clickFilter: 'edited',
+            });
+        }
+        // Warn (있을 때만)
+        if (stats.warns.total > 0) {
+            const warnDetails = [];
+            if (stats.warns.charLimit) warnDetails.push({ value: stats.warns.charLimit, label: '길이', filter: 'warn-charlimit' });
+            if (stats.warns.order) warnDetails.push({ value: stats.warns.order, label: '순서', filter: 'warn-order' });
+            if (stats.warns.tb) warnDetails.push({ value: stats.warns.tb, label: '용어', filter: 'warn-tb' });
+            // 각 warn 종류별 카드
+            for (const w of warnDetails) {
+                cards.push({
+                    cls: 'tw-summary-warn',
+                    label: `Warn ${w.label}`,
+                    value: `${w.value}`,
+                    sub: '클릭 → 검토 필터',
+                    clickFilter: w.filter,
+                });
+            }
+        }
+        // Applied / Drift
+        const driftStats = computeAppliedStats(run);
+        if (driftStats.count > 0) {
+            cards.push({
+                cls: driftStats.drifted > 0 ? 'tw-summary-warn' : 'tw-summary-ok',
+                label: 'Applied',
+                value: `${driftStats.count}`,
+                sub: driftStats.drifted > 0
+                    ? `drift ${driftStats.drifted} · 확인불가 ${driftStats.unknown}`
+                    : `drift 0`,
+                clickFilter: driftStats.drifted > 0 ? 'drifted' : 'applied',
+            });
+        }
+        // 마지막 오류
+        if (stats.lastError) {
+            cards.push({
+                cls: 'tw-summary-fail',
+                label: '마지막 오류',
+                value: '❌',
+                sub: String(stats.lastError).slice(0, 80),
+            });
+        }
+        el.innerHTML = cards.map(c => `
+            <div class="tw-summary-card ${c.cls} ${c.clickFilter ? 'tw-summary-clickable' : ''}"
+                 ${c.clickFilter ? `data-jump-filter="${escapeHtml(c.clickFilter)}"` : ''}
+                 ${c.clickFilter ? `title="검토 탭으로 이동하고 필터 '${escapeHtml(c.clickFilter)}' 적용"` : ''}>
+                <div class="tw-summary-label">${escapeHtml(c.label)}</div>
+                <div class="tw-summary-value">${escapeHtml(c.value)}</div>
+                ${c.sub ? `<div class="tw-summary-sub">${escapeHtml(c.sub)}</div>` : ''}
+            </div>
+        `).join('');
+    }
+
+    // 헬퍼: applied/drift 집계 (renderReviewTable의 로직 발췌, 카드용 경량 버전)
+    function computeAppliedStats(run) {
+        const out = { count: 0, drifted: 0, unknown: 0 };
+        if (!run?.phase3?.parsed?.translations) return out;
+        const segmentById = new Map((run.segments || []).map(seg => [normalizeId(seg.id), seg]));
+        for (const tr of run.phase3.parsed.translations) {
+            const id = normalizeId(tr.id);
+            const a = getAppliedFromBatch(id);
+            if (!a || (run.runId && a.runId && a.runId !== run.runId)) continue;
+            out.count += 1;
+            const ta = findTranslationTextareaForStringId(id);
+            if (ta) {
+                if (ta.value !== a.text) out.drifted += 1;
+            } else {
+                const seg = segmentById.get(id);
+                const cur = seg?.active_result?.result;
+                if (typeof cur === 'string') {
+                    if (cur !== a.text) out.drifted += 1;
+                } else {
+                    out.unknown += 1;
+                }
+            }
+        }
+        return out;
+    }
+
+    // v0.6.9 (G1-d): 카드 클릭 → review 탭으로 이동 + 필터 적용
+    function onBatchSummaryCardClick(e) {
+        const card = e.target.closest('.tw-summary-card.tw-summary-clickable');
+        if (!card) return;
+        const filter = card.getAttribute('data-jump-filter');
+        if (!filter) return;
+        // 비교 모드는 끄고 필터만 적용
+        reviewView.compareMode = false;
+        reviewView.compareRunId = null;
+        reviewView.filter = filter;
+        setMainTab('review');
         renderReviewTable();
     }
 
@@ -5048,11 +5355,13 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             findPriorRunsForCurrent, buildRunCompareRows,
             buildCsvFromRun, buildJsonExportFromRun,
             buildFilteredLogLines,
+            // v0.6.9 (G1-d): 배치 패널 카드 통계
+            buildBatchSummaryStats,
             // misc
             escapeHtml, LS_KEYS,
         };
     }
 
-    console.log('%c[TMS Workflow v0.6.8] 로드됨. Alt+Z로 모달 오픈 (일괄 입력 실패 ID 칩 + 실패만 보기 토글 + 행 스크롤/하이라이트)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.6.9] 로드됨. Alt+Z로 모달 오픈 (배치 패널 가시성: Run 헤더 + Phase stepper + 수집/검증 카드 → 검토 탭 점프)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
