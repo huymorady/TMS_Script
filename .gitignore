@@ -1,0 +1,17 @@
+# 로컬 작업/디버그 산출물
+*.log
+*.err.log
+devtools_*.png
+test_v3*.js
+browser_use_handoff.md
+
+# 임시 체크/대화 로그
+체크용 문서/
+클로드 대화 내역
+*.tmp.md
+
+# OS / 에디터
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
