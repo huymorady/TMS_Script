@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.5.6
+// @version      0.5.7
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -217,12 +217,42 @@
         return data.data.task_id;
     }
 
+    // task_results.result 필드는 이중 인코딩된 JSON 문자열. {TOTAL, SUCCESS, FAILURE, PROCESS} 구조.
+    // PROCESS는 실시간 완료 카운터(2026-04-23 레퍼런스 확정). STARTED 시점에도 그값이 채워져 온다.
+    function parseTaskProgress(rawResult) {
+        if (!rawResult || typeof rawResult !== 'string') return null;
+        try {
+            const parsed = JSON.parse(rawResult);
+            if (parsed == null || typeof parsed !== 'object') return null;
+            const total = Number(parsed.TOTAL);
+            const processed = Number(parsed.PROCESS);
+            if (!Number.isFinite(total) || total <= 0) return null;
+            const safeProcessed = Number.isFinite(processed) ? Math.max(0, processed) : 0;
+            const percent = Math.min(100, Math.round((safeProcessed / total) * 100));
+            return {
+                processed: safeProcessed,
+                total,
+                percent,
+                success: Number.isFinite(Number(parsed.SUCCESS)) ? Number(parsed.SUCCESS) : null,
+                failure: Number.isFinite(Number(parsed.FAILURE)) ? Number(parsed.FAILURE) : null,
+            };
+        } catch (_e) {
+            return null;
+        }
+    }
+
+    function formatTaskProgress(progress) {
+        if (!progress) return '';
+        return `${progress.processed}/${progress.total} (${progress.percent}%)`;
+    }
+
     async function pollTask(taskId, { maxAttempts = 20, interval = 5000, onProgress } = {}) {
         for (let i = 0; i < maxAttempts; i++) {
             await sleep(interval);
             const data = await apiJson(`/api/translate/task_results/${taskId}/`);
             const status = data.data.status;
-            if (onProgress) onProgress(i + 1, status);
+            const progress = parseTaskProgress(data.data.result);
+            if (onProgress) onProgress(i + 1, status, progress);
             if (status === 'SUCCESS') return data.data;
             if (status === 'FAILURE') throw new Error(`작업 실패: ${data.data.traceback || '알 수 없음'}`);
         }
@@ -2791,7 +2821,10 @@
             await pollTask(taskId, {
                 maxAttempts: BATCH_MAX_POLL_ATTEMPTS,
                 interval: BATCH_POLL_INTERVAL_MS,
-                onProgress: (n, status) => appendBatchLog(`Phase ${phaseTag} 폴링 ${n}차: ${status}`),
+                onProgress: (n, status, progress) => {
+                    const tail = progress ? ` (${formatTaskProgress(progress)})` : '';
+                    appendBatchLog(`Phase ${phaseTag} 폴링 ${n}차: ${status}${tail}`);
+                },
             });
 
             const { raw, parsed } = await waitForExpectedBatchResult(run, phaseTag, previousRaw);
@@ -3128,8 +3161,9 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
             updateProgressMessage(progressMsg, '⏳ 처리 중… (5초 간격 폴링)');
             await pollTask(taskId, {
-                onProgress: (n, status) => {
-                    updateProgressMessage(progressMsg, `⏳ 처리 중… [${n}차] ${status}`);
+                onProgress: (n, status, progress) => {
+                    const tail = progress ? ` — ${formatTaskProgress(progress)}` : '';
+                    updateProgressMessage(progressMsg, `⏳ 처리 중… [${n}차] ${status}${tail}`);
                 },
             });
 
@@ -3637,6 +3671,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.5.6] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.5.7] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
