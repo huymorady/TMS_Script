@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.7
+// @version      0.7.8
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -1143,42 +1143,91 @@
         saveSessions({});
     }
 
+    // v0.7.8 (#4): BATCH_RUNS GC 시 SESSIONS의 dangling importedFromRunId nullify
+    // - 세션 자체는 유지 (대화 이력 손실 방지). importedFromRunId만 null로 설정.
+    // - source는 'batch_import' 그대로 둔다 (히스토리 흔적 보존).
+    // 반환: nullify된 세션 개수
+    function nullifyDanglingImportedFromRunId(runId) {
+        if (!runId) return 0;
+        const sessions = loadSessions();
+        let count = 0;
+        for (const id of Object.keys(sessions)) {
+            const s = sessions[id];
+            if (s && s.importedFromRunId === runId) {
+                s.importedFromRunId = null;
+                count++;
+            }
+        }
+        if (count > 0) saveSessions(sessions);
+        return count;
+    }
+
     // Export: 세션만 / 프롬프트만 / 전체 선택 가능
+    // v0.7.8 (#2): includeBatchRuns / includeOverrides 옵션 — 워크스페이스 통째로 백업 가능
     function exportSessionsJson(opts = {}) {
-        const { includeSessions = true, includePrompts = false } = opts;
+        const {
+            includeSessions = true,
+            includePrompts = false,
+            includeBatchRuns = false,
+            includeOverrides = false,
+            stripRawSegments = true, // batch run의 무거운 raw 섹션 기본 제거
+        } = opts;
         const data = {
-            version: 2,
+            version: 3, // v0.7.8: workspace 필드 도입
             exported: new Date().toISOString(),
+            schemaVersion: typeof CURRENT_SCHEMA_VERSION !== 'undefined' ? CURRENT_SCHEMA_VERSION : 1,
         };
         if (includeSessions) data.sessions = loadSessions();
         if (includePrompts) data.prompts = loadPrompts();
+        if (includeOverrides) {
+            try { data.overrides = loadReviewOverrides(); } catch { data.overrides = {}; }
+        }
+        if (includeBatchRuns) {
+            try {
+                const raw = loadBatchRuns();
+                if (stripRawSegments && typeof _stripRunForBackup === 'function') {
+                    const stripped = {};
+                    for (const [id, r] of Object.entries(raw)) stripped[id] = _stripRunForBackup(r);
+                    data.batchRuns = stripped;
+                } else {
+                    data.batchRuns = raw;
+                }
+            } catch { data.batchRuns = {}; }
+        }
         return JSON.stringify(data, null, 2);
     }
 
     // Import: 세션과 프롬프트를 선택적으로 복원
-    // 반환: { sessionsCount, promptsCount, hasSessions, hasPrompts }
+    // 반환: { sessionsCount, promptsCount, overridesCount, batchRunsCount, hasSessions, hasPrompts, hasOverrides, hasBatchRuns }
     function importSessionsJson(jsonStr, opts = {}) {
         const {
             restoreSessions = true,
             restorePrompts = false,
+            restoreOverrides = false,
+            restoreBatchRuns = false,
             mergeSessions = false, // true면 기존 세션에 병합, false면 덮어쓰기
+            mergeOverrides = false,
+            mergeBatchRuns = false,
         } = opts;
 
         const data = JSON.parse(jsonStr);
         const hasSessions = !!data.sessions;
         const hasPrompts = !!data.prompts;
-        if (!hasSessions && !hasPrompts) {
-            throw new Error('잘못된 형식: sessions 또는 prompts 필드가 없습니다.');
+        const hasOverrides = !!data.overrides;
+        const hasBatchRuns = !!data.batchRuns;
+        if (!hasSessions && !hasPrompts && !hasOverrides && !hasBatchRuns) {
+            throw new Error('잘못된 형식: sessions/prompts/overrides/batchRuns 중 하나도 없습니다.');
         }
 
         let sessionsCount = 0;
         let promptsCount = 0;
+        let overridesCount = 0;
+        let batchRunsCount = 0;
 
         if (restoreSessions && hasSessions) {
             if (mergeSessions) {
                 const existing = loadSessions();
-                const merged = { ...existing, ...data.sessions };
-                saveSessions(merged);
+                saveSessions({ ...existing, ...data.sessions });
             } else {
                 saveSessions(data.sessions);
             }
@@ -1190,7 +1239,34 @@
             promptsCount = data.prompts.length;
         }
 
-        return { sessionsCount, promptsCount, hasSessions, hasPrompts };
+        if (restoreOverrides && hasOverrides) {
+            if (mergeOverrides) {
+                const existing = loadReviewOverrides();
+                const merged = { ...existing };
+                for (const [runId, bucket] of Object.entries(data.overrides)) {
+                    merged[runId] = { ...(merged[runId] || {}), ...bucket };
+                }
+                saveReviewOverrides(merged);
+            } else {
+                saveReviewOverrides(data.overrides);
+            }
+            overridesCount = Object.values(data.overrides).reduce((sum, b) => sum + Object.keys(b || {}).length, 0);
+        }
+
+        if (restoreBatchRuns && hasBatchRuns) {
+            if (mergeBatchRuns) {
+                const existing = loadBatchRuns();
+                saveBatchRuns({ ...existing, ...data.batchRuns });
+            } else {
+                saveBatchRuns(data.batchRuns);
+            }
+            batchRunsCount = Object.keys(data.batchRuns).length;
+        }
+
+        return {
+            sessionsCount, promptsCount, overridesCount, batchRunsCount,
+            hasSessions, hasPrompts, hasOverrides, hasBatchRuns,
+        };
     }
 
     // ========================================================================
@@ -2856,6 +2932,20 @@
 }
 .tw-msg-action:hover { background: #2a2a2a; color: #e0e0e0; border-color: #4ade80; }
 .tw-msg-action-apply:hover { color: #4ade80; }
+/* v0.7.8 (#3): chat seed 메시지의 (run xxx) 클릭 가능 태그 */
+.tw-chat-runid-tag {
+    display: inline-block;
+    margin: 0 4px;
+    padding: 0 6px;
+    border-radius: 8px;
+    background: #2a3140;
+    color: #93c5fd;
+    text-decoration: none;
+    font-size: 11px;
+    border: 1px solid #3a4660;
+    cursor: pointer;
+}
+.tw-chat-runid-tag:hover { background: #344056; color: #cfe5ff; border-color: #4ade80; }
 .tw-chat-input-wrap { padding: 14px 16px; border-top: 1px solid #3a3a3a;
     background: #252525; flex-shrink: 0; }
 .tw-input-controls { display: flex; gap: 14px; margin-bottom: 10px; font-size: 12px; color: #aaa; }
@@ -4919,6 +5009,11 @@
         const runs = loadBatchRuns();
         delete runs[runId];
         saveBatchRuns(runs);
+        // v0.7.8 (#4): dangling 정리 — 이 run을 importedFromRunId로 가진 SESSIONS 항목에서 nullify
+        try {
+            const danglingCount = nullifyDanglingImportedFromRunId(runId);
+            if (danglingCount > 0) dverbose(`run ${runId} 삭제: dangling importedFromRunId ${danglingCount}건 nullify`);
+        } catch (e) { dwarn('dangling importedFromRunId nullify 실패', e); }
         if (isActive) {
             lsSet(LS_KEYS.ACTIVE_BATCH_RUN, null);
             batchRun = null;
@@ -6136,9 +6231,38 @@
         messagesEl.innerHTML = '';
 
         // v0.6.0 L1: batch import 시드 배지 노출
+        // v0.7.8 (#3): runId가 있으면 클릭 가능한 태그로 표시 — review 탭 점프
         if (session.system && session.source === 'batch_import') {
-            const tag = session.importedFromRunId ? ` (run ${session.importedFromRunId})` : '';
-            appendMessage('system', `📦 배치 결과로 시드됨${tag} — 아래 후보를 출발점으로 요청을 입력하세요.`);
+            const runId = session.importedFromRunId || '';
+            if (runId) {
+                const sysMsg = appendMessage('system', '📦 배치 결과로 시드됨 — 아래 후보를 출발점으로 요청을 입력하세요.');
+                const contentEl = $('.tw-msg-content', sysMsg);
+                if (contentEl) {
+                    const tag = document.createElement('a');
+                    tag.className = 'tw-chat-runid-tag';
+                    tag.href = '#';
+                    tag.dataset.runId = String(runId);
+                    tag.title = 'review 탭에서 이 run을 활성화하고 해당 행으로 점프';
+                    tag.textContent = ` (run ${runId})`;
+                    // 📦 ... 시드됨 [tag] — 아래 ...
+                    const seedMatch = contentEl.firstChild && contentEl.firstChild.nodeType === 3
+                        ? contentEl.firstChild.nodeValue : '';
+                    if (seedMatch) {
+                        const insertAt = seedMatch.indexOf('시드됨');
+                        if (insertAt >= 0) {
+                            const before = seedMatch.slice(0, insertAt + '시드됨'.length);
+                            const after = seedMatch.slice(insertAt + '시드됨'.length);
+                            contentEl.firstChild.nodeValue = before;
+                            contentEl.appendChild(tag);
+                            contentEl.appendChild(document.createTextNode(after));
+                        } else {
+                            contentEl.appendChild(tag);
+                        }
+                    }
+                }
+            } else {
+                appendMessage('system', '📦 배치 결과로 시드됨 — 아래 후보를 출발점으로 요청을 입력하세요.');
+            }
         }
 
         if (!session.messages.length) {
@@ -6156,9 +6280,11 @@
         msg.className = `tw-msg tw-msg-${role}`;
         const label = role === 'user' ? '나' : role === 'ai' ? 'AI' : '';
         // v0.6.10 C2-신: AI 메시지마다 인라인 적용/복사 액션 부착
+        // v0.7.8 (#1): "✓ override 굳히기" 추가 — 채팅 결과를 현재 run의 review override로 반영
         const actions = role === 'ai'
             ? `<div class="tw-msg-actions">
     <button type="button" class="tw-msg-action tw-msg-action-apply" title="이 결과를 현재 세그먼트 textarea에 적용">✓ 셀로 적용</button>
+    <button type="button" class="tw-msg-action tw-msg-action-override" title="이 결과를 현재 run의 최종 후보 override로 저장 (결과 검토에 반영)">✓ override 굳히기</button>
     <button type="button" class="tw-msg-action tw-msg-action-copy" title="이 결과를 클립보드로 복사">📋 복사</button>
 </div>`
             : '';
@@ -6284,6 +6410,45 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
     // v0.6.10 C2-신: AI 메시지 인라인 액션 (셀로 적용 / 복사)
     function onChatMessageAction(e) {
+        // v0.7.8 (#3): runId 태그 클릭 → review 탭 점프
+        const runTag = e.target.closest('.tw-chat-runid-tag');
+        if (runTag) {
+            e.preventDefault();
+            const runId = runTag.dataset.runId;
+            if (!runId) return;
+            const runs = (() => { try { return loadBatchRuns(); } catch { return {}; } })();
+            if (!runs[runId]) {
+                toast(`run ${runId} 가 더 이상 존재하지 않습니다 (삭제됨/만료)`, 'warn');
+                return;
+            }
+            try {
+                if (getActiveBatchRunId() !== runId) {
+                    setActiveBatchRunId(runId);
+                    syncBatchRunFromLs();
+                }
+                setMainTab('review');
+                // 해당 행으로 스크롤 + flash
+                const targetId = currentStringId;
+                if (targetId) {
+                    setTimeout(() => {
+                        try { renderReviewTable._pendingFlush && renderReviewTable._pendingFlush(); } catch {}
+                        const safe = (typeof CSS !== 'undefined' && CSS.escape) ? CSS.escape(String(targetId)) : String(targetId);
+                        const row = $(`.tw-review-row[data-row-id="${safe}"]`, modalEl);
+                        if (row) {
+                            row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                            row.classList.add('tw-review-row-flash');
+                            setTimeout(() => row.classList.remove('tw-review-row-flash'), 1500);
+                            row.focus();
+                        }
+                    }, 50);
+                }
+            } catch (err) {
+                derror('runId 태그 점프 실패', err);
+                toast('점프 실패: ' + err.message, 'error');
+            }
+            return;
+        }
+
         const btn = e.target.closest('.tw-msg-action');
         if (!btn) return;
         const msgEl = btn.closest('.tw-msg');
@@ -6301,6 +6466,33 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 );
             } else {
                 toast('이 환경에서는 클립보드를 사용할 수 없습니다.', 'error');
+            }
+            return;
+        }
+
+        // v0.7.8 (#1): override로 굳히기 — chat 결과를 review override에 영속 반영
+        if (btn.classList.contains('tw-msg-action-override')) {
+            if (!currentStringId) {
+                toast('현재 세그먼트 ID를 알 수 없습니다.', 'error');
+                return;
+            }
+            const session = getSession(currentStringId);
+            // 우선순위: session.importedFromRunId (배치 시드된 경우) → 활성 batch run
+            const runId = session.importedFromRunId || getActiveBatchRunId();
+            if (!runId) {
+                toast('현재 활성 batch run이 없어 override로 굳힐 수 없습니다.', 'warn');
+                return;
+            }
+            try {
+                setReviewOverride(runId, currentStringId, text);
+                toast(`override로 굳혔습니다 (run ${runId})`, 'success');
+                // review 탭이 열려 있으면 즉시 갱신
+                if (currentMainTab === 'review') {
+                    try { renderReviewTable(); } catch {}
+                }
+            } catch (err) {
+                derror('override 굳히기 실패', err);
+                toast('override 저장 실패: ' + err.message, 'error');
             }
             return;
         }
@@ -6437,6 +6629,9 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 </button>
                 <button class="tw-btn tw-btn-ghost tw-btn-export-all">
                     📤 전체 백업 (세션 + 프롬프트)
+                </button>
+                <button class="tw-btn tw-btn-ghost tw-btn-export-workspace" title="세션 + 프롬프트 + 배치 run(메타) + override까지 한 파일로 백업">
+                    📦 워크스페이스 백업 (세션 + 프롬프트 + run + override)
                 </button>
                 <button class="tw-btn tw-btn-ghost tw-btn-session-import">
                     📥 JSON에서 복원
@@ -6647,6 +6842,18 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             toast('전체 백업 파일 다운로드됨 (세션 + 프롬프트)', 'success');
         });
 
+        // v0.7.8 (#2): 워크스페이스 통째 백업 (세션 + 프롬프트 + 배치 run + override)
+        $('.tw-btn-export-workspace', overlay).addEventListener('click', () => {
+            const json = exportSessionsJson({
+                includeSessions: true,
+                includePrompts: true,
+                includeBatchRuns: true,
+                includeOverrides: true,
+            });
+            downloadJson(json, `tms_workspace_${new Date().toISOString().slice(0,10)}.json`);
+            toast('워크스페이스 백업 다운로드됨 (run raw segment 제외)', 'success');
+        });
+
         function downloadJson(json, filename) {
             const blob = new Blob([json], { type: 'application/json' });
             const a = document.createElement('a');
@@ -6668,10 +6875,16 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 const preview = JSON.parse(text);
                 const hasSessions = !!preview.sessions;
                 const hasPrompts = !!preview.prompts;
+                const hasOverrides = !!preview.overrides; // v0.7.8 (#2)
+                const hasBatchRuns = !!preview.batchRuns; // v0.7.8 (#2)
                 const sessionCount = hasSessions ? Object.keys(preview.sessions).length : 0;
                 const promptCount = hasPrompts ? preview.prompts.length : 0;
+                const overrideCount = hasOverrides
+                    ? Object.values(preview.overrides).reduce((s, b) => s + Object.keys(b || {}).length, 0)
+                    : 0;
+                const batchRunCount = hasBatchRuns ? Object.keys(preview.batchRuns).length : 0;
 
-                if (!hasSessions && !hasPrompts) {
+                if (!hasSessions && !hasPrompts && !hasOverrides && !hasBatchRuns) {
                     toast('유효하지 않은 백업 파일입니다.', 'error');
                     importFileInput.value = '';
                     return;
@@ -6684,18 +6897,39 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                         title: '프롬프트 복원 여부',
                         message: `이 백업에는 다음이 포함되어 있습니다:\n` +
                             (hasSessions ? `• 세션 ${sessionCount}개\n` : '') +
-                            `• 시스템 프롬프트 ${promptCount}개\n\n` +
-                            `프롬프트도 함께 복원하시겠습니까?`,
+                            `• 시스템 프롬프트 ${promptCount}개\n` +
+                            (hasOverrides ? `• override ${overrideCount}개\n` : '') +
+                            (hasBatchRuns ? `• batch run ${batchRunCount}개\n` : '') +
+                            `\n프롬프트도 함께 복원하시겠습니까?`,
                         confirmLabel: '세션 + 프롬프트',
                         cancelLabel: '세션만',
                     });
                 }
 
+                // v0.7.8 (#2): workspace 백업이면 overrides/batchRuns 복원 여부 추가 prompt
+                let restoreOverrides = false;
+                let restoreBatchRuns = false;
+                if (hasOverrides || hasBatchRuns) {
+                    restoreBatchRuns = await twConfirm({
+                        title: '워크스페이스 복원 여부',
+                        message: `이 백업에 포함된 워크스페이스 데이터를 복원하시겠습니까?\n\n` +
+                            (hasBatchRuns ? `• batch run ${batchRunCount}개 (raw segment 제외)\n` : '') +
+                            (hasOverrides ? `• override ${overrideCount}개\n` : '') +
+                            `\n기존 데이터는 덮어씌워집니다.`,
+                        confirmLabel: '복원',
+                        cancelLabel: '건너뜀',
+                        danger: true,
+                    });
+                    restoreOverrides = restoreBatchRuns && hasOverrides;
+                }
+
                 // 세션 복원 최종 확인
                 if (hasSessions) {
-                    const msg = restorePrompts
-                        ? `세션 ${sessionCount}개와 프롬프트 ${promptCount}개를 복원합니다.\n기존 데이터는 덮어씌워집니다.`
-                        : `세션 ${sessionCount}개를 복원합니다.\n(기존 프롬프트는 보존됩니다)\n기존 세션은 덮어씌워집니다.`;
+                    const lines = [`세션 ${sessionCount}개`];
+                    if (restorePrompts) lines.push(`프롬프트 ${promptCount}개`);
+                    if (restoreBatchRuns) lines.push(`batch run ${batchRunCount}개`);
+                    if (restoreOverrides) lines.push(`override ${overrideCount}개`);
+                    const msg = `${lines.join(' / ')} 를 복원합니다.\n기존 데이터는 덮어씌워집니다.`;
                     const okRestore = await twConfirm({ title: '복원 확인', message: msg, danger: true });
                     if (!okRestore) {
                         importFileInput.value = '';
@@ -6706,11 +6940,15 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 const result = importSessionsJson(text, {
                     restoreSessions: hasSessions,
                     restorePrompts: restorePrompts,
+                    restoreOverrides: restoreOverrides,
+                    restoreBatchRuns: restoreBatchRuns,
                 });
 
                 const parts = [];
                 if (result.sessionsCount > 0) parts.push(`세션 ${result.sessionsCount}개`);
                 if (result.promptsCount > 0) parts.push(`프롬프트 ${result.promptsCount}개`);
+                if (result.batchRunsCount > 0) parts.push(`batch run ${result.batchRunsCount}개`);
+                if (result.overridesCount > 0) parts.push(`override ${result.overridesCount}개`);
                 toast(`복원 완료: ${parts.join(', ')}`, 'success');
 
                 refreshSessionStats();
