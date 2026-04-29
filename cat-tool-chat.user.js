@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.5
+// @version      0.7.6
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -30,6 +30,7 @@
         ACTIVE_BATCH_RUN: 'tms_workflow_active_batch_run_v1',
         APPLIED_FROM_BATCH: 'tms_workflow_applied_from_batch_v1', // v0.6.0 L3: textarea가 배치에서 자동 적용된 세그먼트 추적
         REVIEW_OVERRIDES: 'tms_workflow_review_overrides_v1', // v0.6.2: 사용자가 리뷰 탭에서 직접 수정한 최종 후보 (run+id 키)
+        COMPACT_MODE: 'tms_workflow_compact_mode_v1', // v0.7.6 (#4): 배치 패널 컴팩트 모드 (stepper + 카드 접기)
     };
 
     const DEFAULT_PROMPT = {
@@ -2309,7 +2310,10 @@
                 <div class="tw-panel-title">배치 실행</div>
                 <div class="tw-batch-meta tw-muted">현재 페이지를 수집한 뒤 Phase를 순서대로 실행합니다.</div>
             </div>
-            <div class="tw-batch-status">대기 중</div>
+            <div class="tw-batch-header-right">
+                <button class="tw-btn tw-btn-ghost tw-btn-toggle-compact" title="Phase stepper와 수집/검증 카드를 접어서 표를 더 빨리 보여줍니다 (localStorage 저장)" data-compact="0">📐 컴팩트</button>
+                <div class="tw-batch-status">대기 중</div>
+            </div>
         </div>
         <!-- v0.6.9 (G1-a): 활성 run 헤더 카드 -->
         <div class="tw-batch-run-header tw-hidden"></div>
@@ -2447,6 +2451,19 @@
         attachHandlers(el);
         restoreModalPosition(el);
         populateSelects(el);
+        // v0.7.6 (#7): 모달 폭이 좁아지면 toolbar 압축 클래스 토글 (ResizeObserver 미지원 환경은 무시)
+        try {
+            if (typeof ResizeObserver !== 'undefined') {
+                const NARROW_PX = 900;
+                const ro = new ResizeObserver(entries => {
+                    for (const entry of entries) {
+                        const w = entry.contentRect ? entry.contentRect.width : entry.target.offsetWidth;
+                        el.classList.toggle('tw-narrow', w > 0 && w < NARROW_PX);
+                    }
+                });
+                ro.observe(el);
+            }
+        } catch (e) { /* no-op */ }
 
         return el;
     }
@@ -3150,6 +3167,90 @@
 .tw-session-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 .tw-session-info-body { font-size: 12px; color: #aaa; line-height: 1.7; }
 .tw-stat-hint { font-size: 11px; color: #888; margin-top: 8px; font-style: italic; }
+
+/* v0.7.6 (#4): 컴팩트 모드 — Phase stepper와 수집/검증 카드 접기 */
+.tw-batch-header-right {
+    display: flex; align-items: center; gap: 8px;
+}
+.tw-btn-toggle-compact {
+    font-size: 11px; padding: 4px 8px; white-space: nowrap;
+}
+.tw-btn-toggle-compact[data-compact="1"] {
+    background: rgba(74,222,128,0.15); border-color: rgba(74,222,128,0.5); color: #4ade80;
+}
+.tw-batch-panel.tw-compact .tw-batch-stepper,
+.tw-batch-panel.tw-compact .tw-batch-summary-cards {
+    display: none !important;
+}
+
+/* v0.7.6 (#7): 좁은 모달 폭(<900px) 대응 — toolbar 압축 */
+#tms-workflow-modal.tw-narrow .tw-review-toolbar { gap: 4px; row-gap: 4px; }
+#tms-workflow-modal.tw-narrow .tw-review-toolbar .tw-btn { padding: 4px 7px; font-size: 11px; }
+#tms-workflow-modal.tw-narrow .tw-review-toolbar-divider { display: none; }
+#tms-workflow-modal.tw-narrow .tw-review-shortcut-hint { display: none; }
+#tms-workflow-modal.tw-narrow .tw-review-filter-label { font-size: 11px; gap: 2px; }
+#tms-workflow-modal.tw-narrow .tw-review-filter,
+#tms-workflow-modal.tw-narrow .tw-review-sort { font-size: 11px; padding: 2px 4px; }
+#tms-workflow-modal.tw-narrow .tw-review-toolbar-group { gap: 4px; }
+
+/* v0.7.6 (#5): 최종 후보 편집 모달 */
+.tw-final-edit-overlay {
+    position: fixed; inset: 0; z-index: 2147483646;
+    background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center;
+    font-family: system-ui, -apple-system, sans-serif;
+}
+.tw-final-edit-dialog {
+    background: #1f1f1f; color: #e0e0e0;
+    border: 1px solid #3a3a3a; border-radius: 8px;
+    width: min(960px, 92vw); max-height: 86vh;
+    display: flex; flex-direction: column;
+    box-shadow: 0 14px 48px rgba(0,0,0,0.55);
+}
+.tw-final-edit-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 18px; border-bottom: 1px solid #3a3a3a;
+}
+.tw-final-edit-title { font-size: 14px; font-weight: 600; color: #4ade80; }
+.tw-final-edit-close {
+    background: transparent; border: none; color: #888; font-size: 18px;
+    cursor: pointer; padding: 0 6px; line-height: 1;
+}
+.tw-final-edit-close:hover { color: #e0e0e0; }
+.tw-final-edit-body {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    padding: 14px 18px; overflow: auto; flex: 1 1 auto; min-height: 0;
+}
+.tw-final-edit-col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.tw-final-edit-section {
+    display: flex; flex-direction: column; gap: 4px;
+    background: #252525; border: 1px solid #333; border-radius: 6px;
+    padding: 8px 10px;
+}
+.tw-final-edit-section-label {
+    font-size: 11px; font-weight: 600; color: #4ade80; text-transform: uppercase;
+}
+.tw-final-edit-section-body {
+    font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+    color: #d0d0d0; max-height: 180px; overflow: auto;
+}
+.tw-final-edit-section-body.tw-empty { color: #666; font-style: italic; }
+.tw-final-edit-textarea {
+    width: 100%; min-height: 220px; resize: vertical;
+    background: #1a1a1a; color: #e0e0e0; border: 1px solid #3a3a3a;
+    border-radius: 6px; padding: 8px 10px;
+    font-family: inherit; font-size: 13px; line-height: 1.5;
+    box-sizing: border-box;
+}
+.tw-final-edit-textarea:focus { outline: 2px solid #4ade80; outline-offset: -2px; }
+.tw-final-edit-meta { font-size: 11px; color: #888; }
+.tw-final-edit-footer {
+    display: flex; justify-content: flex-end; gap: 8px;
+    padding: 10px 18px; border-top: 1px solid #3a3a3a;
+}
+@media (max-width: 760px) {
+    .tw-final-edit-body { grid-template-columns: 1fr; }
+}
 `;
         document.head.appendChild(style);
     }
@@ -3282,6 +3383,22 @@
         $('.tw-btn-phase45', el).addEventListener('click', () => onRunBatchPhase('4+5'));
         $('.tw-btn-batch-refetch', el).addEventListener('click', onBatchRefetchResult);
         $('.tw-btn-batch-reset', el).addEventListener('click', onBatchReset);
+        // v0.7.6 (#4): 컴팩트 모드 토글
+        const compactBtn = $('.tw-btn-toggle-compact', el);
+        if (compactBtn) {
+            const applyCompact = (on) => {
+                el.classList.toggle('tw-compact', !!on);
+                compactBtn.dataset.compact = on ? '1' : '0';
+                compactBtn.textContent = on ? '📐 컴팩트 ✓' : '📐 컴팩트';
+                compactBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+            };
+            applyCompact(lsGet(LS_KEYS.COMPACT_MODE) === '1');
+            compactBtn.addEventListener('click', () => {
+                const next = compactBtn.dataset.compact !== '1';
+                applyCompact(next);
+                lsSet(LS_KEYS.COMPACT_MODE, next ? '1' : '0');
+            });
+        }
         $('.tw-btn-log-copy', el).addEventListener('click', onCopyLogOutput);
         $('.tw-btn-review-apply-selected', el).addEventListener('click', () => applyBatchTranslationsByIds(getSelectedReviewIds()));
         $('.tw-btn-review-apply-all', el).addEventListener('click', () => applyBatchTranslationsByIds(getReviewTranslationIds()));
@@ -4599,8 +4716,134 @@
         return revision && revision.t !== null ? String(revision.t || '') : String(phase3.t || '');
     }
 
-    // v0.6.2: 최종 후보 인라인 수정 — 해당 행의 최종 후보 셀을 textarea로 전환
+    // v0.6.2: 최종 후보 직접 수정 — v0.7.6 (#5) 부터는 인라인 textarea 대신 모달로 전환.
+    //  - 좌측: 원문 / Phase3 / Phase4+5 (read-only)
+    //  - 우측: 최종 후보 textarea (편집)
+    // 단축키: Ctrl/Cmd+Enter 저장, Esc 취소
     function openInlineFinalEditor(stringId) {
+        return openFinalEditModal(stringId);
+    }
+
+    function openFinalEditModal(stringId) {
+        const id = normalizeId(stringId);
+        if (!id) return;
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run?.runId) { toast('활성 batch run이 없어 편집할 수 없습니다.', 'error'); return; }
+        // 동시에 두 개 띄우지 않음
+        const existing = document.querySelector('.tw-final-edit-overlay');
+        if (existing) existing.remove();
+
+        const seg = (run.segments || []).find(s => normalizeId(s.id) === id);
+        const phase3 = (run.phase3?.parsed?.translations || []).find(it => normalizeId(it.id) === id);
+        const revision = run.phase45?.validation?.ok
+            ? (run.phase45?.parsed?.revisions || []).find(it => normalizeId(it.id) === id)
+            : null;
+        const sourceText = String(seg?.origin_string || '');
+        const phase3Text = String(phase3?.t || '');
+        const phase45Text = revision && revision.t !== null ? String(revision.t || '') : '';
+        const currentFinal = getBatchFinalText(id);
+        const charLimit = Number(seg?.char_limit || 0) || 0;
+
+        const overlay = document.createElement('div');
+        overlay.className = 'tw-final-edit-overlay';
+        overlay.innerHTML = `
+<div class="tw-final-edit-dialog" role="dialog" aria-modal="true" aria-label="최종 후보 편집">
+    <div class="tw-final-edit-header">
+        <span class="tw-final-edit-title">✏ 최종 후보 편집 — #${escapeHtml(id)}${charLimit ? ` <span class="tw-final-edit-meta">(char_limit: ${charLimit})</span>` : ''}</span>
+        <button type="button" class="tw-final-edit-close" title="닫기 (Esc)">✕</button>
+    </div>
+    <div class="tw-final-edit-body">
+        <div class="tw-final-edit-col">
+            <div class="tw-final-edit-section">
+                <span class="tw-final-edit-section-label">원문 (source)</span>
+                <div class="tw-final-edit-section-body${sourceText ? '' : ' tw-empty'}">${sourceText ? escapeHtml(sourceText) : '(없음)'}</div>
+            </div>
+            <div class="tw-final-edit-section">
+                <span class="tw-final-edit-section-label">Phase 3 결과</span>
+                <div class="tw-final-edit-section-body${phase3Text ? '' : ' tw-empty'}">${phase3Text ? escapeHtml(phase3Text) : '(없음)'}</div>
+            </div>
+            <div class="tw-final-edit-section">
+                <span class="tw-final-edit-section-label">Phase 4+5 수정</span>
+                <div class="tw-final-edit-section-body${phase45Text ? '' : ' tw-empty'}">${phase45Text ? escapeHtml(phase45Text) : '(수정 없음 / Phase4+5 미실행)'}</div>
+            </div>
+        </div>
+        <div class="tw-final-edit-col">
+            <div class="tw-final-edit-section" style="flex: 1 1 auto;">
+                <span class="tw-final-edit-section-label">최종 후보 (편집)</span>
+                <textarea class="tw-final-edit-textarea" data-id="${escapeHtml(id)}">${escapeHtml(currentFinal)}</textarea>
+                <span class="tw-final-edit-meta tw-final-edit-counter">길이: ${currentFinal.length}자${charLimit ? ` / ${charLimit}` : ''}</span>
+            </div>
+        </div>
+    </div>
+    <div class="tw-final-edit-footer">
+        <button type="button" class="tw-btn tw-btn-ghost tw-final-edit-cancel">취소</button>
+        <button type="button" class="tw-btn tw-btn-primary tw-final-edit-save">💾 저장 (Ctrl+Enter)</button>
+    </div>
+</div>`;
+        document.body.appendChild(overlay);
+
+        const dialog = overlay.querySelector('.tw-final-edit-dialog');
+        const ta = overlay.querySelector('.tw-final-edit-textarea');
+        const counter = overlay.querySelector('.tw-final-edit-counter');
+        const close = () => { overlay.remove(); };
+        const updateCounter = () => {
+            if (!counter || !ta) return;
+            const len = ta.value.length;
+            counter.textContent = `길이: ${len}자${charLimit ? ` / ${charLimit}` : ''}`;
+            counter.style.color = (charLimit && len > charLimit) ? '#f87171' : '';
+        };
+        const save = () => {
+            commitFinalEditModal(id, ta ? ta.value : '');
+            close();
+        };
+        overlay.addEventListener('click', (ev) => { if (ev.target === overlay) close(); });
+        overlay.querySelector('.tw-final-edit-close').addEventListener('click', close);
+        overlay.querySelector('.tw-final-edit-cancel').addEventListener('click', close);
+        overlay.querySelector('.tw-final-edit-save').addEventListener('click', save);
+        if (ta) {
+            ta.addEventListener('input', updateCounter);
+            ta.addEventListener('keydown', (ev) => {
+                if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') { ev.preventDefault(); save(); }
+                else if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+            });
+            // 모달 외부에서도 Esc로 닫히도록
+            dialog.addEventListener('keydown', (ev) => {
+                if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+            });
+            // 포커스 + 커서 끝
+            setTimeout(() => {
+                ta.focus();
+                try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+            }, 0);
+        }
+    }
+
+    function commitFinalEditModal(stringId, newText) {
+        const id = normalizeId(stringId);
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run?.runId) {
+            toast('활성 batch run이 없어 저장할 수 없습니다.', 'error');
+            return;
+        }
+        const text = String(newText == null ? '' : newText);
+        const phase3 = (run.phase3?.parsed?.translations || []).find(it => normalizeId(it.id) === id);
+        const revision = run.phase45?.validation?.ok
+            ? (run.phase45?.parsed?.revisions || []).find(it => normalizeId(it.id) === id)
+            : null;
+        const original = revision && revision.t !== null ? String(revision.t || '') : String(phase3?.t || '');
+        const override = getReviewOverride(run.runId, id);
+        if (text === original) {
+            if (override !== null) clearReviewOverride(run.runId, id);
+            appendBatchLog(`#${id} 직접 수정이 원본과 같아 override 제거`, 'info');
+        } else {
+            setReviewOverride(run.runId, id, text);
+            appendBatchLog(`#${id} 직접 수정 저장 (${text.length}자)`, 'success');
+        }
+        renderReviewTable();
+    }
+
+    // 구버전 호환 — 직접 호출되는 일은 없지만 export 등 외부 참조 안전망
+    function _legacy_openInlineFinalEditor_INLINE(stringId) {
         if (!modalEl) return;
         const id = normalizeId(stringId);
         const wrap = modalEl.querySelector(`.tw-review-final-wrap[data-final-id="${CSS.escape(String(id))}"]`);
