@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.5.5
+// @version      0.5.6
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -50,22 +50,15 @@
     const BATCH_MAX_POLL_ATTEMPTS = 90;
     const BATCH_RESULT_RETRY_INTERVAL_MS = 2000;
     const BATCH_RESULT_RETRY_ATTEMPTS = 30;
+    // 실제 사용되는 batchRun.status는 5개만 존재. 이전 워크플로우에서 설정했던 phase_*,
+    // reviewing, apply_ready, bedrock_timeout, model_endpoint_error 등 dead state는 제거.
+    // 향후 새 상태 추가 시 이 맵과 isBatchBusy() 면절 메소드도 함께 업데이트할 것.
     const BATCH_STATUS_LABELS = {
         idle: '대기 중',
         collecting: '수집 중',
         ready: '수집 완료',
-        phase12_running: 'Phase 1+2 실행 중',
-        phase12_ready: 'Phase 1+2 완료',
-        phase3_running: 'Phase 3 실행 중',
-        phase3_ready: 'Phase 3 완료',
-        phase45_running: 'Phase 4+5 실행 중',
-        phase45_ready: 'Phase 4+5 완료',
-        reviewing: '검토 중',
-        apply_ready: '적용 대기',
         failed: '오류',
         stale: '저장본 불일치',
-        bedrock_timeout: 'Bedrock timeout',
-        model_endpoint_error: '모델 엔드포인트 오류',
     };
 
     // 번역 입력창 셀렉터 후보 (TMS UI에 맞게 여러 패턴 시도)
@@ -2324,7 +2317,9 @@
     }
 
     function isBatchBusy(status) {
-        return ['collecting', 'phase12_running', 'phase3_running', 'phase45_running'].includes(status);
+        // 실제 코드에서 set되는 busy 상태는 'collecting'뿐. phase_* 후보는 향후
+        // 확장을 위해 이름만 남겨둡고, 설정되는 곳이 추가될 때 함께 업데이트.
+        return status === 'collecting';
     }
 
     // 검증 객체에서 실패 사유를 짧은 토큰 배열로 추출. 간단 표시용.
@@ -2875,11 +2870,17 @@
     // 모달 Show/Hide + 세그먼트 로드 + 자동 감지 폴링
     // ========================================================================
     let segmentWatcherId = null;
+    // race 가드: 이전 watcher의 in-flight loadSegmentInfo()가 다음 watcher가 시작된 뒤
+    // 늦게 도착해서 stale render를 트리거하는 것을 막기 위한 epoch.
+    let segmentWatcherEpoch = 0;
 
     // 모달 열린 동안 세그먼트 변경 자동 감지
     function startSegmentWatcher() {
         stopSegmentWatcher();
+        const myEpoch = ++segmentWatcherEpoch;
         segmentWatcherId = setInterval(async () => {
+            // 세대가 바뀌면 (다른 watcher가 시작) 조용히 종료
+            if (myEpoch !== segmentWatcherEpoch) return;
             if (!modalEl || modalEl.style.display === 'none') {
                 stopSegmentWatcher();
                 return;
@@ -2887,9 +2888,14 @@
             const newId = getCurrentStringId();
             if (newId && newId !== currentStringId) {
                 console.log(`[TMS-WF] 세그먼트 변경 감지: ${currentStringId} → ${newId}`);
-                currentStringId = newId;
+                const targetId = newId;
+                currentStringId = targetId;
                 try {
-                    await loadSegmentInfo(newId);
+                    await loadSegmentInfo(targetId);
+                    // 로드 완료 시점에서 epoch나 대상 세그먼트가 바뀌었으면
+                    // 이 render는 stale이므로 듬냈다.
+                    if (myEpoch !== segmentWatcherEpoch) return;
+                    if (currentStringId !== targetId) return;
                     renderChatHistory();
                 } catch (e) {
                     console.error('[TMS-WF] 세그먼트 자동 갱신 실패:', e);
@@ -2902,6 +2908,8 @@
             clearInterval(segmentWatcherId);
             segmentWatcherId = null;
         }
+        // 변경 수례를 올려 남아 있는 in-flight tick이 스스로 종료하도록 유도
+        segmentWatcherEpoch++;
     }
 
     async function showModal() {
@@ -3629,6 +3637,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.5.5] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.5.6] 로드됨. Alt+Z로 모달 오픈', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
