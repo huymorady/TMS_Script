@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.10
+// @version      0.7.0
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -1379,17 +1379,31 @@
 
     // v0.6.7 (C2): 두 run 사이의 phase3/phase45 final 텍스트 diff 행 빌드.
     // override는 의도적으로 무시 — "LLM 결과 자체"의 drift만 보기 위함.
-    function buildRunCompareRows(currentRun, priorRun) {
+    // v0.7.0 B5: options.includeOverrides=true 면 override를 final에 덮어 비교한다
+    //           (사용자가 실제 적용한 결과 기준 drift 확인용)
+    function buildRunCompareRows(currentRun, priorRun, options = {}) {
         if (!currentRun || !priorRun) return [];
+        const includeOverrides = !!options.includeOverrides;
         const overlay = (run, id) => {
             const phase3 = (run.phase3?.parsed?.translations || []).find(t => normalizeId(t.id) === id);
             const rev = (run.phase45?.parsed?.revisions || []).find(r => normalizeId(r.id) === id);
             const phase45Ok = !!run.phase45?.validation?.ok;
             let finalText = phase3?.t || '';
+            let overrideText = null;
             if (phase45Ok && rev) {
                 if (rev.t !== null && rev.t !== undefined) finalText = String(rev.t);
             }
-            return { phase3Text: phase3?.t || '', finalText, src: phase3?.src || '', gid: phase3?.gid || '' };
+            if (includeOverrides) {
+                overrideText = getReviewOverride(run.runId, id);
+                if (overrideText !== null && overrideText !== undefined) finalText = overrideText;
+            }
+            return {
+                phase3Text: phase3?.t || '',
+                finalText,
+                overrideText,
+                src: phase3?.src || '',
+                gid: phase3?.gid || '',
+            };
         };
         const ids = new Set();
         (currentRun.phase3?.parsed?.translations || []).forEach(t => ids.add(normalizeId(t.id)));
@@ -1408,6 +1422,8 @@
                 priorFinal: prev.finalText,
                 currentPhase3: cur.phase3Text,
                 currentFinal: cur.finalText,
+                priorOverride: prev.overrideText || null,
+                currentOverride: cur.overrideText || null,
                 sameFinal,
                 samePhase3,
                 onlyInCurrent: !prev.phase3Text && !!cur.phase3Text,
@@ -2159,7 +2175,7 @@
     // v0.6.5 (A3): 리뷰 탭 필터/정렬 상태 (메모리 only — 세션 한정)
     // v0.6.7 (C2): 비교 모드 상태 추가 — compareMode/compareRunId 가 set 되면
     // 검토 표 대신 직전 run 비교 표가 렌더된다.
-    const reviewView = { filter: 'all', sort: 'id', compareMode: false, compareRunId: null, lastFailedIds: [], showOnlyFailed: false };
+    const reviewView = { filter: 'all', sort: 'id', compareMode: false, compareRunId: null, compareIncludeOverrides: false, lastFailedIds: [], showOnlyFailed: false };
     // v0.6.7 (D1): 로그 탭 필터/검색 상태
     const logView = { level: 'all', query: '' };
 
@@ -2302,6 +2318,9 @@
         <label class="tw-review-filter-label" title="같은 project/file/language의 직전 run과 비교 (LLM 결과 drift 확인)">비교
             <select class="tw-review-compare-select"><option value="">— 직전 run 선택 —</option></select>
         </label>
+        <label class="tw-review-filter-label tw-hidden tw-review-compare-overrides-label" title="비교 시 직접 수정(override)을 final에 덮어 표시 (실제 적용 결과 기준 drift)">
+            <input type="checkbox" class="tw-review-compare-overrides" /> override 포함
+        </label>
         <button class="tw-btn tw-btn-ghost tw-btn-review-compare-exit tw-hidden" title="비교 모드 종료">↩ 검토로 돌아가기</button>
         <button class="tw-btn tw-btn-ghost tw-btn-review-export-json" title="현재 run 결과를 JSON으로 내려받기 (raw 제외)">📥 JSON</button>
         <button class="tw-btn tw-btn-ghost tw-btn-review-export-csv" title="현재 run 결과를 CSV로 내려받기 (id/원문/phase3/45/override/final)">📥 CSV</button>
@@ -2309,7 +2328,10 @@
         <button class="tw-btn tw-btn-ghost tw-btn-review-export-overrides" title="모든 직접 수정(override)을 JSON 파일로 내보내기">⤴ override</button>
         <button class="tw-btn tw-btn-ghost tw-btn-review-import-overrides" title="JSON 파일에서 직접 수정(override) 복원">⤵ override</button>
         <input type="file" class="tw-review-import-overrides-file" accept="application/json,.json" hidden />
+        <span class="tw-review-toolbar-divider"></span>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-history" title="이 파일의 과거 batch run 목록 (활성 전환 / 삭제)">📚 history</button>
     </div>
+    <div class="tw-review-history-panel tw-hidden"></div>
     <div class="tw-review-table"></div>
 </div>
 <div class="tw-log-panel tw-tab-content" data-tab-content="logs">
@@ -2617,6 +2639,9 @@
 .tw-batch-step.tw-step-fail .tw-batch-step-name { color: var(--tw-danger); }
 .tw-batch-step.tw-step-busy { background: rgba(52, 152, 219, 0.10); border-color: rgba(52, 152, 219, 0.4); }
 .tw-batch-step.tw-step-busy .tw-batch-step-name { color: var(--tw-info); }
+/* v0.7.0 G1-b 보강: fail/warn step은 클릭 가능 (로그 탭으로 점프) */
+.tw-batch-step.tw-step-actionable { cursor: pointer; transition: filter 0.12s ease; }
+.tw-batch-step.tw-step-actionable:hover { filter: brightness(1.25); }
 /* v0.6.9 (G1-d): 수집/검증 결과 카드 그리드 — 290px 사이드바에서 2열 정도 들어가게 */
 .tw-batch-summary-cards {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
@@ -2788,6 +2813,24 @@
 .tw-compare-status-same { background: #1f2a1f; color: #86efac; border: 1px solid #2f4a32; }
 .tw-compare-status-changed { background: var(--tw-edit-soft); color: var(--tw-edit); border: 1px solid rgba(251, 191, 36, 0.4); }
 .tw-compare-status-only { background: rgba(52, 152, 219, 0.18); color: #93c5fd; border: 1px solid rgba(52, 152, 219, 0.4); }
+/* v0.7.0 G1-c: history 패널 — 같은 file의 과거 run 목록 */
+.tw-review-history-panel {
+    margin: 6px 0; padding: 6px;
+    border: 1px solid var(--tw-border); border-radius: 6px;
+    background: var(--tw-bg-2); max-height: 240px; overflow: auto;
+}
+.tw-history-row {
+    display: grid; grid-template-columns: 140px 1fr 70px 60px 130px;
+    gap: 8px; padding: 5px 8px; align-items: center; font-size: 12px;
+    border-bottom: 1px solid var(--tw-border);
+}
+.tw-history-row:last-child { border-bottom: none; }
+.tw-history-row.tw-history-active { background: rgba(74, 222, 128, 0.08); }
+.tw-history-row.tw-history-head { font-weight: 600; color: var(--tw-accent); border-bottom: 1px solid var(--tw-border); }
+.tw-history-row > div { word-break: break-all; }
+.tw-history-actions { display: flex; gap: 4px; flex-wrap: wrap; }
+.tw-history-actions .tw-btn { padding: 2px 7px; font-size: 11px; }
+.tw-history-empty { padding: 12px; text-align: center; color: var(--tw-muted, #888); font-size: 12px; }
 @container (max-width: 760px) {
     .tw-context-panel { width: 260px; }
     .tw-batch-panel { flex-direction: column; }
@@ -3079,6 +3122,11 @@
         // v0.6.7 (C2): 비교 모드 select / 종료 버튼
         $('.tw-review-compare-select', el).addEventListener('change', onCompareSelectChange);
         $('.tw-btn-review-compare-exit', el).addEventListener('click', onExitCompareMode);
+        // v0.7.0 B5: override 포함 토글 — compare 모드에서만 노출
+        $('.tw-review-compare-overrides', el).addEventListener('change', (e) => {
+            reviewView.compareIncludeOverrides = !!e.target.checked;
+            renderReviewTable();
+        });
         // v0.6.7 (C3): export JSON/CSV
         $('.tw-btn-review-export-json', el).addEventListener('click', onExportRunJson);
         $('.tw-btn-review-export-csv', el).addEventListener('click', onExportRunCsv);
@@ -3088,18 +3136,50 @@
             $('.tw-review-import-overrides-file', el)?.click();
         });
         $('.tw-review-import-overrides-file', el).addEventListener('change', onImportOverridesFile);
+        // v0.7.0 G1-c: history 패널 토글 + 행 액션 위임
+        $('.tw-btn-review-history', el).addEventListener('click', onToggleHistory);
+        $('.tw-review-history-panel', el).addEventListener('click', (e) => {
+            const act = e.target.closest('.tw-btn-history-activate');
+            if (act) { onActivateRun(act.getAttribute('data-run-id')); return; }
+            const del = e.target.closest('.tw-btn-history-delete');
+            if (del) { onDeleteRun(del.getAttribute('data-run-id')); return; }
+        });
         // v0.6.7 (D1): 로그 필터/검색/다운로드
         $('.tw-log-level', el).addEventListener('change', onLogLevelChange);
         $('.tw-log-search', el).addEventListener('input', onLogSearchInput);
         $('.tw-btn-log-download', el).addEventListener('click', onDownloadLog);
 
+        // v0.7.0 G1-b 보강: 실패/경고 phase step 클릭 → 로그 탭으로 점프 + phase 이름 필터
+        const stepperEl = $('.tw-batch-stepper', el);
+        if (stepperEl) {
+            stepperEl.addEventListener('click', (e) => {
+                const step = e.target.closest('.tw-batch-step.tw-step-actionable');
+                if (!step) return;
+                const key = step.getAttribute('data-phase-key');
+                const PHASE_LOG_QUERY = { collect: '수집', phase12: 'Phase 1+2', phase3: 'Phase 3', phase45: 'Phase 4+5' };
+                const q = PHASE_LOG_QUERY[key];
+                if (!q) return;
+                logView.query = q;
+                setMainTab('logs');
+                const searchInput = $('.tw-log-search', el);
+                if (searchInput) searchInput.value = q;
+                renderLogOutput();
+                toast(`📜 로그 탭에서 "${q}" 항목으로 필터했어요`, 'info', 3000);
+            });
+        }
+
         $('.tw-review-table', el).addEventListener('click', async (e) => {
-            // v0.6.10 B4: warn chip 클릭 → 해당 행 스크롤+flash (자체 행이라도 시각 강조 도움)
+            // v0.7.0 B4 재설계: warn chip 클릭 → 위반 상세를 toast로 표시
+            // (chip의 title 속성에 이미 상세 메시지가 들어있음. v0.6.10의 자기 행 flash는
+            //  이미 보이는 행이라 정보적 가치가 낮아 상세 안내로 교체)
             const warnChip = e.target.closest('.tw-review-warn-chip');
             if (warnChip) {
-                const row = warnChip.closest('.tw-review-row');
-                const rid = row?.getAttribute('data-row-id');
-                if (rid) scrollToReviewRow(rid);
+                const kind = warnChip.classList.contains('tw-review-warn-tb') ? 'TB 용어'
+                    : warnChip.classList.contains('tw-review-warn-order') ? 'placeholder 순서'
+                    : warnChip.classList.contains('tw-review-warn-charlimit') ? '길이'
+                    : '검증';
+                const detail = warnChip.getAttribute('title') || '상세 없음';
+                toast(`⚠ ${kind} — ${detail}`, 'warn', 6000);
                 return;
             }
 
@@ -3571,13 +3651,19 @@
             },
         ];
         const ICON = { idle: '⭕', busy: '🔄', done: '✅', warn: '⚠', fail: '❌' };
+        // v0.7.0 G1-b 보강: fail/warn step 클릭 → 로그 탭 + phase 이름으로 필터
+        const PHASE_LOG_QUERY = { collect: '수집', phase12: 'Phase 1+2', phase3: 'Phase 3', phase45: 'Phase 4+5' };
         el.innerHTML = steps.map(s => {
             const cls = s.state === 'done' ? 'tw-step-done'
                 : s.state === 'fail' ? 'tw-step-fail'
                 : s.state === 'warn' ? 'tw-step-warn'
                 : s.state === 'busy' ? 'tw-step-busy'
                 : '';
-            return `<div class="tw-batch-step ${cls}" title="${escapeHtml(s.name)}: ${escapeHtml(s.state)}">
+            const actionable = (s.state === 'fail' || s.state === 'warn') && PHASE_LOG_QUERY[s.key];
+            const dataAttr = actionable ? ` data-phase-key="${escapeHtml(s.key)}"` : '';
+            const actionableCls = actionable ? ' tw-step-actionable' : '';
+            const titleSuffix = actionable ? ' · 클릭 시 로그 탭에서 해당 phase 항목 필터' : '';
+            return `<div class="tw-batch-step ${cls}${actionableCls}"${dataAttr} title="${escapeHtml(s.name)}: ${escapeHtml(s.state)}${titleSuffix}">
                 <span class="tw-batch-step-icon">${ICON[s.state] || '⭕'}</span>
                 <span class="tw-batch-step-name">${escapeHtml(s.name)}</span>
                 ${s.detail ? `<span class="tw-batch-step-detail">${escapeHtml(s.detail)}</span>` : ''}
@@ -3867,6 +3953,11 @@
             }).join('');
         sel.disabled = !currentRun || priors.length === 0;
         if (exitBtn) exitBtn.classList.toggle('tw-hidden', !reviewView.compareMode);
+        // v0.7.0 B5: override 포함 토글은 compare 모드에서만 노출하고 상태도 동기화
+        const ovrLabel = $('.tw-review-compare-overrides-label', modalEl);
+        const ovrChk = $('.tw-review-compare-overrides', modalEl);
+        if (ovrLabel) ovrLabel.classList.toggle('tw-hidden', !reviewView.compareMode);
+        if (ovrChk) ovrChk.checked = !!reviewView.compareIncludeOverrides;
     }
 
     function onCompareSelectChange(e) {
@@ -3897,11 +3988,14 @@
             tableEl.innerHTML = '';
             return;
         }
-        const rows = buildRunCompareRows(currentRun, prior);
+        const rows = buildRunCompareRows(currentRun, prior, { includeOverrides: !!reviewView.compareIncludeOverrides });
         const changed = rows.filter(r => !r.sameFinal && !r.onlyInCurrent && !r.onlyInPrior).length;
         const onlyCurrent = rows.filter(r => r.onlyInCurrent).length;
         const onlyPrior = rows.filter(r => r.onlyInPrior).length;
-        summaryEl.textContent = `비교: 현재 run ${currentRun.runId} ↔ 직전 run ${prior.runId} · 총 ${rows.length}개 · 최종 변경 ${changed}개 · 현재만 ${onlyCurrent}개 · 직전만 ${onlyPrior}개`;
+        const overrideTag = reviewView.compareIncludeOverrides
+            ? ` · ✏️ override 반영 (현재 ${rows.filter(r => r.currentOverride).length} / 직전 ${rows.filter(r => r.priorOverride).length})`
+            : '';
+        summaryEl.textContent = `비교: 현재 run ${currentRun.runId} ↔ 직전 run ${prior.runId} · 총 ${rows.length}개 · 최종 변경 ${changed}개 · 현재만 ${onlyCurrent}개 · 직전만 ${onlyPrior}개${overrideTag}`;
         const head = `<div class="tw-compare-row tw-compare-head">
             <div class="tw-compare-cell">ID</div>
             <div class="tw-compare-cell">원문</div>
@@ -3927,7 +4021,7 @@
                 <div class="tw-compare-cell"><span class="tw-compare-status ${statusCls}">${status}</span></div>
             </div>`;
         }).join('');
-        tableEl.innerHTML = `<div class="tw-compare-banner">⚖ 비교 모드 — 직전 run의 LLM 결과와 비교 (override는 미반영). 종료하려면 우측 상단 ↩ 버튼.</div>
+        tableEl.innerHTML = `<div class="tw-compare-banner">⚖ 비교 모드 — 직전 run의 ${reviewView.compareIncludeOverrides ? '실제 적용 결과 (override 포함)' : 'LLM 결과'}와 비교. 종료하려면 우측 상단 ↩ 버튼.</div>
             <div class="tw-compare-table">${head}${body}</div>`;
     }
 
@@ -3981,49 +4075,95 @@
             try {
                 const text = String(reader.result || '');
                 const parsed = JSON.parse(text);
-                const incoming = parsed?.overrides && typeof parsed.overrides === 'object' ? parsed.overrides : null;
+                // v0.7.0 E1 보강: 다음 3가지 포맷 모두 허용
+                //   1) wrapper: { schema, schemaVersion, overrides: {...} }   (v0.6.10 export)
+                //   2) raw bucket: { [runId]: { [stringId]: { text, updatedAt } | string } }
+                //      (사용자가 localStorage에서 직접 복사한 경우)
+                //   3) wrapper에 schemaVersion이 다르면 사용자 확인 후 강행
+                let incoming = null;
+                let schemaVersion = null;
+                if (parsed && typeof parsed === 'object' && parsed.overrides && typeof parsed.overrides === 'object') {
+                    incoming = parsed.overrides;
+                    schemaVersion = parsed.schemaVersion ?? null;
+                } else if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    // raw bucket: 각 값이 객체이고 그 안의 값이 string 또는 {text} 면 OK
+                    const sample = Object.values(parsed)[0];
+                    if (sample && typeof sample === 'object' && !Array.isArray(sample)) {
+                        incoming = parsed;
+                    }
+                }
                 if (!incoming) {
-                    toast('파일 형식이 올바르지 않습니다 (overrides 필드 없음).', 'error');
+                    toast('파일 형식이 올바르지 않습니다 (overrides 데이터 없음).', 'error');
                     return;
+                }
+                if (schemaVersion !== null && schemaVersion !== 1) {
+                    if (!confirm(`이 파일의 schemaVersion=${schemaVersion} 은 알려진 형식이 아닙니다.\n\n그래도 가져오시겠습니까? (호환성은 보장되지 않음)`)) {
+                        return;
+                    }
                 }
                 const runIds = Object.keys(incoming);
                 const incomingCount = runIds.reduce((s, rid) => s + Object.keys(incoming[rid] || {}).length, 0);
                 if (!incomingCount) { toast('파일에 복원할 항목이 없습니다.', 'info'); return; }
-                const mode = confirm(
-                    `override 가져오기\n\n` +
-                    `파일: run ${runIds.length}개 / 항목 ${incomingCount}개\n\n` +
-                    `[확인] = 같은 run+id는 파일 값으로 덮어쓰기 (병합)\n` +
-                    `[취소] = 가져오기 중단`,
-                ) ? 'merge' : null;
-                if (!mode) return;
 
+                // 사전 충돌 분석 — 신규/변경/동일을 미리 카운트해서 confirm 메시지에 포함
                 const current = loadReviewOverrides() || {};
                 let added = 0;
-                let overwritten = 0;
+                let changed = 0;
+                let same = 0;
+                for (const rid of runIds) {
+                    const bucket = incoming[rid] || {};
+                    const targetExisting = current[rid] || {};
+                    for (const sid of Object.keys(bucket)) {
+                        const v = bucket[sid];
+                        const incomingText = typeof v === 'string'
+                            ? v
+                            : (v && typeof v === 'object' && typeof v.text === 'string' ? v.text : null);
+                        if (incomingText === null) continue;
+                        const existing = targetExisting[sid];
+                        const existingText = typeof existing === 'string'
+                            ? existing
+                            : (existing && typeof existing === 'object' ? existing.text : null);
+                        if (existing == null) added += 1;
+                        else if (existingText === incomingText) same += 1;
+                        else changed += 1;
+                    }
+                }
+                const detail = `신규 ${added} · 변경 ${changed} · 동일 ${same}`;
+                if (!confirm(`override 가져오기\n\n파일: run ${runIds.length}개 / 항목 ${incomingCount}개\n비교: ${detail}\n\n[확인] 진행 (변경된 항목은 파일 값으로 덮어쓰기)\n[취소] 중단`)) {
+                    return;
+                }
+
+                let appliedAdded = 0;
+                let appliedChanged = 0;
                 for (const rid of runIds) {
                     const bucket = incoming[rid] || {};
                     const target = current[rid] || (current[rid] = {});
                     for (const sid of Object.keys(bucket)) {
                         const v = bucket[sid];
-                        // legacy string vs {text, updatedAt}
                         const norm = typeof v === 'string'
                             ? { text: v, updatedAt: Date.now() }
-                            : (v && typeof v === 'object' && typeof v.text === 'string' ? { text: v.text, updatedAt: v.updatedAt || Date.now() } : null);
+                            : (v && typeof v === 'object' && typeof v.text === 'string'
+                                ? { text: v.text, updatedAt: v.updatedAt || Date.now() }
+                                : null);
                         if (!norm) continue;
-                        if (target[sid]) overwritten += 1;
-                        else added += 1;
+                        const existing = target[sid];
+                        const existingText = typeof existing === 'string'
+                            ? existing
+                            : (existing && typeof existing === 'object' ? existing.text : null);
+                        if (existing == null) appliedAdded += 1;
+                        else if (existingText !== norm.text) appliedChanged += 1;
                         target[sid] = norm;
                     }
                 }
                 saveReviewOverrides(current);
-                toast(`override 가져오기 완료 — 신규 ${added}, 덮어쓰기 ${overwritten}`, 'success');
-                appendBatchLog(`override 가져오기 (신규 ${added}, 덮어쓰기 ${overwritten})`, 'info');
+                toast(`override 가져오기 완료 — 신규 ${appliedAdded} / 덮어쓰기 ${appliedChanged} / 동일 ${same}`, 'success');
+                appendBatchLog(`override 가져오기 (신규 ${appliedAdded}, 덮어쓰기 ${appliedChanged}, 동일 ${same}, schemaVersion=${schemaVersion ?? 'raw'})`, 'info');
                 renderReviewTable();
             } catch (err) {
                 console.error('[TMS-WF] override import 실패:', err);
                 toast('가져오기 실패: ' + err.message, 'error');
             } finally {
-                input.value = ''; // 같은 파일 다시 선택 가능하도록 reset
+                input.value = '';
             }
         };
         reader.onerror = () => {
@@ -4031,6 +4171,80 @@
             input.value = '';
         };
         reader.readAsText(file);
+    }
+
+    // v0.7.0 G1-c: history 패널 — 이 파일의 과거 batch run을 나열하고
+    // 활성 전환 / 삭제할 수 있게 함. compare-select와 달리 현재 활성 run도 포함.
+    function onToggleHistory() {
+        const panel = $('.tw-review-history-panel', modalEl);
+        if (!panel) return;
+        const willShow = panel.classList.contains('tw-hidden');
+        if (willShow) renderHistoryPanel();
+        panel.classList.toggle('tw-hidden');
+    }
+    function renderHistoryPanel() {
+        const panel = $('.tw-review-history-panel', modalEl);
+        if (!panel || panel.classList.contains('tw-hidden')) return;
+        const runs = loadBatchRuns();
+        const params = getUrlParams();
+        const sameFile = Object.values(runs)
+            .filter(r => r && r.runId &&
+                String(r.projectId) === String(params.projectId || '') &&
+                String(r.fileId) === String(params.fileId || '') &&
+                String(r.languageId) === String(params.languageId || ''))
+            .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+        if (!sameFile.length) {
+            panel.innerHTML = '<div class="tw-history-empty">이 파일에는 저장된 run 기록이 없습니다.</div>';
+            return;
+        }
+        const activeId = getActiveBatchRunId();
+        const head = `<div class="tw-history-row tw-history-head">
+    <div>업데이트</div><div>Run ID</div><div>상태</div><div>항목</div><div>동작</div>
+</div>`;
+        const body = sameFile.map(r => {
+            const stamp = (r.updatedAt || r.createdAt || '').slice(0, 19).replace('T', ' ');
+            const itemCount = r.phase3?.parsed?.translations?.length || 0;
+            const statusLabel = (typeof BATCH_STATUS_LABELS === 'object' && BATCH_STATUS_LABELS[r.status]) || r.status || '-';
+            const isActive = r.runId === activeId;
+            const activateBtn = isActive
+                ? ''
+                : `<button class="tw-btn tw-btn-ghost tw-btn-history-activate" data-run-id="${escapeHtml(r.runId)}" title="이 run을 활성으로 전환 (이후 review/log/compare가 이 run 기준이 됨)">✓ 활성화</button>`;
+            return `<div class="tw-history-row${isActive ? ' tw-history-active' : ''}">
+    <div title="${escapeHtml(r.createdAt || '')}">${escapeHtml(stamp || '-')}</div>
+    <div title="${escapeHtml(r.runId)}">${escapeHtml(r.runId)}${isActive ? ' <span class="tw-muted">(현재)</span>' : ''}</div>
+    <div>${escapeHtml(statusLabel)}</div>
+    <div>${itemCount}</div>
+    <div class="tw-history-actions">${activateBtn}<button class="tw-btn tw-btn-ghost tw-btn-history-delete" data-run-id="${escapeHtml(r.runId)}" title="이 run 삭제 (override는 별도 키이므로 보존됨)">🗑 삭제</button></div>
+</div>`;
+        }).join('');
+        panel.innerHTML = head + body;
+    }
+    function onActivateRun(runId) {
+        if (!runId) return;
+        const runs = loadBatchRuns();
+        if (!runs[runId]) { toast('run을 찾을 수 없습니다.', 'error'); return; }
+        setActiveBatchRunId(runId);
+        syncBatchRunFromLs();
+        renderBatchRun();
+        renderHistoryPanel();
+        toast(`run ${runId} 활성화`, 'success');
+    }
+    function onDeleteRun(runId) {
+        if (!runId) return;
+        const isActive = runId === getActiveBatchRunId();
+        const msg = (isActive ? '⚠ 현재 활성 run을 삭제합니다.\n\n' : '')
+            + `run을 삭제합니다.\n\n${runId}\n\n계속하시겠습니까?`;
+        if (!confirm(msg)) return;
+        const runs = loadBatchRuns();
+        delete runs[runId];
+        saveBatchRuns(runs);
+        if (isActive) {
+            lsSet(LS_KEYS.ACTIVE_BATCH_RUN, null);
+            batchRun = null;
+            renderBatchRun();
+        }
+        renderHistoryPanel();
+        toast(`run ${runId} 삭제됨`, 'success');
     }
     function getBatchFinalText(id) {
         const run = batchRun || restoreActiveBatchRun();
