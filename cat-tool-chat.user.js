@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.5
+// @version      0.6.6
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -561,7 +561,64 @@
         return expectedGroupById;
     }
 
-    function validatePhase3Compact(phase12Compact, phase3Compact, segmentSource) {
+    // v0.6.6 (B3): warn-only 추가 검증 (char 길이, placeholder 순서, TB term 미사용)
+    // - charLimitOver: segment.char_limit이 있을 때 final 길이가 limit 초과 (없으면 origin_string 길이 * 2.5 + 30 임시 cap)
+    // - placeholderOrderMismatch: source/target placeholder 출현 순서가 다름
+    // - tbTermsMissed: tbTerms Map에 source가 있지만 final이 target을 포함하지 않음
+    function computeTranslationWarnings(items, sourceById, tbTerms) {
+        const charLimitOver = [];
+        const placeholderOrderMismatch = [];
+        const tbTermsMissed = [];
+        const tb = tbTerms instanceof Map ? tbTerms : null;
+
+        for (const item of items) {
+            if (typeof item.t !== 'string' || !item.t) continue;
+            const id = normalizeId(item.id);
+            const seg = sourceById.get(id);
+            const src = seg?.origin_string || '';
+            const finalText = item.t;
+
+            // char limit
+            const explicitLimit = Number(seg?.char_limit) || 0;
+            const finalLen = Array.from(finalText).length;
+            if (explicitLimit > 0) {
+                if (finalLen > explicitLimit) charLimitOver.push({ id, length: finalLen, limit: explicitLimit, source: 'segment.char_limit' });
+            } else if (src) {
+                const srcLen = Array.from(src).length;
+                const softLimit = Math.max(30, Math.ceil(srcLen * 2.5));
+                if (finalLen > softLimit) charLimitOver.push({ id, length: finalLen, limit: softLimit, source: 'soft(2.5x+30)' });
+            }
+
+            // placeholder order
+            const srcPh = extractPlaceholders(src);
+            if (srcPh.length >= 2) {
+                const finalPh = extractPlaceholders(finalText);
+                const srcSeq = srcPh.filter(p => finalPh.includes(p));
+                const finalSeq = finalPh.filter(p => srcPh.includes(p));
+                const minLen = Math.min(srcSeq.length, finalSeq.length);
+                let mismatched = false;
+                for (let i = 0; i < minLen; i += 1) {
+                    if (srcSeq[i] !== finalSeq[i]) { mismatched = true; break; }
+                }
+                if (mismatched) placeholderOrderMismatch.push({ id, expected: srcSeq, actual: finalSeq });
+            }
+
+            // tb terms
+            if (tb && tb.size && src) {
+                const missed = [];
+                for (const [srcTerm, dstTerm] of tb) {
+                    if (!srcTerm || !dstTerm) continue;
+                    if (src.includes(srcTerm) && !finalText.includes(dstTerm)) {
+                        missed.push({ src: srcTerm, expected: dstTerm });
+                    }
+                }
+                if (missed.length) tbTermsMissed.push({ id, terms: missed });
+            }
+        }
+        return { charLimitOver, placeholderOrderMismatch, tbTermsMissed };
+    }
+
+    function validatePhase3Compact(phase12Compact, phase3Compact, segmentSource, options = {}) {
         const expectedIds = segmentSource.map(seg => normalizeId(seg.id));
         const expectedGroupById = buildExpectedGroupMap(phase12Compact);
         const translations = Array.isArray(phase3Compact?.translations) ? phase3Compact.translations : [];
@@ -600,6 +657,9 @@
             .filter(item => typeof item.t === 'string' && /[\u4e00-\u9fff]/.test(item.t))
             .map(item => normalizeId(item.id));
 
+        // v0.6.6 (B3): warn-only 추가 검증 (ok에 영향 없음)
+        const warnings = computeTranslationWarnings(translations, sourceById, options.tbTerms);
+
         return {
             ok: phase3Compact?.phase === '3' &&
                 coverage.ok &&
@@ -614,10 +674,11 @@
             emptyTranslations,
             missingPlaceholders,
             hanjaLike,
+            warnings,
         };
     }
 
-    function validatePhase45Compact(phase3Compact, phase45Compact, segmentSource) {
+    function validatePhase45Compact(phase3Compact, phase45Compact, segmentSource, options = {}) {
         const translations = Array.isArray(phase3Compact?.translations) ? phase3Compact.translations : [];
         const expectedIds = translations.map(item => normalizeId(item.id));
         const phase3ById = new Map(translations.map(item => [normalizeId(item.id), item]));
@@ -686,6 +747,10 @@
         // v0.6.4: \uc0ac\uc2e4\uc0c1 no-op\uc744 \uc81c\uc678\ud55c \uc2e4\uc81c \ubcc0\uacbd \uac74\uc218
         const changedCount = revisions.filter(item => item.t !== null && !effectiveNoOpIds.has(normalizeId(item.id))).length;
 
+        // v0.6.6 (B3): warn-only 추가 검증 (final 텍스트 기준)
+        const warnInputs = revisions.map(item => ({ id: normalizeId(item.id), gid: item.gid, t: finalTextById.get(normalizeId(item.id)) || '' }));
+        const warnings = computeTranslationWarnings(warnInputs, sourceById, options.tbTerms);
+
         return {
             ok: phase45Compact?.phase === '4+5' &&
                 coverage.ok &&
@@ -705,6 +770,7 @@
             missingPlaceholders,
             hanjaLike,
             changedCount,
+            warnings,
         };
     }
 
@@ -1245,6 +1311,50 @@
         return bucket ? Object.keys(bucket).length : 0;
     }
 
+    // v0.6.6 (B1): 고아 override 정리 — 알려진 batch run 또는 활성 run 외 버킷 + 활성 run 내 phase3에 없는 ID 정리
+    function gcOrphanReviewOverrides(options = {}) {
+        const all = loadReviewOverrides();
+        const allRunIds = Object.keys(all);
+        if (!allRunIds.length) return { removedRunIds: [], removedItems: [], totalItemsRemoved: 0, runIdsKept: [] };
+
+        const knownRuns = lsGet(LS_KEYS.BATCH_RUNS, {}) || {};
+        const knownRunIds = new Set(Object.keys(knownRuns));
+        const activeRunId = lsGet(LS_KEYS.ACTIVE_BATCH_RUN, null);
+        if (activeRunId) knownRunIds.add(activeRunId);
+
+        const removedRunIds = [];
+        const removedItems = [];
+        for (const runId of allRunIds) {
+            const bucket = all[runId] || {};
+            if (!knownRunIds.has(runId)) {
+                removedRunIds.push(runId);
+                for (const itemId of Object.keys(bucket)) removedItems.push({ runId, id: itemId });
+                delete all[runId];
+                continue;
+            }
+            // 활성 run의 경우 phase3에 더 이상 존재하지 않는 ID도 정리
+            if (options.pruneMissingIds !== false && runId === activeRunId) {
+                const run = knownRuns[runId];
+                const phase3Ids = new Set((run?.phase3?.parsed?.translations || []).map(it => normalizeId(it.id)));
+                if (phase3Ids.size === 0) continue; // phase3 없으면 정리 보류
+                for (const itemId of Object.keys(bucket)) {
+                    if (!phase3Ids.has(normalizeId(itemId))) {
+                        removedItems.push({ runId, id: itemId });
+                        delete bucket[itemId];
+                    }
+                }
+                if (!Object.keys(bucket).length) delete all[runId];
+            }
+        }
+        if (removedRunIds.length || removedItems.length) saveReviewOverrides(all);
+        return {
+            removedRunIds,
+            removedItems,
+            totalItemsRemoved: removedItems.length,
+            runIdsKept: Object.keys(all),
+        };
+    }
+
     // ========================================================================
     // v0.6.0 L1: batch 결과를 chat 세션 system 메시지로 시드
     // ========================================================================
@@ -1279,7 +1389,44 @@
                 sysLines.push(`Phase 4+5 수정안: ${revisionItem.t}${reasons}`);
             }
         }
-        sysLines.push(`이 후보를 출발점으로, 이후 사용자 요청에 따라 다듬으세요.`);
+
+        // v0.6.6 (C1): 같은 gid의 다른 세그먼트 샘플 (톤/스타일 일관성 참고용, 최대 5개)
+        if (phase3Item?.gid) {
+            const segById = new Map((run.segments || []).map(s => [normalizeId(s.id), s]));
+            const revById = new Map(((run.phase45?.parsed?.revisions) || []).map(r => [normalizeId(r.id), r]));
+            const siblings = (run.phase3?.parsed?.translations || [])
+                .filter(it => it.gid === phase3Item.gid && normalizeId(it.id) !== id)
+                .slice(0, 5);
+            if (siblings.length) {
+                const lines = siblings.map(it => {
+                    const sid = normalizeId(it.id);
+                    const src = segById.get(sid)?.origin_string || '';
+                    const rev = revById.get(sid);
+                    const finalText = (rev && rev.t !== null && rev.t !== undefined) ? String(rev.t) : it.t;
+                    return `- #${sid}: "${src}" → "${finalText}"`;
+                });
+                sysLines.push(`[같은 그룹 ${phase3Item.gid} 샘플 ${siblings.length}개 (톤/스타일 참고)]\n${lines.join('\n')}`);
+            }
+        }
+
+        // v0.6.6 (C1): 세그먼트별 TB 용어 매핑 (segment.match_terms)
+        if (Array.isArray(segItem?.match_terms) && segItem.match_terms.length) {
+            const terms = segItem.match_terms
+                .map(t => {
+                    const src = t?.trans?.['zh-Hans'] || t?.trans?.zh || '';
+                    const dst = t?.trans?.ko || '';
+                    return (src && dst) ? `- ${src} → ${dst}` : null;
+                })
+                .filter(Boolean);
+            if (terms.length) sysLines.push(`[적용 용어 (TB)]\n${terms.join('\n')}`);
+        }
+
+        // v0.6.6 (C1): 글자수 제한
+        if (segItem?.char_limit && segItem.char_limit > 0) {
+            sysLines.push(`[글자수 제한] ${segItem.char_limit}자`);
+        }
+
+        sysLines.push(`이 후보를 출발점으로, 이후 사용자 요청에 따라 다듬으세요. 같은 그룹의 톤/용어를 일관되게 유지하세요.`);
         const systemText = sysLines.join('\n');
 
         const session = getSession(id);
@@ -1974,6 +2121,9 @@
                     <option value="hanja">한자 잔존</option>
                     <option value="applied">자동 적용됨</option>
                     <option value="drifted">적용 후 변경됨</option>
+                    <option value="warn-charlimit">⚠ 길이 초과</option>
+                    <option value="warn-order">⚠ placeholder 순서</option>
+                    <option value="warn-tb">⚠ TB 용어 누락</option>
                 </select>
             </label>
             <label class="tw-review-filter-label">정렬
@@ -1985,6 +2135,7 @@
             </label>
         </span>
         <span class="tw-review-apply-status tw-muted">입력은 textarea 값 주입까지만 수행합니다.</span>
+        <button class="tw-btn tw-btn-ghost tw-btn-review-gc" title="현재 활성 batch run 외에 남아있는 직접 수정 데이터 정리">override 정리</button>
     </div>
     <div class="tw-review-table"></div>
 </div>
@@ -2173,6 +2324,15 @@
 /* v0.6.5 (A4): phase3 ↔ phase4+5 단어 단위 diff */
 .tw-diff-add { background: rgba(74, 222, 128, 0.18); color: #86efac; border-radius: 2px; padding: 0 2px; }
 .tw-diff-del { background: rgba(248, 113, 113, 0.18); color: #fca5a5; text-decoration: line-through; border-radius: 2px; padding: 0 2px; opacity: 0.85; }
+/* v0.6.6 (B3): warn-only chip (final 셀에 부착) */
+.tw-review-warn-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.tw-review-warn-chip {
+    display: inline-flex; align-items: center; padding: 1px 6px; border-radius: 9999px;
+    font-size: 11px; font-weight: 500; line-height: 1.4; cursor: help;
+    background: rgba(250, 204, 21, 0.14); color: #fde047; border: 1px solid rgba(250, 204, 21, 0.35);
+}
+.tw-review-warn-chip.tw-review-warn-tb { background: rgba(244, 114, 182, 0.14); color: #f9a8d4; border-color: rgba(244, 114, 182, 0.35); }
+.tw-review-warn-chip.tw-review-warn-order { background: rgba(96, 165, 250, 0.14); color: #93c5fd; border-color: rgba(96, 165, 250, 0.35); }
 .tw-review-table {
     flex: 1; overflow: auto; border: 1px solid #333; border-radius: 10px; background: #151515;
 }
@@ -2489,6 +2649,8 @@
         // v0.6.5 (A3): 필터/정렬 변경 → 재렌더
         $('.tw-review-filter', el).addEventListener('change', (e) => { reviewView.filter = e.target.value || 'all'; renderReviewTable(); });
         $('.tw-review-sort', el).addEventListener('change', (e) => { reviewView.sort = e.target.value || 'id'; renderReviewTable(); });
+        // v0.6.6 (B1): 고아 override 정리
+        $('.tw-btn-review-gc', el).addEventListener('click', onReviewOverrideGc);
 
         $('.tw-review-table', el).addEventListener('click', async (e) => {
             const copyBtn = e.target.closest('.tw-btn-copy-final');
@@ -3091,6 +3253,44 @@
         if (success > 0 || failures.length > 0) renderReviewTable();
     }
 
+    // v0.6.6 (B1): 고아 override 정리 클릭 핸들러
+    function onReviewOverrideGc() {
+        const all = loadReviewOverrides();
+        const totalRuns = Object.keys(all).length;
+        const totalItems = Object.values(all).reduce((sum, b) => sum + Object.keys(b || {}).length, 0);
+        if (!totalItems) { toast('정리할 직접 수정 데이터가 없습니다.', 'info'); return; }
+        const knownRuns = lsGet(LS_KEYS.BATCH_RUNS, {}) || {};
+        const activeRunId = lsGet(LS_KEYS.ACTIVE_BATCH_RUN, null);
+        const orphanRunIds = Object.keys(all).filter(rid => !knownRuns[rid] && rid !== activeRunId);
+        const orphanItems = orphanRunIds.reduce((sum, rid) => sum + Object.keys(all[rid] || {}).length, 0);
+
+        let prunedActive = 0;
+        if (activeRunId && all[activeRunId]) {
+            const phase3Ids = new Set((knownRuns[activeRunId]?.phase3?.parsed?.translations || []).map(it => normalizeId(it.id)));
+            if (phase3Ids.size) {
+                for (const itemId of Object.keys(all[activeRunId])) {
+                    if (!phase3Ids.has(normalizeId(itemId))) prunedActive += 1;
+                }
+            }
+        }
+        const removableItems = orphanItems + prunedActive;
+        if (!removableItems) {
+            toast(`정리할 고아 데이터가 없습니다. (전체 ${totalItems}개, run ${totalRuns}개 모두 활성/알려진 run 안에 있음)`, 'info', 3500);
+            return;
+        }
+        const msg = `직접 수정 데이터 정리\n` +
+            `- 알려지지 않은 run: ${orphanRunIds.length}개 (항목 ${orphanItems}개)\n` +
+            (prunedActive ? `- 활성 run 내 phase3에 없는 항목: ${prunedActive}개\n` : '') +
+            `\n총 ${removableItems}개 항목을 삭제합니다. 진행하시겠습니까?`;
+        if (!confirm(msg)) return;
+        const result = gcOrphanReviewOverrides();
+        const after = loadReviewOverrides();
+        const remaining = Object.values(after).reduce((sum, b) => sum + Object.keys(b || {}).length, 0);
+        appendBatchLog(`override GC: run ${result.removedRunIds.length}개, 항목 ${result.totalItemsRemoved}개 삭제, 남음 ${remaining}개`, 'info');
+        toast(`정리 완료 — ${result.totalItemsRemoved}개 삭제, 남음 ${remaining}개`, 'success', 3500);
+        renderReviewTable();
+    }
+
     // v0.6.0 L2: review 행 → chat 탭 점프 (단일 세그먼트 다듬기 모드)
     async function onChatRefineFromReview(stringId) {
         const id = normalizeId(stringId);
@@ -3192,6 +3392,11 @@
         const phase45Validation = run.phase45?.validation || {};
         const missingPlaceholderIds = new Set((phase45Validation.missingPlaceholders || []).map(item => normalizeId(item.id)));
         const hanjaIds = new Set((phase45Validation.hanjaLike || []).map(id => normalizeId(id)));
+        // v0.6.6 (B3): warn-only 분류 (phase45 우선, 없으면 phase3로 폴백)
+        const warnSource = (phase45Validation.warnings ? phase45Validation : (run.phase3?.validation || {})).warnings || {};
+        const warnCharLimitIds = new Set((warnSource.charLimitOver || []).map(w => normalizeId(w.id)));
+        const warnOrderIds = new Set((warnSource.placeholderOrderMismatch || []).map(w => normalizeId(w.id)));
+        const warnTbIds = new Set((warnSource.tbTermsMissed || []).map(w => normalizeId(w.id)));
 
         const stateOrder = { override: 0, edit: 1, keep: 2, none: 3 };
         const descriptors = translations.map(item => {
@@ -3221,6 +3426,9 @@
                 appliedActive, appliedState,
                 hasMissingPlaceholder: missingPlaceholderIds.has(id),
                 hasHanja: hanjaIds.has(id),
+                warnCharLimit: warnCharLimitIds.has(id),
+                warnOrder: warnOrderIds.has(id),
+                warnTb: warnTbIds.has(id),
             };
         });
 
@@ -3234,6 +3442,9 @@
                 case 'hanja': return d.hasHanja;
                 case 'applied': return d.appliedActive;
                 case 'drifted': return d.appliedState === 'drifted';
+                case 'warn-charlimit': return d.warnCharLimit;
+                case 'warn-order': return d.warnOrder;
+                case 'warn-tb': return d.warnTb;
                 case 'all':
                 default: return true;
             }
@@ -3255,7 +3466,16 @@
         const totalCount = descriptors.length;
         const shownCount = filtered.length;
         const filterTag = reviewView.filter !== 'all' ? ` · 필터(${reviewView.filter}) ${shownCount}/${totalCount}` : '';
-        summaryEl.textContent = `번역 ${translations.length}개 · Phase 4+5 ${usePhase45 ? `수정 ${changedCount}개` : '미적용 또는 검증 실패'} · ${appliedSummary}${filterTag}`;
+        // v0.6.6 (B3): warn 요약
+        const warnTotals = {
+            charLimit: warnCharLimitIds.size,
+            order: warnOrderIds.size,
+            tb: warnTbIds.size,
+        };
+        const warnTag = (warnTotals.charLimit + warnTotals.order + warnTotals.tb) > 0
+            ? ` · ⚠ 길이 ${warnTotals.charLimit} / 순서 ${warnTotals.order} / 용어 ${warnTotals.tb}`
+            : '';
+        summaryEl.textContent = `번역 ${translations.length}개 · Phase 4+5 ${usePhase45 ? `수정 ${changedCount}개` : '미적용 또는 검증 실패'} · ${appliedSummary}${warnTag}${filterTag}`;
         const rows = filtered.map(d => {
             const item = d.item;
             const id = d.id;
@@ -3295,6 +3515,24 @@
             const revisionHtml = revisionText
                 ? `<div class="tw-review-text" title="phase3 대비 변경: 초록=추가, 빨강=삭제">${renderDiffHtml(diffWords(item.t || '', revisionText))}</div>`
                 : '';
+            // v0.6.6 (B3): warn-only chip들 (final 셀에 부착)
+            const warnChips = [];
+            if (d.warnCharLimit) {
+                const w = (warnSource.charLimitOver || []).find(x => normalizeId(x.id) === id);
+                const tip = w ? `길이 ${w.length} / 한도 ${w.limit} (${w.source})` : '길이 초과';
+                warnChips.push(`<span class="tw-review-warn-chip tw-review-warn-charlimit" title="${escapeHtml(tip)}">⚠ 길이</span>`);
+            }
+            if (d.warnOrder) {
+                const w = (warnSource.placeholderOrderMismatch || []).find(x => normalizeId(x.id) === id);
+                const tip = w ? `예상 순서: ${(w.expected || []).join(' → ')} / 실제: ${(w.actual || []).join(' → ')}` : 'placeholder 순서 다름';
+                warnChips.push(`<span class="tw-review-warn-chip tw-review-warn-order" title="${escapeHtml(tip)}">⚠ 순서</span>`);
+            }
+            if (d.warnTb) {
+                const w = (warnSource.tbTermsMissed || []).find(x => normalizeId(x.id) === id);
+                const tip = w ? `누락된 용어: ${(w.terms || []).map(t => `${t.src}→${t.expected}`).join(', ')}` : 'TB 용어 누락';
+                warnChips.push(`<span class="tw-review-warn-chip tw-review-warn-tb" title="${escapeHtml(tip)}">⚠ 용어</span>`);
+            }
+            const warnChipsHtml = warnChips.length ? `<div class="tw-review-warn-row">${warnChips.join('')}</div>` : '';
             return `
 <div class="tw-review-row" data-row-id="${escapeHtml(id)}">
     <div class="tw-review-cell tw-review-check" data-label="선택"><input class="tw-review-select" type="checkbox" data-id="${escapeHtml(id)}"></div>
@@ -3303,7 +3541,7 @@
     <div class="tw-review-cell tw-review-source tw-review-text" data-label="원문">${escapeHtml(seg?.origin_string || '')}</div>
     <div class="tw-review-cell tw-review-text" data-label="Phase 3">${escapeHtml(item.t || '')}</div>
     <div class="tw-review-cell" data-label="Phase 4+5">${revisionHtml}<span class="${flagChipClass}">${escapeHtml(flagChipText)}</span></div>
-    <div class="tw-review-cell" data-label="최종 후보"><div class="tw-review-final-wrap" data-final-id="${escapeHtml(id)}"><div class="tw-review-final-view tw-review-text">${escapeHtml(finalText)}</div>${overrideChip}</div></div>
+    <div class="tw-review-cell" data-label="최종 후보"><div class="tw-review-final-wrap" data-final-id="${escapeHtml(id)}"><div class="tw-review-final-view tw-review-text">${escapeHtml(finalText)}</div>${overrideChip}${warnChipsHtml}</div></div>
     <div class="tw-review-cell tw-review-actions" data-label="동작"><button class="tw-btn tw-btn-primary tw-btn-apply-final" data-id="${escapeHtml(id)}" title="현재 textarea에 입력">입력</button><button class="tw-btn tw-btn-ghost tw-btn-edit-final" data-id="${escapeHtml(id)}" title="최종 후보를 직접 수정">✏️</button><button class="tw-btn tw-btn-ghost tw-btn-copy-final" data-id="${escapeHtml(id)}" title="최종 후보 복사">📋</button><button class="tw-btn tw-btn-ghost tw-btn-chat-refine" data-id="${escapeHtml(id)}" title="chat 탭에서 다듬기">💬</button>${hasOverride ? `<button class="tw-btn tw-btn-ghost tw-btn-revert-final" data-id="${escapeHtml(id)}" title="직접 수정 되돌리기">↺</button>` : ''}</div>
 </div>`;
         }).join('');
@@ -3386,8 +3624,12 @@
 
     function validateParsedPhase(run, phaseTag, parsed) {
         if (phaseTag === '1+2') return validatePhase12Compact(parsed, run.segments);
-        if (phaseTag === '3') return validatePhase3Compact(run.phase12.parsed, parsed, run.segments);
-        if (phaseTag === '4+5') return validatePhase45Compact(run.phase3.parsed, parsed, run.segments);
+        // v0.6.6 (B3): warn-only 추가 검증을 위해 visible TB term 매핑 주입 (DOM 의존 — 없으면 빈 Map)
+        let tbTerms;
+        try { tbTerms = extractVisibleTbTerms(); } catch (_) { tbTerms = new Map(); }
+        const opts = { tbTerms };
+        if (phaseTag === '3') return validatePhase3Compact(run.phase12.parsed, parsed, run.segments, opts);
+        if (phaseTag === '4+5') return validatePhase45Compact(run.phase3.parsed, parsed, run.segments, opts);
         throw new Error(`알 수 없는 Phase: ${phaseTag}`);
     }
 
@@ -4320,6 +4562,23 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.6.5] 로드됨. Alt+Z로 모달 오픈 (필터/정렬 + diff 하이라이트 + 수정만 입력 + override 가드)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    // v0.6.6 (D3): node 테스트 환경에서만 내부 순수 함수를 노출 (브라우저에서는 영향 없음)
+    if (typeof globalThis !== 'undefined' && globalThis.__TMS_TEST_HOOK__) {
+        globalThis.__TMS_TEST_EXPORTS__ = {
+            // validators
+            validatePhase3Compact, validatePhase45Compact, computeTranslationWarnings,
+            extractPlaceholders, analyzeIdCoverage, normalizeId,
+            // diff
+            diffWords, tokenizeForDiff, renderDiffHtml,
+            // override LS
+            getReviewOverride, setReviewOverride, clearReviewOverride,
+            loadReviewOverrides, saveReviewOverrides, countReviewOverridesForRun,
+            gcOrphanReviewOverrides,
+            // misc
+            escapeHtml, LS_KEYS,
+        };
+    }
+
+    console.log('%c[TMS Workflow v0.6.6] 로드됨. Alt+Z로 모달 오픈 (override GC + 추가 검증 룰 + chat 시드 강화)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
