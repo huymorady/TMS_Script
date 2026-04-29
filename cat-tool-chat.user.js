@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.1
+// @version      0.6.2
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -29,6 +29,7 @@
         BATCH_RUNS: 'tms_workflow_batch_runs_v1',
         ACTIVE_BATCH_RUN: 'tms_workflow_active_batch_run_v1',
         APPLIED_FROM_BATCH: 'tms_workflow_applied_from_batch_v1', // v0.6.0 L3: textarea가 배치에서 자동 적용된 세그먼트 추적
+        REVIEW_OVERRIDES: 'tms_workflow_review_overrides_v1', // v0.6.2: 사용자가 리뷰 탭에서 직접 수정한 최종 후보 (run+id 키)
     };
 
     const DEFAULT_PROMPT = {
@@ -1190,6 +1191,40 @@
     }
 
     // ========================================================================
+    // v0.6.2: 리뷰 탭 인라인 수정 override (run+id 키, phase 데이터는 불변 유지)
+    // ========================================================================
+    function loadReviewOverrides() {
+        return lsGet(LS_KEYS.REVIEW_OVERRIDES, {});
+    }
+    function saveReviewOverrides(map) {
+        lsSet(LS_KEYS.REVIEW_OVERRIDES, map);
+    }
+    function getReviewOverride(runId, stringId) {
+        if (!runId) return null;
+        const all = loadReviewOverrides();
+        const bucket = all[runId];
+        if (!bucket) return null;
+        const v = bucket[normalizeId(stringId)];
+        return typeof v === 'string' ? v : null;
+    }
+    function setReviewOverride(runId, stringId, text) {
+        if (!runId) return;
+        const all = loadReviewOverrides();
+        const bucket = all[runId] || (all[runId] = {});
+        bucket[normalizeId(stringId)] = String(text ?? '');
+        saveReviewOverrides(all);
+    }
+    function clearReviewOverride(runId, stringId) {
+        if (!runId) return;
+        const all = loadReviewOverrides();
+        const bucket = all[runId];
+        if (!bucket) return;
+        delete bucket[normalizeId(stringId)];
+        if (!Object.keys(bucket).length) delete all[runId];
+        saveReviewOverrides(all);
+    }
+
+    // ========================================================================
     // v0.6.0 L1: batch 결과를 chat 세션 system 메시지로 시드
     // ========================================================================
     function importBatchResultToChat(stringId, run, options = {}) {
@@ -2087,7 +2122,7 @@
     flex: 1; overflow: auto; border: 1px solid #333; border-radius: 10px; background: #151515;
 }
 .tw-review-row {
-    display: grid; grid-template-columns: 34px 78px 54px minmax(120px, 0.8fr) minmax(145px, 1fr) minmax(120px, 0.8fr) minmax(160px, 1fr) 104px;
+    display: grid; grid-template-columns: 34px 78px 54px minmax(120px, 0.8fr) minmax(145px, 1fr) minmax(120px, 0.8fr) minmax(160px, 1fr) 132px;
     gap: 8px; padding: 10px 12px; border-bottom: 1px solid #303030; align-items: start;
 }
 .tw-review-row:last-child { border-bottom: none; }
@@ -2097,8 +2132,29 @@
 .tw-review-check { display: flex; align-items: center; justify-content: center; }
 .tw-review-select, .tw-review-select-all { accent-color: #4ade80; }
 .tw-review-source { color: #aaa; max-height: 90px; overflow: hidden; }
-.tw-review-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
-.tw-review-actions .tw-btn { width: 76px; }
+.tw-review-actions {
+    display: flex; flex-direction: row; flex-wrap: wrap; gap: 4px;
+    align-items: center; justify-content: flex-start;
+}
+.tw-review-actions .tw-btn {
+    width: auto; min-width: 0; padding: 4px 8px; font-size: 12px; line-height: 1.3;
+}
+.tw-review-flag-chip {
+    display: inline-block; margin-top: 4px; padding: 2px 7px; border-radius: 10px;
+    font-size: 10px; line-height: 1.4; background: #25304a; color: #cbd5e1; border: 1px solid #334155;
+    white-space: nowrap;
+}
+.tw-review-flag-chip.tw-review-flag-keep { background: #1f2a1f; color: #86efac; border-color: #2f4a32; }
+.tw-review-flag-chip.tw-review-flag-edit { background: #2a1f33; color: #d8b4fe; border-color: #4a2f5a; }
+.tw-review-final-wrap { display: flex; flex-direction: column; gap: 4px; }
+.tw-review-final-edit { display: flex; flex-direction: column; gap: 6px; }
+.tw-review-final-edit textarea {
+    width: 100%; min-height: 64px; resize: vertical; box-sizing: border-box;
+    background: #0f1612; color: #e6e6e6; border: 1px solid #4ade80; border-radius: 6px;
+    padding: 6px 8px; font-size: 12px; line-height: 1.45; font-family: inherit;
+}
+.tw-review-edit-buttons { display: flex; gap: 4px; }
+.tw-review-edit-buttons .tw-btn { padding: 3px 8px; font-size: 11px; }
 .tw-review-chat-badge {
     margin-left: 6px; font-size: 11px; opacity: 0.85;
     cursor: help;
@@ -2395,6 +2451,39 @@
             const refineBtn = e.target.closest('.tw-btn-chat-refine');
             if (refineBtn) {
                 await onChatRefineFromReview(Number(refineBtn.dataset.id));
+                return;
+            }
+
+            // v0.6.2: 인라인 직접 수정 진입
+            const editBtn = e.target.closest('.tw-btn-edit-final');
+            if (editBtn) {
+                openInlineFinalEditor(normalizeId(editBtn.dataset.id));
+                return;
+            }
+            // v0.6.2: 인라인 수정 저장
+            const saveBtn = e.target.closest('.tw-btn-edit-save');
+            if (saveBtn) {
+                commitInlineFinalEditor(normalizeId(saveBtn.dataset.id));
+                return;
+            }
+            // v0.6.2: 인라인 수정 취소
+            const cancelBtn = e.target.closest('.tw-btn-edit-cancel');
+            if (cancelBtn) {
+                renderReviewTable();
+                return;
+            }
+            // v0.6.2: override 되돌리기
+            const revertBtn = e.target.closest('.tw-btn-revert-final');
+            if (revertBtn) {
+                const id = normalizeId(revertBtn.dataset.id);
+                const run = batchRun || restoreActiveBatchRun();
+                if (run?.runId) {
+                    if (!confirm(`#${id} 직접 수정을 되돌리고 배치 결과로 복원하시겠습니까?`)) return;
+                    clearReviewOverride(run.runId, id);
+                    appendBatchLog(`#${id} 직접 수정 되돌림`, 'info');
+                    renderReviewTable();
+                }
+                return;
             }
         });
 
@@ -2720,12 +2809,76 @@
     function getBatchFinalText(id) {
         const run = batchRun || restoreActiveBatchRun();
         if (!run?.phase3?.parsed || !run.phase3.validation?.ok) return '';
+        // v0.6.2: 사용자 인라인 수정 override 우선
+        const override = getReviewOverride(run.runId, id);
+        if (typeof override === 'string') return override;
         const phase3 = (run.phase3.parsed.translations || []).find(item => normalizeId(item.id) === normalizeId(id));
         const revision = run.phase45?.validation?.ok
             ? (run.phase45?.parsed?.revisions || []).find(item => normalizeId(item.id) === normalizeId(id))
             : null;
         if (!phase3) return '';
         return revision && revision.t !== null ? String(revision.t || '') : String(phase3.t || '');
+    }
+
+    // v0.6.2: 최종 후보 인라인 수정 — 해당 행의 최종 후보 셀을 textarea로 전환
+    function openInlineFinalEditor(stringId) {
+        if (!modalEl) return;
+        const id = normalizeId(stringId);
+        const wrap = modalEl.querySelector(`.tw-review-final-wrap[data-final-id="${CSS.escape(String(id))}"]`);
+        if (!wrap) return;
+        const current = getBatchFinalText(id);
+        wrap.innerHTML = `
+<div class="tw-review-final-edit">
+    <textarea class="tw-review-final-textarea" data-id="${escapeHtml(id)}">${escapeHtml(current)}</textarea>
+    <div class="tw-review-edit-buttons">
+        <button class="tw-btn tw-btn-primary tw-btn-edit-save" data-id="${escapeHtml(id)}">저장</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-edit-cancel" data-id="${escapeHtml(id)}">취소</button>
+    </div>
+</div>`;
+        const ta = wrap.querySelector('textarea');
+        if (ta) {
+            ta.focus();
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+            // Ctrl/Cmd+Enter 저장, Esc 취소 단축키
+            ta.addEventListener('keydown', (ev) => {
+                if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
+                    ev.preventDefault();
+                    commitInlineFinalEditor(id);
+                } else if (ev.key === 'Escape') {
+                    ev.preventDefault();
+                    renderReviewTable();
+                }
+            });
+        }
+    }
+
+    function commitInlineFinalEditor(stringId) {
+        if (!modalEl) return;
+        const id = normalizeId(stringId);
+        const ta = modalEl.querySelector(`.tw-review-final-textarea[data-id="${CSS.escape(String(id))}"]`);
+        if (!ta) return;
+        const run = batchRun || restoreActiveBatchRun();
+        if (!run?.runId) {
+            toast('활성 batch run이 없어 저장할 수 없습니다.', 'error');
+            return;
+        }
+        const newText = ta.value;
+        // 배치 원본과 동일하면 override 제거 (의미 없는 빈 override 누적 방지)
+        const override = getReviewOverride(run.runId, id);
+        // 원본 텍스트 (override 무시 버전) 계산
+        const phase3 = (run.phase3?.parsed?.translations || []).find(it => normalizeId(it.id) === id);
+        const revision = run.phase45?.validation?.ok
+            ? (run.phase45?.parsed?.revisions || []).find(it => normalizeId(it.id) === id)
+            : null;
+        const original = revision && revision.t !== null ? String(revision.t || '') : String(phase3?.t || '');
+        if (newText === original) {
+            if (override !== null) clearReviewOverride(run.runId, id);
+            appendBatchLog(`#${id} 직접 수정이 원본과 같아 override 제거`, 'info');
+        } else {
+            setReviewOverride(run.runId, id, newText);
+            appendBatchLog(`#${id} 직접 수정 저장 (${newText.length}자)`, 'success');
+        }
+        renderReviewTable();
     }
 
     function getReviewTranslationIds() {
@@ -2900,7 +3053,20 @@
             const revision = revisionById.get(id);
             const finalText = getBatchFinalText(id);
             const revisionText = revision && revision.t !== null ? String(revision.t || '') : '';
-            const flag = revision ? (revision.t === null ? '유지' : `수정: ${(revision.r || []).join(', ') || 'reason 없음'}`) : 'Phase3';
+            // v0.6.2: flag chip (action 셀에서 분리, Phase 4+5 셀로 이동)
+            let flagChipClass = 'tw-review-flag-chip';
+            let flagChipText;
+            if (revision) {
+                if (revision.t === null) { flagChipClass += ' tw-review-flag-keep'; flagChipText = '유지'; }
+                else { flagChipClass += ' tw-review-flag-edit'; flagChipText = `수정: ${(revision.r || []).join(', ') || 'reason 없음'}`; }
+            } else {
+                flagChipText = 'Phase3';
+            }
+            // v0.6.2: override 적용 여부
+            const hasOverride = typeof getReviewOverride(run.runId, id) === 'string';
+            const overrideChip = hasOverride
+                ? `<span class="tw-review-flag-chip tw-review-flag-edit" title="사용자가 직접 수정한 최종 후보">✏️ 직접 수정</span>`
+                : '';
             const workState = getSegmentWorkState(id);
             const chatBadge = workState.chat.hasSession
                 ? `<span class="tw-review-chat-badge" title="채팅 세션 ${workState.chat.messageCount}개 메시지">💬</span>`
@@ -2927,19 +3093,28 @@
                 appliedBadge = ` <span class="tw-review-applied-badge" title="${escapeHtml(tip)}">${icon}</span>`;
             }
             return `
-<div class="tw-review-row">
+<div class="tw-review-row" data-row-id="${escapeHtml(id)}">
     <div class="tw-review-cell tw-review-check" data-label="선택"><input class="tw-review-select" type="checkbox" data-id="${escapeHtml(id)}"></div>
     <div class="tw-review-cell" data-label="ID">#${escapeHtml(id)}${chatBadge}${appliedBadge}</div>
     <div class="tw-review-cell" data-label="그룹">${escapeHtml(item.gid || '')}</div>
     <div class="tw-review-cell tw-review-source" data-label="원문">${escapeHtml(seg?.origin_string || '')}</div>
     <div class="tw-review-cell" data-label="Phase 3">${escapeHtml(item.t || '')}</div>
-    <div class="tw-review-cell" data-label="Phase 4+5">${escapeHtml(revisionText || '유지')}</div>
-    <div class="tw-review-cell" data-label="최종 후보">${escapeHtml(finalText)}</div>
+    <div class="tw-review-cell" data-label="Phase 4+5">
+        <div>${escapeHtml(revisionText || (revision && revision.t === null ? '유지' : '—'))}</div>
+        <span class="${flagChipClass}">${escapeHtml(flagChipText)}</span>
+    </div>
+    <div class="tw-review-cell" data-label="최종 후보">
+        <div class="tw-review-final-wrap" data-final-id="${escapeHtml(id)}">
+            <div class="tw-review-final-view">${escapeHtml(finalText)}</div>
+            ${overrideChip}
+        </div>
+    </div>
     <div class="tw-review-cell tw-review-actions" data-label="동작">
-        <button class="tw-btn tw-btn-primary tw-btn-apply-final" data-id="${escapeHtml(id)}">입력</button>
-        <button class="tw-btn tw-btn-ghost tw-btn-copy-final" data-id="${escapeHtml(id)}">복사</button>
-        <button class="tw-btn tw-btn-ghost tw-btn-chat-refine" data-id="${escapeHtml(id)}" title="chat 탭에서 이 세그먼트를 다듬기">다듬기</button>
-        <div class="tw-muted">${escapeHtml(flag)}</div>
+        <button class="tw-btn tw-btn-primary tw-btn-apply-final" data-id="${escapeHtml(id)}" title="현재 textarea에 입력">입력</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-edit-final" data-id="${escapeHtml(id)}" title="최종 후보를 직접 수정">✏️</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-copy-final" data-id="${escapeHtml(id)}" title="최종 후보 복사">📋</button>
+        <button class="tw-btn tw-btn-ghost tw-btn-chat-refine" data-id="${escapeHtml(id)}" title="chat 탭에서 다듬기">💬</button>
+        ${hasOverride ? `<button class="tw-btn tw-btn-ghost tw-btn-revert-final" data-id="${escapeHtml(id)}" title="직접 수정 되돌리기">↺</button>` : ''}
     </div>
 </div>`;
         }).join('');
@@ -3939,6 +4114,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.6.1] 로드됨. Alt+Z로 모달 오픈 (P1/P2/P3 수정)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.6.2] 로드됨. Alt+Z로 모달 오픈 (리뷰 탭 UI 정리 + 인라인 수정)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
