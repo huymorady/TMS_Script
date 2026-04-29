@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.6.0
+// @version      0.6.1
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -2810,15 +2810,15 @@
         if (!run) { toast('활성 배치 실행이 없습니다.', 'error'); return; }
         if (!getBatchFinalText(id)) { toast(`#${id} 적용 가능한 배치 결과가 없습니다.`, 'error'); return; }
 
-        // 페이지 DOM에 있으면 스크롤+클릭으로 활성화 (segmentWatcher가 자동 따라잡지만 확정성 위해 수동 호출도 함)
+        // 페이지 DOM에 없으면 조용히 중단 (P1: segmentWatcher가 currentStringId를 되돌려서 채팅이 틀어지는 혀난함 방지)
         const item = findStringItemByStringId(id);
-        if (item) {
-            item.scrollIntoView({ block: 'center', behavior: 'smooth' });
-            item.click();
-            await sleep(120);
-        } else {
-            toast(`#${id} 세그먼트가 현재 페이지 DOM에 없어 자동 활성화는 생략됩니다.`, 'info');
+        if (!item) {
+            toast(`#${id} 세그먼트가 현재 페이지 DOM에 없습니다. 해당 세그먼트가 보이도록 스크롤/클릭한 뒤 다시 시도하세요.`, 'error', 4000);
+            return;
         }
+        item.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        item.click();
+        await sleep(120);
 
         // 기존 chat 메시지가 있으면 덮어쓰기 confirm
         const existing = getSession(id);
@@ -2868,7 +2868,32 @@
         const segmentById = new Map((run.segments || []).map(seg => [normalizeId(seg.id), seg]));
         const changedCount = revisions.filter(item => item.t !== null).length;
 
-        summaryEl.textContent = `번역 ${translations.length}개 · Phase 4+5 ${usePhase45 ? `수정 ${changedCount}개` : '미적용 또는 검증 실패'} · 자동 적용 없음`;
+        // v0.6.1 P3: applied 기록 집계 (현 run에 속한 것만)
+        let appliedCount = 0;
+        let driftedCount = 0;
+        let unknownCount = 0;
+        for (const tr of translations) {
+            const id = normalizeId(tr.id);
+            const a = getAppliedFromBatch(id);
+            if (!a || (run.runId && a.runId && a.runId !== run.runId)) continue;
+            appliedCount += 1;
+            const ta = findTranslationTextareaForStringId(id);
+            if (ta) {
+                if (ta.value !== a.text) driftedCount += 1;
+            } else {
+                const seg = segmentById.get(id);
+                const cur = seg?.active_result?.result;
+                if (typeof cur === 'string') {
+                    if (cur !== a.text) driftedCount += 1;
+                } else {
+                    unknownCount += 1;
+                }
+            }
+        }
+        const appliedSummary = appliedCount
+            ? `자동 적용 ${appliedCount}개 (수정 ${driftedCount}, 확인 불가 ${unknownCount})`
+            : '자동 적용 없음';
+        summaryEl.textContent = `번역 ${translations.length}개 · Phase 4+5 ${usePhase45 ? `수정 ${changedCount}개` : '미적용 또는 검증 실패'} · ${appliedSummary}`;
         const rows = translations.map(item => {
             const id = normalizeId(item.id);
             const seg = segmentById.get(id);
@@ -2880,14 +2905,26 @@
             const chatBadge = workState.chat.hasSession
                 ? `<span class="tw-review-chat-badge" title="채팅 세션 ${workState.chat.messageCount}개 메시지">💬</span>`
                 : '';
-            // v0.6.0 L3: applied-from-batch 배지
+            // v0.6.0 L3: applied-from-batch 배지 (v0.6.1 P2: textarea 없으면 unknown 상태 표시)
             const applied = getAppliedFromBatch(id);
             let appliedBadge = '';
             if (applied) {
                 const ta = findTranslationTextareaForStringId(id);
-                const drifted = ta && ta.value !== applied.text;
-                const tip = `배치에서 자동 적용됨 (run ${applied.runId || '?'}, ${applied.phase})${drifted ? ' — 이후 수정됨' : ''}`;
-                appliedBadge = ` <span class="tw-review-applied-badge" title="${escapeHtml(tip)}">${drifted ? '🤖→✏️' : '🤖'}</span>`;
+                let state; // 'ok' | 'drifted' | 'unknown'
+                if (ta) {
+                    state = ta.value === applied.text ? 'ok' : 'drifted';
+                } else {
+                    const cur = seg?.active_result?.result;
+                    if (typeof cur === 'string') {
+                        state = cur === applied.text ? 'ok' : 'drifted';
+                    } else {
+                        state = 'unknown';
+                    }
+                }
+                const stateLabel = state === 'drifted' ? ' — 이후 수정됨' : state === 'unknown' ? ' — 현재 값 확인 불가 (DOM에 없음)' : '';
+                const tip = `배치에서 자동 적용됨 (run ${applied.runId || '?'}, ${applied.phase})${stateLabel}`;
+                const icon = state === 'drifted' ? '🤖→✏️' : state === 'unknown' ? '🤖❓' : '🤖';
+                appliedBadge = ` <span class="tw-review-applied-badge" title="${escapeHtml(tip)}">${icon}</span>`;
             }
             return `
 <div class="tw-review-row">
@@ -3902,6 +3939,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         },
     };
 
-    console.log('%c[TMS Workflow v0.6.0] 로드됨. Alt+Z로 모달 오픈 (L1 batch→chat import + L2 review→chat jump + L3 applied tracking)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
+    console.log('%c[TMS Workflow v0.6.1] 로드됨. Alt+Z로 모달 오픈 (P1/P2/P3 수정)', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px');
     console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / .getCurrentStringId() / .getParams()', 'color:#888');
 })();
