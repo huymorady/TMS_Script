@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.10
+// @version      0.7.11
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -34,6 +34,7 @@
         SCHEMA_VERSION: 'tms_workflow_schema_version', // v0.7.7 (#10): LS 스키마 버전 가드 (정수). 향후 마이그레이션 분기점.
         BACKUP_NEXT_SLOT: 'tms_workflow_backup_next_slot', // v0.7.7 (#12): IDB ring 안의 다음 쓸 slot 인덱스 (0..N-1)
         OVERRIDE_WRITE_COUNTER: 'tms_workflow_override_write_counter', // v0.7.7 (#12): override 쓰기 누적 카운터 (threshold마다 backup trigger)
+        ACTIVITY_LOG: 'tms_workflow_activity_log_v1', // v0.7.11: Activity ring (감사 로그). 메모리 + LS 동기화.
     };
 
     // v0.7.7 (#10): 현재 스키마 버전. 신규 LS key/필드를 추가하거나 기존 구조를 변경할 때 +1.
@@ -281,6 +282,58 @@
             }
         };
     } catch {}
+
+    // ========================================================================
+    // v0.7.11: Activity ring (감사 로그)
+    // - 메모리 ring + LS 동기화. 워크스페이스 탭에서 가시화.
+    // - logActivity(category, message, meta) 로 호출. 콘솔 출력은 LOG_RANK 가드.
+    // - getActivityLog() 로 최근 N개 조회 (최신이 0번 인덱스).
+    // - clearActivityLog() 로 비우기.
+    // - 위험 작업 (factory reset, 슬롯 복원, run/override 일괄 정리)은 반드시 logActivity 한 번 남긴다.
+    // ========================================================================
+    const ACTIVITY_RING_CAP = 200;
+    let _activityRing = (() => {
+        try {
+            const raw = localStorage.getItem(LS_KEYS.ACTIVITY_LOG);
+            if (!raw) return [];
+            const arr = JSON.parse(raw);
+            return Array.isArray(arr) ? arr.slice(0, ACTIVITY_RING_CAP) : [];
+        } catch { return []; }
+    })();
+    let _activityPersistTimer = null;
+    function _persistActivityDebounced() {
+        if (_activityPersistTimer) return;
+        _activityPersistTimer = setTimeout(() => {
+            _activityPersistTimer = null;
+            try { localStorage.setItem(LS_KEYS.ACTIVITY_LOG, JSON.stringify(_activityRing)); }
+            catch (e) { try { console.warn(LOG_TAG, 'activity persist 실패', e); } catch {} }
+        }, 250);
+    }
+    function logActivity(category, message, meta) {
+        const entry = {
+            t: Date.now(),
+            cat: String(category || 'misc'),
+            msg: String(message || ''),
+        };
+        if (meta != null) {
+            try { entry.meta = JSON.parse(JSON.stringify(meta)); } catch { entry.meta = String(meta); }
+        }
+        _activityRing.unshift(entry);
+        if (_activityRing.length > ACTIVITY_RING_CAP) _activityRing.length = ACTIVITY_RING_CAP;
+        _persistActivityDebounced();
+        // 콘솔 출력은 LOG_RANK >= info 일 때만 (warn 카테고리는 dwarn 가드 사용)
+        try {
+            if (entry.cat === 'error') derror(`[activity:${entry.cat}]`, entry.msg, entry.meta || '');
+            else if (entry.cat === 'warn') dwarn(`[activity:${entry.cat}]`, entry.msg, entry.meta || '');
+            else dinfo(`[activity:${entry.cat}]`, entry.msg, entry.meta || '');
+        } catch {}
+    }
+    function getActivityLog() { return _activityRing.slice(); }
+    function clearActivityLog() {
+        _activityRing = [];
+        try { localStorage.removeItem(LS_KEYS.ACTIVITY_LOG); } catch {}
+    }
+    try { window.tmsActivity = { get: getActivityLog, clear: clearActivityLog, log: logActivity }; } catch {}
 
     // v0.7.5: 자체 confirm 모달 — 브라우저 confirm()을 대체. Promise<boolean> 반환.
     // \n 줄바꿈 보존 + 모달 톤 일관성 + Esc/Enter 단축키.
@@ -1331,6 +1384,80 @@
             out.prompts = { added, overwrite, same, incoming: data.prompts.length };
         }
         return out;
+    }
+
+    // v0.7.11: run → 그 run으로 만들어진 chat 세션 역방향 조회.
+    // 반환: [{stringId, updated, importedAt, msgCount, lastMsgPreview}], updated 내림차순.
+    function findSessionsForRun(runId) {
+        if (!runId) return [];
+        const sessions = loadSessions();
+        const out = [];
+        for (const [stringId, s] of Object.entries(sessions || {})) {
+            if (!s || s.importedFromRunId !== runId) continue;
+            const msgs = Array.isArray(s.messages) ? s.messages : [];
+            const last = msgs[msgs.length - 1];
+            const preview = last && typeof last.content === 'string'
+                ? last.content.slice(0, 80).replace(/\s+/g, ' ').trim()
+                : '';
+            out.push({
+                stringId,
+                updated: s.updated || 0,
+                importedAt: s.importedAt || null,
+                msgCount: msgs.length,
+                lastMsgPreview: preview,
+            });
+        }
+        out.sort((a, b) => (b.updated || 0) - (a.updated || 0));
+        return out;
+    }
+
+    // v0.7.11: Factory Reset. 모든 LS 워크스페이스 키와 IDB 백업을 비운다.
+    // - 안전망: 호출 직전에 자동 1회 IDB 백업 (caller가 별도 호출). 본 함수는 LS만 정리.
+    // - prompts는 옵션 (기본은 보존: 사용자가 손수 만든 시스템 프롬프트는 잘 보존되어야 함).
+    // - 반환: { clearedKeys: [...], promptsCleared: bool }
+    function factoryResetWorkspace(opts = {}) {
+        const { includePrompts = false } = opts;
+        const clearedKeys = [];
+        const targetKeys = [
+            LS_KEYS.SESSIONS,
+            LS_KEYS.BATCH_RUNS,
+            LS_KEYS.ACTIVE_BATCH_RUN,
+            LS_KEYS.APPLIED_FROM_BATCH,
+            LS_KEYS.REVIEW_OVERRIDES,
+            LS_KEYS.OVERRIDE_WRITE_COUNTER,
+            LS_KEYS.BACKUP_NEXT_SLOT,
+            LS_KEYS.COMPACT_MODE,
+        ];
+        if (includePrompts) {
+            targetKeys.push(LS_KEYS.SYSTEM_PROMPTS);
+            targetKeys.push(LS_KEYS.CHAT_ACTIVE_PROMPT_ID);
+            targetKeys.push(LS_KEYS.BATCH_ACTIVE_PROMPT_ID);
+            targetKeys.push(LS_KEYS.PROMPT_LOCK_LINKED);
+            targetKeys.push(LS_KEYS.ACTIVE_PROMPT_ID);
+        }
+        for (const k of targetKeys) {
+            try {
+                if (localStorage.getItem(k) != null) {
+                    localStorage.removeItem(k);
+                    clearedKeys.push(k);
+                }
+            } catch (e) { try { console.warn(LOG_TAG, 'reset key 실패', k, e); } catch {} }
+        }
+        return { clearedKeys, promptsCleared: !!includePrompts };
+    }
+
+    // v0.7.11: 위험 작업 직전 안전망 백업. triggerBackupAsync('pre-action') wrapper.
+    // - 호출 후 짧게 sleep해서 IDB 쓰기가 시작되도록.
+    async function preActionBackup(actionLabel) {
+        try {
+            if (typeof triggerBackupAsync === 'function') {
+                triggerBackupAsync('pre-action');
+                await new Promise(r => setTimeout(r, 200));
+                logActivity('backup', `pre-action 백업 (${actionLabel || 'unknown'})`);
+                return true;
+            }
+        } catch (e) { try { console.warn(LOG_TAG, 'pre-action backup 실패', e); } catch {} }
+        return false;
     }
 
     // v0.7.8 (#4): BATCH_RUNS GC 시 SESSIONS의 dangling importedFromRunId nullify
@@ -3811,6 +3938,72 @@
 .tw-ws-quota-bar-fill {
     height: 100%; background: linear-gradient(90deg, #4ade80, #facc15 70%, #ef4444);
     transition: width 0.3s;
+}
+/* v0.7.11: Activity ring + Danger Zone */
+.tw-ws-activity-body {
+    max-height: 320px; overflow-y: auto; background: #1a1a1a;
+    border: 1px solid #2a2a2a; border-radius: 6px;
+}
+.tw-ws-activity-row {
+    display: grid; grid-template-columns: 130px 70px 1fr;
+    gap: 8px; padding: 6px 10px; font-size: 12px;
+    border-bottom: 1px solid #262626; align-items: baseline;
+}
+.tw-ws-activity-row:last-child { border-bottom: none; }
+.tw-ws-activity-row .ts { color: #888; font-family: monospace; font-size: 11px; }
+.tw-ws-activity-row .cat {
+    display: inline-block; padding: 1px 6px; font-size: 10px;
+    border-radius: 4px; text-align: center; text-transform: uppercase;
+    background: #2a2a2a; color: #aaa;
+}
+.tw-ws-activity-row .cat.cat-error { background: rgba(239,68,68,0.18); color: #fca5a5; }
+.tw-ws-activity-row .cat.cat-warn { background: rgba(251,191,36,0.18); color: #fbbf24; }
+.tw-ws-activity-row .cat.cat-backup { background: rgba(74,222,128,0.18); color: #4ade80; }
+.tw-ws-activity-row .cat.cat-restore { background: rgba(96,165,250,0.18); color: #60a5fa; }
+.tw-ws-activity-row .cat.cat-prune { background: rgba(196,181,253,0.18); color: #c4b5fd; }
+.tw-ws-activity-row .cat.cat-reset { background: rgba(239,68,68,0.28); color: #fca5a5; font-weight: 700; }
+.tw-ws-activity-row .msg { color: #ddd; word-break: break-word; }
+.tw-ws-activity-row .meta { display: block; color: #777; font-size: 10px; font-family: monospace; margin-top: 2px; }
+.tw-ws-log-controls {
+    display: inline-flex; gap: 4px; align-items: center;
+}
+.tw-ws-log-btn {
+    padding: 2px 8px; font-size: 11px;
+    background: #2a2a2a; color: #888; border: 1px solid #333; border-radius: 4px;
+    cursor: pointer; transition: all 0.15s;
+}
+.tw-ws-log-btn:hover { color: #ddd; border-color: #555; }
+.tw-ws-log-btn.is-active { background: rgba(74,222,128,0.18); color: #4ade80; border-color: rgba(74,222,128,0.5); }
+.tw-ws-danger-section .tw-stat-title { color: #f87171; }
+.tw-ws-danger-buttons {
+    display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 0;
+}
+.tw-btn-danger-zone {
+    background: rgba(239,68,68,0.10); color: #fca5a5; border: 1px solid rgba(239,68,68,0.5);
+}
+.tw-btn-danger-zone:hover { background: rgba(239,68,68,0.20); color: #fee2e2; }
+/* v0.7.11: run 행 → 세션 역방향 점프 버튼 */
+.tw-ws-run-sessions-popover {
+    position: absolute; z-index: 99999; max-width: 420px; min-width: 280px;
+    background: #1a1a1a; border: 1px solid #444; border-radius: 6px;
+    padding: 8px; font-size: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+}
+.tw-ws-run-sessions-popover .head {
+    display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 1px solid #2a2a2a; padding-bottom: 6px; margin-bottom: 6px;
+    color: #4ade80; font-weight: 600;
+}
+.tw-ws-run-sessions-popover .session-row {
+    display: block; padding: 6px 4px; border-radius: 4px; cursor: pointer;
+    color: #ddd; text-decoration: none; border-bottom: 1px solid #232323;
+}
+.tw-ws-run-sessions-popover .session-row:last-child { border-bottom: none; }
+.tw-ws-run-sessions-popover .session-row:hover { background: #262626; }
+.tw-ws-run-sessions-popover .session-row .sid {
+    font-family: monospace; font-size: 11px; color: #60a5fa;
+}
+.tw-ws-run-sessions-popover .session-row .preview {
+    color: #aaa; font-size: 11px; margin-top: 2px;
 }
 
 /* v0.7.6 (#4): 컴팩트 모드 — Phase stepper와 수집/검증 카드 접기 */
@@ -6963,6 +7156,35 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             <div class="tw-stat-hint">💡 프리셋 버튼은 체크박스를 자동으로 맞추기만 하므로 다시 한 번 [📤 선택 항목 백업]을 눌러 다운로드하세요. 복원은 항목별 신규/덮어쓸/동일 카운트를 미리 보여줍니다.</div>
             <input type="file" class="tw-session-import-file" accept=".json,application/json" style="display:none">
         </div>
+        <div class="tw-session-actions tw-ws-activity-section">
+            <div class="tw-ws-section-head">
+                <div class="tw-stat-title">📜 Activity / 감사 로그</div>
+                <div class="tw-ws-section-head-actions">
+                    <span class="tw-ws-log-controls" data-role="log-level-controls">
+                        <span style="color:#777;font-size:11px;margin-right:4px">콘솔:</span>
+                        <button type="button" class="tw-ws-log-btn tw-btn-ws-log-level" data-level="silent">silent</button>
+                        <button type="button" class="tw-ws-log-btn tw-btn-ws-log-level" data-level="error">error</button>
+                        <button type="button" class="tw-ws-log-btn tw-btn-ws-log-level" data-level="warn">warn</button>
+                        <button type="button" class="tw-ws-log-btn tw-btn-ws-log-level" data-level="info">info</button>
+                        <button type="button" class="tw-ws-log-btn tw-btn-ws-log-level" data-level="verbose">verbose</button>
+                    </span>
+                    <button class="tw-btn tw-btn-ghost tw-btn-ws-activity-refresh" title="갱신">🔄</button>
+                    <button class="tw-btn tw-btn-ghost tw-btn-ws-activity-clear" title="감사 로그 비우기">🗑 비우기</button>
+                </div>
+            </div>
+            <div class="tw-ws-activity-body"></div>
+            <div class="tw-stat-hint">💡 최근 ${ACTIVITY_RING_CAP}건의 워크스페이스 변경 이력 (백업·복원·정리·초기화). 콘솔 로그 레벨은 즉시 적용됩니다.</div>
+        </div>
+        <div class="tw-session-actions tw-ws-danger-section">
+            <div class="tw-ws-section-head">
+                <div class="tw-stat-title">🚨 위험 영역</div>
+            </div>
+            <div class="tw-ws-danger-buttons">
+                <button class="tw-btn tw-btn-danger-zone tw-btn-ws-danger-reset" title="LS의 워크스페이스 키 전체 초기화 (사전 백업 자동)">🚨 워크스페이스 초기화</button>
+                <button class="tw-btn tw-btn-danger-zone tw-btn-ws-danger-reset-full" title="시스템 프롬프트까지 포함해서 전체 초기화 (사전 백업 자동)">🚨 전체 초기화 (프롬프트 포함)</button>
+            </div>
+            <div class="tw-stat-hint">💡 초기화 직전에 IDB 슬롯에 자동 백업이 1회 저장됩니다. 백업 슬롯 카드의 [♻ 복원] 으로 되돌릴 수 있습니다.</div>
+        </div>
         <div class="tw-session-info">
             <div class="tw-stat-title">ℹ️ 자동 정리 정책</div>
             <div class="tw-session-info-body">
@@ -7169,6 +7391,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 const status = escapeHtml(String(r.status || '?'));
                 const segCount = Array.isArray(r.segments) ? r.segments.length : (r.phase45?.parsed?.length || r.phase3?.parsed?.length || 0);
                 const ovCount = overrides[id] ? Object.keys(overrides[id]).length : 0;
+                const sessCount = (() => { try { return findSessionsForRun(id).length; } catch { return 0; } })();
                 const sizeKb = (() => {
                     try { return (new Blob([JSON.stringify(r)]).size / 1024).toFixed(1); } catch { return '?'; }
                 })();
@@ -7184,6 +7407,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     <td>
                         <div class="tw-ws-actions">
                             ${isActive ? '<button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-run-activate is-active" data-run-id="' + escapeHtml(id) + '" disabled title="이미 활성 run">✓ 활성</button>' : '<button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-run-activate" data-run-id="' + escapeHtml(id) + '">🔁 활성</button>'}
+                            <button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-run-sessions" data-run-id="${escapeHtml(id)}" data-session-count="${sessCount}" title="이 run으로 만든 채팅 세션 보기" ${sessCount === 0 ? 'disabled' : ''}>💬 ${sessCount}</button>
                             <button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-run-export" data-run-id="${escapeHtml(id)}" title="이 run 1개만 export">📤</button>
                             <button type="button" class="tw-btn tw-btn-danger tw-btn-ws-run-delete" data-run-id="${escapeHtml(id)}">🗑</button>
                         </div>
@@ -7317,6 +7541,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     });
                     if (!ok) return;
                     const r = pruneOldRuns({ keepRecent: 10, maxAgeDays: 30, dryRun: false });
+                    logActivity('prune', `오래된 run 정리`, { runs: r.removed, overrideRuns: r.removedOverrideRuns, nullifiedSessions: r.nullifiedSessions });
                     toast(`정리 완료: run ${r.removed} / override run ${r.removedOverrideRuns} / 세션 nullify ${r.nullifiedSessions}`, 'success');
                     refreshWorkspaceUi();
                     return;
@@ -7326,6 +7551,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     const rid = act.getAttribute('data-run-id');
                     setActiveBatchRunId(rid);
                     syncBatchRunFromLs();
+                    logActivity('config', `활성 run 변경`, { runId: rid });
                     toast(`run ${rid} 활성화`, 'success');
                     refreshRunsTable();
                     return;
@@ -7350,6 +7576,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 if (del) {
                     const rid = del.getAttribute('data-run-id');
                     await onDeleteRun(rid);
+                    logActivity('prune', `run 삭제`, { runId: rid });
                     refreshWorkspaceUi();
                     return;
                 }
@@ -7374,6 +7601,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     });
                     if (!ok) return;
                     const r = pruneOrphanOverrides();
+                    logActivity('prune', `고아 override 정리`, { runs: r.removedRuns, entries: r.removedEntries });
                     toast(`정리 완료: run ${r.removedRuns}개 / override ${r.removedEntries}개`, 'success');
                     refreshOverridesTable();
                     refreshSessionStats();
@@ -7389,6 +7617,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     });
                     if (!ok) return;
                     const n = clearOverridesForRun(rid);
+                    logActivity('prune', `override 비우기`, { runId: rid, count: n });
                     toast(`override ${n}개 삭제됨`, 'success');
                     refreshOverridesTable();
                     refreshSessionStats();
@@ -7439,12 +7668,176 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                         triggerBackupAsync('pre-restore'); // 안전망
                         await new Promise(r => setTimeout(r, 200));
                         const r = await restoreFromBackupSlot(slot, 'overwrite');
+                        logActivity('restore', `IDB 슬롯 복원`, { slot, sessions: r.sessions, runs: r.runs, overrides: r.overrides });
                         toast(`복원 완료: 세션 ${r.sessions} / run ${r.runs} / override ${r.overrides}`, 'success');
                         refreshWorkspaceUi();
                         // 활성 run 메모리 동기화
                         try { syncBatchRunFromLs(); renderBatchRun(); } catch {}
                     } catch (err) { toast(`복원 실패: ${err.message}`, 'error'); }
                     return;
+                }
+            });
+        }
+
+        // v0.7.11: Activity / 감사 로그 섹션 + 콘솔 로그 레벨 토글
+        const activitySection = $('.tw-ws-activity-section', overlay);
+        function refreshLogLevelButtons() {
+            if (!activitySection) return;
+            const cur = (() => {
+                try {
+                    const stored = localStorage.getItem('tms_workflow_log_level');
+                    return (stored && LOG_LEVEL_RANK[stored] != null) ? stored : 'warn';
+                } catch { return 'warn'; }
+            })();
+            activitySection.querySelectorAll('.tw-btn-ws-log-level').forEach(b => {
+                b.classList.toggle('is-active', b.getAttribute('data-level') === cur);
+            });
+        }
+        function refreshActivityTable() {
+            const body = activitySection && $('.tw-ws-activity-body', activitySection);
+            if (!body) return;
+            const log = getActivityLog();
+            if (!log.length) {
+                body.innerHTML = `<div class="tw-ws-empty">감사 로그가 비어 있습니다.</div>`;
+                return;
+            }
+            body.innerHTML = log.map(e => {
+                const ts = new Date(e.t || 0);
+                const tstr = isFinite(ts.getTime()) ? `${String(ts.getMonth()+1).padStart(2,'0')}-${String(ts.getDate()).padStart(2,'0')} ${String(ts.getHours()).padStart(2,'0')}:${String(ts.getMinutes()).padStart(2,'0')}:${String(ts.getSeconds()).padStart(2,'0')}` : '?';
+                const cat = String(e.cat || 'misc');
+                const meta = e.meta != null ? (typeof e.meta === 'string' ? e.meta : (() => { try { return JSON.stringify(e.meta); } catch { return ''; } })()) : '';
+                return `<div class="tw-ws-activity-row">
+                    <span class="ts">${escapeHtml(tstr)}</span>
+                    <span class="cat cat-${escapeHtml(cat)}">${escapeHtml(cat)}</span>
+                    <span class="msg">${escapeHtml(String(e.msg || ''))}${meta ? `<span class="meta">${escapeHtml(meta)}</span>` : ''}</span>
+                </div>`;
+            }).join('');
+        }
+        if (activitySection) {
+            activitySection.addEventListener('click', async (e) => {
+                const lv = e.target.closest('.tw-btn-ws-log-level');
+                if (lv) {
+                    const level = lv.getAttribute('data-level');
+                    if (level && LOG_LEVEL_RANK[level] != null) {
+                        try { localStorage.setItem('tms_workflow_log_level', level); } catch {}
+                        LOG_RANK = LOG_LEVEL_RANK[level];
+                        refreshLogLevelButtons();
+                        toast(`콘솔 로그 레벨 → ${level}`, 'info');
+                        logActivity('config', `로그 레벨 변경 → ${level}`);
+                        refreshActivityTable();
+                    }
+                    return;
+                }
+                if (e.target.closest('.tw-btn-ws-activity-refresh')) { refreshActivityTable(); return; }
+                if (e.target.closest('.tw-btn-ws-activity-clear')) {
+                    const ok = await twConfirm({
+                        title: '감사 로그 비우기',
+                        message: `메모리·LS 의 activity 로그를 모두 지웁니다.\n\n계속하시겠습니까?`,
+                        danger: true,
+                    });
+                    if (!ok) return;
+                    clearActivityLog();
+                    refreshActivityTable();
+                    toast('감사 로그를 비웠습니다.', 'success');
+                    return;
+                }
+            });
+        }
+
+        // v0.7.11: Run 행 → 채팅 세션 역방향 점프 popover
+        function closeRunSessionsPopover() {
+            const ex = document.querySelector('.tw-ws-run-sessions-popover');
+            if (ex) ex.remove();
+        }
+        function openRunSessionsPopover(anchor, runId) {
+            closeRunSessionsPopover();
+            const sessions = findSessionsForRun(runId);
+            const pop = document.createElement('div');
+            pop.className = 'tw-ws-run-sessions-popover';
+            const headHtml = `<div class="head"><span>💬 run ${escapeHtml(runId)} → 세션 (${sessions.length})</span><button type="button" class="tw-btn tw-btn-ghost tw-ws-run-sessions-close" style="font-size:11px;padding:2px 8px">닫기</button></div>`;
+            const rowsHtml = sessions.length
+                ? sessions.map(s => {
+                    const ts = s.updated ? new Date(s.updated).toISOString().slice(0,16).replace('T',' ') : '';
+                    return `<a href="#" class="session-row" data-session-id="${escapeHtml(s.stringId)}">
+                        <div><span class="sid">${escapeHtml(s.stringId)}</span> <span style="color:#888;font-size:11px">· ${s.msgCount}msg · ${escapeHtml(ts)}</span></div>
+                        ${s.lastMsgPreview ? `<div class="preview">${escapeHtml(s.lastMsgPreview)}</div>` : ''}
+                    </a>`;
+                }).join('')
+                : `<div class="tw-ws-empty">관련 세션이 없습니다.</div>`;
+            pop.innerHTML = headHtml + rowsHtml;
+            const rect = anchor.getBoundingClientRect();
+            pop.style.top = `${Math.round(rect.bottom + window.scrollY + 4)}px`;
+            pop.style.left = `${Math.round(rect.left + window.scrollX)}px`;
+            document.body.appendChild(pop);
+            pop.addEventListener('click', (ev) => {
+                if (ev.target.closest('.tw-ws-run-sessions-close')) { closeRunSessionsPopover(); return; }
+                const row = ev.target.closest('.session-row');
+                if (row) {
+                    ev.preventDefault();
+                    const sid = row.getAttribute('data-session-id');
+                    closeRunSessionsPopover();
+                    try {
+                        // 모달 닫기 (워크스페이스 탭 → 채팅 패널 보이게)
+                        const closeBtn = $('.tw-settings-close', overlay);
+                        if (closeBtn) closeBtn.click();
+                        if (typeof setMainTab === 'function') setMainTab('chat');
+                        try { currentStringId = sid; } catch {}
+                        try { if (typeof loadSegmentInfo === 'function') loadSegmentInfo(sid); } catch (e) { dwarn('loadSegmentInfo 실패', e); }
+                        try { if (typeof renderChatHistory === 'function') renderChatHistory(); } catch (e) { dwarn('renderChatHistory 실패', e); }
+                        logActivity('config', `\uc138\uc158 \uc810\ud504`, { runId, sessionId: sid });
+                    } catch (err) { dwarn('\uc138\uc158 \uc810\ud504 \uc2e4\ud328', err); }
+                }
+            });
+            // 외부 클릭으로 닫기
+            setTimeout(() => {
+                document.addEventListener('click', function offClick(ev) {
+                    if (!pop.contains(ev.target) && !ev.target.closest('.tw-btn-ws-run-sessions')) {
+                        closeRunSessionsPopover();
+                        document.removeEventListener('click', offClick, true);
+                    }
+                }, true);
+            }, 0);
+        }
+        // runs 섹션에 sessions 버튼 클릭 위임 (capture)
+        const _runsForSessions = $('.tw-ws-runs-section', overlay);
+        if (_runsForSessions) {
+            _runsForSessions.addEventListener('click', (e) => {
+                const btn = e.target.closest('.tw-btn-ws-run-sessions');
+                if (!btn || btn.disabled) return;
+                e.stopPropagation();
+                const rid = btn.getAttribute('data-run-id');
+                openRunSessionsPopover(btn, rid);
+            });
+        }
+
+        // v0.7.11: 위험 영역 (Factory Reset)
+        const dangerSection = $('.tw-ws-danger-section', overlay);
+        if (dangerSection) {
+            dangerSection.addEventListener('click', async (e) => {
+                const isFull = !!e.target.closest('.tw-btn-ws-danger-reset-full');
+                const isWs = !isFull && !!e.target.closest('.tw-btn-ws-danger-reset');
+                if (!isFull && !isWs) return;
+                const label = isFull ? '전체 초기화 (프롬프트 포함)' : '워크스페이스 초기화';
+                const ok = await twConfirm({
+                    title: `🚨 ${label}`,
+                    message: `워크스페이스 LS 키${isFull ? ' + 시스템 프롬프트' : ''} 를 모두 삭제합니다.\n\n` +
+                        `직전에 IDB 슬롯에 자동 1회 백업되며, 이후 IDB 슬롯의 [♻ 복원] 으로 되돌릴 수 있습니다.\n\n` +
+                        `정말 진행하시겠습니까?`,
+                    danger: true,
+                });
+                if (!ok) return;
+                try {
+                    await preActionBackup(label);
+                    const r = factoryResetWorkspace({ includePrompts: isFull });
+                    logActivity('reset', `${label} 완료`, { keys: r.clearedKeys.length, includePrompts: r.promptsCleared });
+                    toast(`초기화 완료: ${r.clearedKeys.length} 개 LS 키 삭제`, 'success');
+                    refreshWorkspaceUi();
+                    // 메모리 동기화
+                    try { syncBatchRunFromLs(); } catch {}
+                    try { if (typeof renderBatchRun === 'function') renderBatchRun(); } catch {}
+                } catch (err) {
+                    logActivity('error', `${label} 실패`, { msg: String(err && err.message || err) });
+                    toast(`초기화 실패: ${err.message || err}`, 'error');
                 }
             });
         }
@@ -7501,7 +7894,11 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         refreshWorkspaceUi = function patchedRefreshWorkspaceUi() {
             try { _origRefreshWs(); } catch (e) { dwarn('ws refresh 실패', e); }
             try { refreshExportMatrixCounts(); } catch {}
+            try { refreshActivityTable(); } catch (e) { dwarn('activity refresh 실패', e); }
+            try { refreshLogLevelButtons(); } catch (e) { dwarn('log btn refresh 실패', e); }
         };
+        // 초기 1회 강제 호출 (워크스페이스 탭 처음 들어오면 자동 호출되지만, activity 초기 표시를 보장)
+        try { refreshActivityTable(); refreshLogLevelButtons(); } catch {}
 
         $('.tw-btn-export-selected', overlay).addEventListener('click', () => {
             const m = getExportMatrix();
