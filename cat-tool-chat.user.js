@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.13
+// @version      0.7.14
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -17,7 +17,7 @@
     // 상수 & 설정
     // ========================================================================
     // v0.7.12: @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.13';
+    const SCRIPT_VERSION = '0.7.14';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -7116,7 +7116,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             </div>
         </div>
     </div>
-    <div class="tw-settings-content tw-settings-tab-sessions" style="display:none; flex-direction:column; gap:16px;">
+    <div class="tw-settings-content tw-settings-tab-sessions" style="display:none; flex-direction:column; gap:16px; overflow-y:auto; min-height:0; padding-right:6px;">
         <div class="tw-session-stats">
             <div class="tw-stat-title">📊 저장 현황</div>
             <div class="tw-stat-body"></div>
