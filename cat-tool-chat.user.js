@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.11
+// @version      0.7.12
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -3893,13 +3893,25 @@
 .tw-ws-table tr.tw-ws-row-active td { background: rgba(74,222,128,0.08); }
 .tw-ws-table tr.tw-ws-row-active td:first-child { border-left: 2px solid #4ade80; }
 .tw-ws-table tr.tw-ws-row-orphan td { color: #fbbf24; }
-.tw-ws-table .tw-ws-actions { display: flex; gap: 4px; flex-wrap: wrap; }
+.tw-ws-table .tw-ws-actions {
+    display: flex; gap: 4px; flex-wrap: nowrap; align-items: center;
+    justify-content: flex-start;
+}
 .tw-ws-table .tw-ws-actions .tw-btn {
     padding: 2px 6px; font-size: 11px; min-width: 0;
+    white-space: nowrap; flex: 0 0 auto;
 }
+/* v0.7.11 (#1): action 컬럼 정렬 — 활성/세션 버튼은 고정폭으로 자리 유지 */
+.tw-ws-table .tw-btn-ws-run-activate { min-width: 56px; text-align: center; }
+.tw-ws-table .tw-btn-ws-run-sessions { min-width: 44px; text-align: center; }
+.tw-ws-table .tw-btn-ws-run-export,
+.tw-ws-table .tw-btn-ws-run-delete { min-width: 28px; text-align: center; }
 .tw-ws-table .tw-btn-ws-run-activate.is-active {
     background: rgba(74,222,128,0.15); border-color: rgba(74,222,128,0.5); color: #4ade80;
     cursor: default; opacity: 1;
+}
+.tw-ws-table .tw-btn-ws-run-sessions[disabled] {
+    opacity: 0.35; cursor: default;
 }
 /* v0.7.10: export 체크박스 매트릭스 + import diff */
 .tw-ws-export-matrix {
@@ -3940,9 +3952,22 @@
     transition: width 0.3s;
 }
 /* v0.7.11: Activity ring + Danger Zone */
+.tw-ws-activity-section {
+    border-left: 3px solid #60a5fa; padding-left: 10px;
+    background: rgba(96,165,250,0.04);
+}
+.tw-ws-activity-section .tw-stat-title { color: #60a5fa; }
+.tw-ws-danger-section {
+    border-left: 3px solid #ef4444; padding-left: 10px;
+    background: rgba(239,68,68,0.04);
+}
 .tw-ws-activity-body {
     max-height: 320px; overflow-y: auto; background: #1a1a1a;
     border: 1px solid #2a2a2a; border-radius: 6px;
+}
+.tw-ws-activity-body:empty::after {
+    content: '감사 로그가 비어 있습니다.';
+    display: block; padding: 12px; color: #666; font-size: 12px; text-align: center;
 }
 .tw-ws-activity-row {
     display: grid; grid-template-columns: 130px 70px 1fr;
