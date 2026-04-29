@@ -2423,17 +2423,21 @@
 .tw-tab-content { flex: 1; overflow: hidden; display: none; }
 .tw-tab-content.active { display: flex; }
 .tw-context-panel {
-    width: 280px; flex-shrink: 0; padding: 12px;
+    width: 320px; flex-shrink: 0; padding: 12px;
     border-right: 1px solid #3a3a3a; overflow-y: auto;
     background: #252525;
+    display: flex; flex-direction: column; gap: 10px;
 }
-.tw-panel-title { font-weight: 600; color: #4ade80; margin-bottom: 10px; font-size: 12px; }
-.tw-context-content { font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.tw-panel-title { font-weight: 600; color: #4ade80; margin: 0 0 4px; font-size: 12px;
+    padding-bottom: 6px; border-bottom: 1px solid #333; }
+.tw-context-content { font-size: 12px; line-height: 1.55; word-break: break-word; }
 .tw-muted { color: #888; }
-.tw-context-section { margin-bottom: 12px; }
-.tw-context-label { color: #4ade80; font-size: 11px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
-.tw-context-value { background: #1a1a1a; padding: 6px 8px; border-radius: 4px; color: #ddd; }
+.tw-context-section { margin: 0 0 10px; display: flex; flex-direction: column; gap: 4px; }
+.tw-context-section:last-child { margin-bottom: 0; }
+.tw-context-label { color: #4ade80; font-size: 10px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.5px; margin: 0; }
+.tw-context-value { background: #1a1a1a; padding: 6px 8px; border-radius: 4px; color: #ddd;
+    white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
 .tw-chat-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .tw-chat-messages { flex: 1; overflow-y: auto; padding: 14px; }
 .tw-msg { margin-bottom: 14px; max-width: 90%; word-wrap: break-word; }
@@ -2769,7 +2773,7 @@
 .tw-compare-status-changed { background: var(--tw-edit-soft); color: var(--tw-edit); border: 1px solid rgba(251, 191, 36, 0.4); }
 .tw-compare-status-only { background: rgba(52, 152, 219, 0.18); color: #93c5fd; border: 1px solid rgba(52, 152, 219, 0.4); }
 @container (max-width: 760px) {
-    .tw-context-panel { width: 220px; }
+    .tw-context-panel { width: 260px; }
     .tw-batch-panel { flex-direction: column; }
     .tw-batch-sidebar {
         width: 100%; max-height: 240px; border-right: none; border-bottom: 1px solid #3a3a3a;
