@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.16
+// @version      0.7.17
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.16)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.17)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.16';
+    const SCRIPT_VERSION = '0.7.17';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -691,6 +691,20 @@
         return out;
     }
 
+    // v0.7.17 (#1): 토큰 카운트 기반 extra 검사. dst 카운트 > src 카운트인 토큰만 반환.
+    // 원문에 없던 `{0}`가 번역에 끼어들거나, `%s`가 1→2로 늘어난 경우를 잡는다.
+    // 반환 형식: [{ token, expected, actual }] (expected < actual)
+    function diffPlaceholderExtras(srcText, dstText) {
+        const src = countPlaceholders(srcText);
+        const dst = countPlaceholders(dstText);
+        const out = [];
+        for (const [token, m] of dst) {
+            const n = src.get(token) || 0;
+            if (m > n) out.push({ token, expected: n, actual: m });
+        }
+        return out;
+    }
+
     function stripCodeFence(text) {
         // 모든 ```json/``` 펜스를 제거. LLM이 두 개 블록을 붙이거나 닫는 펜스를
         // 빠뜨려도 안전하게 본문을 노출시키기 위해 글로벌 치환을 사용.
@@ -940,15 +954,25 @@
             .map(item => normalizeId(item.id));
 
         const missingPlaceholders = [];
+        const extraPlaceholders = [];
         for (const item of translations) {
-            const src = sourceById.get(normalizeId(item.id))?.origin_string || '';
+            const id = normalizeId(item.id);
+            const src = sourceById.get(id)?.origin_string || '';
             const translated = typeof item.t === 'string' ? item.t : '';
             // v0.7.16 (#1): 토큰 카운트 비교로 중복 누락(`%s %s` → `%s`)도 잡는다.
             const diff = diffPlaceholderCounts(src, translated);
             if (diff.length) {
                 missingPlaceholders.push({
-                    id: normalizeId(item.id),
+                    id,
                     missing: diff.map(d => d.expected > 1 ? `${d.token}(×${d.actual}/${d.expected})` : d.token),
+                });
+            }
+            // v0.7.17 (#1): src에 없거나 더 적은 토큰이 dst에 추가된 경우도 게이트로 잡는다.
+            const extras = diffPlaceholderExtras(src, translated);
+            if (extras.length) {
+                extraPlaceholders.push({
+                    id,
+                    extra: extras.map(d => d.expected > 0 ? `${d.token}(×${d.actual}/${d.expected})` : `${d.token}(×${d.actual})`),
                 });
             }
         }
@@ -967,12 +991,14 @@
                 invalidTranslationType.length === 0 &&
                 emptyTranslations.length === 0 &&
                 missingPlaceholders.length === 0 &&
+                extraPlaceholders.length === 0 &&
                 hanjaLike.length === 0,
             coverage,
             wrongGroups,
             invalidTranslationType,
             emptyTranslations,
             missingPlaceholders,
+            extraPlaceholders,
             hanjaLike,
             warnings,
         };
@@ -1029,6 +1055,7 @@
 
         const sourceById = new Map(segmentSource.map(seg => [normalizeId(seg.id), seg]));
         const missingPlaceholders = [];
+        const extraPlaceholders = [];
         for (const item of revisions) {
             const id = normalizeId(item.id);
             const src = sourceById.get(id)?.origin_string || '';
@@ -1039,6 +1066,14 @@
                 missingPlaceholders.push({
                     id,
                     missing: diff.map(d => d.expected > 1 ? `${d.token}(×${d.actual}/${d.expected})` : d.token),
+                });
+            }
+            // v0.7.17 (#1): final 텍스트에 src보다 많은(또는 src에 없던) 토큰이 끼어든 경우도 게이트.
+            const extras = diffPlaceholderExtras(src, finalText);
+            if (extras.length) {
+                extraPlaceholders.push({
+                    id,
+                    extra: extras.map(d => d.expected > 0 ? `${d.token}(×${d.actual}/${d.expected})` : `${d.token}(×${d.actual})`),
                 });
             }
         }
@@ -1063,6 +1098,7 @@
                 invalidReasons.length === 0 &&
                 emptyFinals.length === 0 &&
                 missingPlaceholders.length === 0 &&
+                extraPlaceholders.length === 0 &&
                 hanjaLike.length === 0,
             coverage,
             wrongGroups,
@@ -1071,6 +1107,7 @@
             invalidReasons,
             emptyFinals,
             missingPlaceholders,
+            extraPlaceholders,
             hanjaLike,
             changedCount,
             warnings,
@@ -4962,7 +4999,7 @@
             }
         } catch (_) { /* URL parse 실패 — 배지 생략 */ }
         el.innerHTML = `
-            <span class="tw-batch-run-id" title="runId: ${escapeHtml(String(run.runId || ''))}${run.label ? `\n라벨: ${run.label}` : ''}">🏃 ${escapeHtml(run.label || runIdShort)}</span>
+            <span class="tw-batch-run-id" title="runId: ${escapeHtml(String(run.runId || ''))}${run.label ? `\n라벨: ${escapeHtml(String(run.label))}` : ''}">🏃 ${escapeHtml(run.label || runIdShort)}</span>
             <span class="tw-batch-run-meta">project <b>${escapeHtml(String(run.projectId || '?'))}</b> / file <b>${escapeHtml(String(run.fileId || '?'))}</b> / lang <b>${escapeHtml(String(run.languageId || '?'))}</b></span>
             <span class="tw-batch-run-meta">override <b>${overrides}</b></span>
             ${pageBadge}
@@ -6960,10 +6997,15 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             const history = session.messages.slice(0, -1);
             const prefixPrompt = buildPrefixPrompt(systemPrompt, segmentCtx, history, userMessage, session.system || null);
 
-            // 콘솔에 최종 프롬프트 출력 (디버그)
-            console.groupCollapsed('[TMS Workflow] prefix_prompt 전송');
-            console.log(prefixPrompt);
-            console.groupEnd();
+            // v0.7.17 (#3): 운영 중 원문/대화/프롬프트가 콘솔에 그대로 남는 걸 막는다.
+            //   verbose 레벨일 때만 전체 본문 출력, 그 외에는 길이/마스킹 요약만.
+            if (LOG_RANK >= 4) {
+                console.groupCollapsed('[TMS Workflow] prefix_prompt 전송');
+                console.log(prefixPrompt);
+                console.groupEnd();
+            } else {
+                dinfo('prefix_prompt 전송', maskSensitive(prefixPrompt));
+            }
 
             // API 호출
             const { projectId } = getUrlParams();
