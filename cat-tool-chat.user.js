@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.2
+// @version      0.7.3
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -2667,6 +2667,34 @@
 .tw-summary-card.tw-summary-fail .tw-summary-value { color: var(--tw-danger); }
 .tw-summary-card.tw-summary-info .tw-summary-value { color: var(--tw-info); }
 .tw-review-summary { flex-shrink: 0; }
+/* v0.7.3: 결과 검토 요약을 칩으로 시각화 */
+.tw-review-summary.tw-review-summary-chips {
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    padding: 4px 0; font-size: 12px;
+}
+.tw-summary-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--tw-border); background: var(--tw-bg-2);
+    color: var(--tw-fg); white-space: nowrap; line-height: 1.3;
+}
+.tw-summary-chip b { font-weight: 600; }
+.tw-summary-chip .tw-summary-chip-label { color: var(--tw-muted); font-size: 11px; }
+.tw-summary-chip-info { background: rgba(52, 152, 219, 0.10); border-color: rgba(52, 152, 219, 0.35); }
+.tw-summary-chip-info b { color: var(--tw-info); }
+.tw-summary-chip-edit { background: var(--tw-edit-soft); border-color: rgba(251, 191, 36, 0.4); }
+.tw-summary-chip-edit b { color: var(--tw-edit); }
+.tw-summary-chip-ok { background: rgba(39, 174, 96, 0.10); border-color: rgba(39, 174, 96, 0.4); }
+.tw-summary-chip-ok b { color: var(--tw-success); }
+.tw-summary-chip-warn { background: rgba(250, 204, 21, 0.08); border-color: rgba(250, 204, 21, 0.45); }
+.tw-summary-chip-warn b { color: var(--tw-warn); }
+.tw-summary-chip-fail { background: rgba(231, 76, 60, 0.10); border-color: rgba(231, 76, 60, 0.4); }
+.tw-summary-chip-fail b { color: var(--tw-danger); }
+.tw-summary-chip-muted { background: transparent; border-color: var(--tw-border); }
+.tw-summary-chip-muted b { color: var(--tw-muted); }
+.tw-summary-chip-filter { background: rgba(74, 222, 128, 0.10); border-color: rgba(74, 222, 128, 0.4); cursor: pointer; }
+.tw-summary-chip-filter b { color: var(--tw-success); }
+.tw-summary-divider { width: 1px; height: 14px; background: var(--tw-border); margin: 0 2px; }
 .tw-review-toolbar {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
     padding: 10px; border: 1px solid #333; border-radius: 8px;
@@ -2823,7 +2851,7 @@
     background: var(--tw-bg-2); max-height: 280px; overflow: auto;
 }
 .tw-history-row {
-    display: grid; grid-template-columns: 130px 1fr 110px 50px 200px;
+    display: grid; grid-template-columns: 130px minmax(180px, 1.2fr) 110px 50px minmax(280px, 2fr);
     gap: 8px; padding: 5px 8px; align-items: center; font-size: 12px;
     border-bottom: 1px solid var(--tw-border);
 }
@@ -2838,8 +2866,8 @@
 .tw-history-row .tw-history-runid { font-size: 10px; color: var(--tw-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tw-history-row .tw-history-badge { display: inline-block; padding: 1px 5px; margin-left: 4px; font-size: 10px; border-radius: 3px; background: rgba(74, 222, 128, 0.18); color: var(--tw-success); }
 .tw-history-row .tw-history-badge.tw-history-badge-compare { background: rgba(52, 152, 219, 0.18); color: var(--tw-info); }
-.tw-history-actions { display: flex; gap: 4px; flex-wrap: wrap; }
-.tw-history-actions .tw-btn { padding: 2px 7px; font-size: 11px; }
+.tw-history-actions { display: flex; gap: 4px; flex-wrap: nowrap; justify-content: flex-end; }
+.tw-history-actions .tw-btn { padding: 2px 7px; font-size: 11px; white-space: nowrap; }
 .tw-history-empty { padding: 12px; text-align: center; color: var(--tw-muted, #888); font-size: 12px; }
 @container (max-width: 760px) {
     .tw-context-panel { width: 260px; }
@@ -3994,6 +4022,7 @@
         const runs = lsGet(LS_KEYS.BATCH_RUNS, {}) || {};
         const prior = runs[reviewView.compareRunId];
         if (!prior) {
+            summaryEl.classList.remove('tw-review-summary-chips');
             summaryEl.textContent = '비교 대상 run을 찾을 수 없습니다 (삭제되었을 수 있음).';
             tableEl.innerHTML = '';
             return;
@@ -4005,6 +4034,7 @@
         const overrideTag = reviewView.compareIncludeOverrides
             ? ` · ✏️ override 반영 (현재 ${rows.filter(r => r.currentOverride).length} / 직전 ${rows.filter(r => r.priorOverride).length})`
             : '';
+        summaryEl.classList.remove('tw-review-summary-chips');
         summaryEl.textContent = `비교: 현재 run ${currentRun.runId} ↔ 직전 run ${prior.runId} · 총 ${rows.length}개 · 최종 변경 ${changed}개 · 현재만 ${onlyCurrent}개 · 직전만 ${onlyPrior}개${overrideTag}`;
         const head = `<div class="tw-compare-row tw-compare-head">
             <div class="tw-compare-cell">ID</div>
@@ -4637,11 +4667,13 @@
         refreshFailedChips();
 
         if (!run?.phase3?.parsed) {
+            summaryEl.classList.remove('tw-review-summary-chips');
             summaryEl.textContent = '아직 Phase 3 결과가 없습니다.';
             tableEl.innerHTML = '';
             return;
         }
         if (!run.phase3.validation?.ok) {
+            summaryEl.classList.remove('tw-review-summary-chips');
             summaryEl.textContent = 'Phase 3 검증이 실패해 결과 검토를 표시하지 않습니다. JSON/로그 탭에서 세부 오류를 확인하세요.';
             tableEl.innerHTML = '';
             return;
@@ -4773,17 +4805,41 @@
 
         const totalCount = descriptors.length;
         const shownCount = filtered.length;
-        const filterTag = reviewView.filter !== 'all' ? ` · 필터(${reviewView.filter}) ${shownCount}/${totalCount}` : '';
-        // v0.6.6 (B3): warn 요약
+        // v0.7.3: 요약을 챕으로 시각화 (색상별 등급: ok/edit/warn/info/fail/muted)
+        const chips = [];
+        chips.push(`<span class="tw-summary-chip tw-summary-chip-info" title="Phase 3 번역 총 개수"><span class="tw-summary-chip-label">번역</span> <b>${translations.length}</b></span>`);
+        if (usePhase45) {
+            const phase45Cls = changedCount > 0 ? 'tw-summary-chip-edit' : 'tw-summary-chip-ok';
+            chips.push(`<span class="tw-summary-chip ${phase45Cls}" title="Phase 4+5 검수에서 수정된 개수"><span class="tw-summary-chip-label">Phase 4+5</span> <b>수정 ${changedCount}</b></span>`);
+        } else {
+            chips.push(`<span class="tw-summary-chip tw-summary-chip-muted" title="Phase 4+5 미적용 또는 검증 실패"><span class="tw-summary-chip-label">Phase 4+5</span> <b>—</b></span>`);
+        }
+        if (appliedCount) {
+            const appliedCls = driftedCount > 0 ? 'tw-summary-chip-warn' : 'tw-summary-chip-ok';
+            const driftSuffix = driftedCount > 0 ? ` <span class="tw-summary-chip-label">· 수정 ${driftedCount}</span>` : '';
+            const unknownSuffix = unknownCount > 0 ? ` <span class="tw-summary-chip-label">· 확인불가 ${unknownCount}</span>` : '';
+            chips.push(`<span class="tw-summary-chip ${appliedCls}" title="자동 적용된 항목 수 (drift는 이후 사용자 수정 수)"><span class="tw-summary-chip-label">자동 적용</span> <b>${appliedCount}</b>${driftSuffix}${unknownSuffix}</span>`);
+        } else {
+            chips.push(`<span class="tw-summary-chip tw-summary-chip-muted" title="이 run에서 자동 적용된 항목 없음"><span class="tw-summary-chip-label">자동 적용</span> <b>0</b></span>`);
+        }
         const warnTotals = {
             charLimit: warnCharLimitIds.size,
             order: warnOrderIds.size,
             tb: warnTbIds.size,
         };
-        const warnTag = (warnTotals.charLimit + warnTotals.order + warnTotals.tb) > 0
-            ? ` · ⚠ 길이 ${warnTotals.charLimit} / 순서 ${warnTotals.order} / 용어 ${warnTotals.tb}`
-            : '';
-        summaryEl.textContent = `번역 ${translations.length}개 · Phase 4+5 ${usePhase45 ? `수정 ${changedCount}개` : '미적용 또는 검증 실패'} · ${appliedSummary}${warnTag}${filterTag}`;
+        const warnSum = warnTotals.charLimit + warnTotals.order + warnTotals.tb;
+        if (warnSum > 0) {
+            chips.push('<span class="tw-summary-divider"></span>');
+            if (warnTotals.charLimit) chips.push(`<span class="tw-summary-chip tw-summary-chip-warn" title="길이 제한 초과"><span class="tw-summary-chip-label">⚠ 길이</span> <b>${warnTotals.charLimit}</b></span>`);
+            if (warnTotals.order) chips.push(`<span class="tw-summary-chip tw-summary-chip-warn" title="placeholder 순서 불일치"><span class="tw-summary-chip-label">⚠ 순서</span> <b>${warnTotals.order}</b></span>`);
+            if (warnTotals.tb) chips.push(`<span class="tw-summary-chip tw-summary-chip-warn" title="TB(용어집) 누락"><span class="tw-summary-chip-label">⚠ 용어</span> <b>${warnTotals.tb}</b></span>`);
+        }
+        if (reviewView.filter !== 'all') {
+            chips.push('<span class="tw-summary-divider"></span>');
+            chips.push(`<span class="tw-summary-chip tw-summary-chip-filter" title="현재 필터: ${escapeHtml(reviewView.filter)}"><span class="tw-summary-chip-label">필터</span> <b>${shownCount}/${totalCount}</b></span>`);
+        }
+        summaryEl.classList.add('tw-review-summary-chips');
+        summaryEl.innerHTML = chips.join('');
         const rows = filtered.map(d => {
             const item = d.item;
             const id = d.id;
