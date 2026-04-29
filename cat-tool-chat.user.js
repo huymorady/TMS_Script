@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.9
+// @version      0.7.10
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -1210,6 +1210,127 @@
         }
         if (removedRuns > 0) saveReviewOverrides(all);
         return { removedRuns, removedEntries };
+    }
+
+    // v0.7.10: Run-level GC. 정책 = (가장 최근 keepRecent개는 무조건 유지) AND (활성 run 보호) AND (보호 상태 보호) AND (maxAgeDays 초과만 삭제 후보).
+    // dryRun=true면 candidates만 반환. dryRun=false면 실제 삭제 + 짝 override + dangling import 정리.
+    function pruneOldRuns(opts = {}) {
+        const {
+            keepRecent = 10,
+            maxAgeDays = 30,
+            protectActive = true,
+            protectStatuses = ['running', 'phase45_ready'],
+            dryRun = true,
+        } = opts;
+        const runs = loadBatchRuns();
+        const activeId = (() => { try { return getActiveBatchRunId && getActiveBatchRunId(); } catch { return null; } })();
+        const protectSet = new Set(protectStatuses);
+        const ageMs = Math.max(0, maxAgeDays) * 24 * 60 * 60 * 1000;
+        const now = Date.now();
+        const ts = (r) => {
+            const v = r.updatedAt || r.createdAt || '';
+            const t = Date.parse(v);
+            return Number.isFinite(t) ? t : 0;
+        };
+        const sorted = Object.entries(runs).sort((a, b) => ts(b[1]) - ts(a[1]));
+        const protectedByRecent = new Set(sorted.slice(0, Math.max(0, keepRecent)).map(([id]) => id));
+        const candidates = [];
+        for (const [id, r] of sorted) {
+            if (protectedByRecent.has(id)) continue;
+            if (protectActive && id === activeId) continue;
+            if (protectSet.has(String(r.status || ''))) continue;
+            const t = ts(r);
+            if (t === 0) continue; // timestamp 미상은 보수적으로 보호
+            if (now - t < ageMs) continue;
+            candidates.push({
+                id,
+                status: String(r.status || '?'),
+                ageDays: Math.floor((now - t) / (24 * 60 * 60 * 1000)),
+            });
+        }
+        if (dryRun) {
+            return { candidates, removed: 0, removedOverrideRuns: 0, nullifiedSessions: 0 };
+        }
+        let removedOverrideRuns = 0;
+        let nullifiedSessions = 0;
+        const remaining = { ...runs };
+        for (const c of candidates) {
+            delete remaining[c.id];
+            try {
+                const n = clearOverridesForRun(c.id);
+                if (n > 0) removedOverrideRuns++;
+            } catch {}
+            try {
+                nullifiedSessions += nullifyDanglingImportedFromRunId(c.id) || 0;
+            } catch {}
+        }
+        if (candidates.length > 0) saveBatchRuns(remaining);
+        return {
+            candidates,
+            removed: candidates.length,
+            removedOverrideRuns,
+            nullifiedSessions,
+        };
+    }
+
+    // v0.7.10: import diff/preview. 백업 JSON과 현재 LS를 비교해 신규/덮어쓸/동일 카운트를 카테고리별로 계산.
+    // sessions/batchRuns/overrides는 id-keyed 객체, prompts는 array(name keyed)로 가정.
+    function diffImportPreview(data) {
+        const out = {
+            sessions: null, prompts: null, batchRuns: null, overrides: null,
+        };
+        const stableStringify = (v) => {
+            try { return JSON.stringify(v); } catch { return String(v); }
+        };
+        const diffObj = (incoming, current) => {
+            let added = 0, overwrite = 0, same = 0;
+            const inc = incoming || {};
+            const cur = current || {};
+            for (const k of Object.keys(inc)) {
+                if (!(k in cur)) { added++; continue; }
+                if (stableStringify(inc[k]) === stableStringify(cur[k])) same++;
+                else overwrite++;
+            }
+            return { added, overwrite, same, incoming: Object.keys(inc).length };
+        };
+        if (data && data.sessions) {
+            try { out.sessions = diffObj(data.sessions, loadSessions()); }
+            catch { out.sessions = diffObj(data.sessions, {}); }
+        }
+        if (data && data.batchRuns) {
+            try { out.batchRuns = diffObj(data.batchRuns, loadBatchRuns()); }
+            catch { out.batchRuns = diffObj(data.batchRuns, {}); }
+        }
+        if (data && data.overrides) {
+            // override는 runId 단위가 아니라 stringId entry 단위로 카운트하는 게 의미가 있음
+            const incoming = data.overrides || {};
+            const current = (() => { try { return loadReviewOverrides(); } catch { return {}; } })();
+            let added = 0, overwrite = 0, same = 0, total = 0;
+            for (const runId of Object.keys(incoming)) {
+                const incBucket = incoming[runId] || {};
+                const curBucket = current[runId] || {};
+                for (const stringId of Object.keys(incBucket)) {
+                    total++;
+                    if (!(stringId in curBucket)) { added++; continue; }
+                    if (stableStringify(incBucket[stringId]) === stableStringify(curBucket[stringId])) same++;
+                    else overwrite++;
+                }
+            }
+            out.overrides = { added, overwrite, same, incoming: total };
+        }
+        if (data && Array.isArray(data.prompts)) {
+            const cur = (() => { try { return loadPrompts(); } catch { return []; } })();
+            const curMap = new Map((cur || []).map(p => [p && p.name, p]));
+            let added = 0, overwrite = 0, same = 0;
+            for (const p of data.prompts) {
+                const name = p && p.name;
+                if (!curMap.has(name)) { added++; continue; }
+                if (stableStringify(p) === stableStringify(curMap.get(name))) same++;
+                else overwrite++;
+            }
+            out.prompts = { added, overwrite, same, incoming: data.prompts.length };
+        }
+        return out;
     }
 
     // v0.7.8 (#4): BATCH_RUNS GC 시 SESSIONS의 dangling importedFromRunId nullify
@@ -3649,6 +3770,32 @@
 .tw-ws-table .tw-ws-actions .tw-btn {
     padding: 2px 6px; font-size: 11px; min-width: 0;
 }
+.tw-ws-table .tw-btn-ws-run-activate.is-active {
+    background: rgba(74,222,128,0.15); border-color: rgba(74,222,128,0.5); color: #4ade80;
+    cursor: default; opacity: 1;
+}
+/* v0.7.10: export 체크박스 매트릭스 + import diff */
+.tw-ws-export-matrix {
+    display: flex; flex-wrap: wrap; gap: 10px 14px; padding: 8px 10px;
+    background: #1a1a1a; border: 1px solid #333; border-radius: 6px; margin-bottom: 8px;
+}
+.tw-ws-export-matrix label {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #ccc;
+    cursor: pointer; user-select: none;
+}
+.tw-ws-export-matrix label.disabled { color: #555; cursor: not-allowed; }
+.tw-ws-export-matrix input[type="checkbox"] { margin: 0; cursor: pointer; }
+.tw-ws-export-matrix .tw-ws-matrix-count { color: #888; font-size: 11px; }
+.tw-ws-import-diff {
+    background: #1a1a1a; border: 1px solid #333; border-radius: 6px;
+    padding: 8px 10px; font-size: 12px; line-height: 1.6;
+    margin-top: 6px; max-width: 480px;
+}
+.tw-ws-import-diff-row { display: flex; justify-content: space-between; gap: 12px; }
+.tw-ws-import-diff-row .label { color: #ccc; }
+.tw-ws-import-diff-row .num-new { color: #4ade80; font-weight: 600; }
+.tw-ws-import-diff-row .num-overwrite { color: #fbbf24; font-weight: 600; }
+.tw-ws-import-diff-row .num-same { color: #666; }
 .tw-ws-empty {
     padding: 20px; text-align: center; color: #666; font-size: 12px; font-style: italic;
 }
@@ -6769,11 +6916,12 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             <div class="tw-ws-section-head">
                 <div class="tw-stat-title">🧪 Batch Run 관리</div>
                 <div class="tw-ws-section-head-actions">
+                    <button class="tw-btn tw-btn-ghost tw-btn-ws-runs-prune" title="최근 10개를 제외하고 30일 초과된 완료 run을 정리 (활성/실행중 run은 보호)">🧹 오래된 run 정리</button>
                     <button class="tw-btn tw-btn-ghost tw-btn-ws-runs-refresh" title="목록 갱신">🔄</button>
                 </div>
             </div>
             <div class="tw-ws-runs-body"></div>
-            <div class="tw-stat-hint">💡 활성 run은 좌측에 초록 줄로 표시됩니다. 삭제 시 dangling override는 별도 정리가 필요합니다.</div>
+            <div class="tw-stat-hint">💡 활성 run은 좌측에 초록 줄로 표시됩니다. 정리 시 짝 override + 고아 importedFromRunId가 함께 정리됩니다.</div>
         </div>
         <div class="tw-session-actions tw-ws-overrides-section">
             <div class="tw-ws-section-head">
@@ -6798,21 +6946,21 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         </div>
         <div class="tw-session-actions">
             <div class="tw-stat-title">📦 백업 · 복원</div>
-            <div class="tw-session-buttons">
-                <button class="tw-btn tw-btn-ghost tw-btn-export-sessions">
-                    📤 세션만 백업
-                </button>
-                <button class="tw-btn tw-btn-ghost tw-btn-export-all">
-                    📤 전체 백업 (세션 + 프롬프트)
-                </button>
-                <button class="tw-btn tw-btn-ghost tw-btn-export-workspace" title="세션 + 프롬프트 + 배치 run(메타) + override까지 한 파일로 백업">
-                    📦 워크스페이스 백업 (세션 + 프롬프트 + run + override)
-                </button>
-                <button class="tw-btn tw-btn-ghost tw-btn-session-import">
-                    📥 JSON에서 복원
-                </button>
+            <div class="tw-ws-export-matrix" data-role="export-matrix">
+                <label><input type="checkbox" data-export-key="sessions" checked> 💬 세션 <span class="tw-ws-matrix-count" data-count="sessions"></span></label>
+                <label><input type="checkbox" data-export-key="prompts"> 📝 프롬프트 <span class="tw-ws-matrix-count" data-count="prompts"></span></label>
+                <label><input type="checkbox" data-export-key="batchRuns"> 🧪 Batch Run <span class="tw-ws-matrix-count" data-count="batchRuns"></span></label>
+                <label><input type="checkbox" data-export-key="overrides"> ✂ Override <span class="tw-ws-matrix-count" data-count="overrides"></span></label>
+                <label title="batch run의 무거운 raw segment 제외 (권장)"><input type="checkbox" data-export-key="stripRaw" checked> raw segment 제외</label>
             </div>
-            <div class="tw-stat-hint">💡 복원 시 JSON에 포함된 내용만 덮어씁니다 (세션만 있으면 프롬프트는 보존).</div>
+            <div class="tw-session-buttons">
+                <button class="tw-btn tw-btn-primary tw-btn-export-selected" title="위에서 체크된 항목만 한 파일로 백업">📤 선택 항목 백업</button>
+                <button class="tw-btn tw-btn-ghost tw-btn-export-preset" data-preset="sessions">세션만</button>
+                <button class="tw-btn tw-btn-ghost tw-btn-export-preset" data-preset="sessions+prompts">세션+프롬프트</button>
+                <button class="tw-btn tw-btn-ghost tw-btn-export-preset" data-preset="workspace">워크스페이스 전체</button>
+                <button class="tw-btn tw-btn-ghost tw-btn-session-import">📥 JSON에서 복원</button>
+            </div>
+            <div class="tw-stat-hint">💡 프리셋 버튼은 체크박스를 자동으로 맞추기만 하므로 다시 한 번 [📤 선택 항목 백업]을 눌러 다운로드하세요. 복원은 항목별 신규/덮어쓸/동일 카운트를 미리 보여줍니다.</div>
             <input type="file" class="tw-session-import-file" accept=".json,application/json" style="display:none">
         </div>
         <div class="tw-session-info">
@@ -7035,7 +7183,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     <td style="text-align:right">${sizeKb} KB</td>
                     <td>
                         <div class="tw-ws-actions">
-                            ${isActive ? '<span style="color:#4ade80;font-size:11px;padding:2px 6px">활성</span>' : '<button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-run-activate" data-run-id="' + escapeHtml(id) + '">🔁 활성</button>'}
+                            ${isActive ? '<button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-run-activate is-active" data-run-id="' + escapeHtml(id) + '" disabled title="이미 활성 run">✓ 활성</button>' : '<button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-run-activate" data-run-id="' + escapeHtml(id) + '">🔁 활성</button>'}
                             <button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-run-export" data-run-id="${escapeHtml(id)}" title="이 run 1개만 export">📤</button>
                             <button type="button" class="tw-btn tw-btn-danger tw-btn-ws-run-delete" data-run-id="${escapeHtml(id)}">🗑</button>
                         </div>
@@ -7151,6 +7299,28 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             runsSection.addEventListener('click', async (e) => {
                 const refresh = e.target.closest('.tw-btn-ws-runs-refresh');
                 if (refresh) { refreshRunsTable(); refreshSessionStats(); return; }
+                const prune = e.target.closest('.tw-btn-ws-runs-prune');
+                if (prune) {
+                    const dry = pruneOldRuns({ keepRecent: 10, maxAgeDays: 30, dryRun: true });
+                    if (!dry.candidates.length) {
+                        toast('정리 대상 run이 없습니다 (정책: 최근 10개 유지 / 30일 초과 / 활성·실행중 보호).', 'info');
+                        return;
+                    }
+                    const sample = dry.candidates.slice(0, 5).map(c => `• ${c.id} (${c.status}, ${c.ageDays}일)`).join('\n');
+                    const more = dry.candidates.length > 5 ? `\n…외 ${dry.candidates.length - 5}개` : '';
+                    const ok = await twConfirm({
+                        title: '오래된 run 정리',
+                        message: `정책: 최근 10개 유지 / 30일 초과 / 활성·실행중 run 보호\n\n` +
+                            `정리 대상 ${dry.candidates.length}개:\n${sample}${more}\n\n` +
+                            `짝 override + 세션의 importedFromRunId도 함께 정리됩니다.\n계속하시겠습니까?`,
+                        danger: true,
+                    });
+                    if (!ok) return;
+                    const r = pruneOldRuns({ keepRecent: 10, maxAgeDays: 30, dryRun: false });
+                    toast(`정리 완료: run ${r.removed} / override run ${r.removedOverrideRuns} / 세션 nullify ${r.nullifiedSessions}`, 'success');
+                    refreshWorkspaceUi();
+                    return;
+                }
                 const act = e.target.closest('.tw-btn-ws-run-activate');
                 if (act) {
                     const rid = act.getAttribute('data-run-id');
@@ -7289,30 +7459,91 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             refreshSessionStats();
         });
 
-        // 세션만 백업
-        $('.tw-btn-export-sessions', overlay).addEventListener('click', () => {
-            const json = exportSessionsJson({ includeSessions: true, includePrompts: false });
-            downloadJson(json, `tms_sessions_${new Date().toISOString().slice(0,10)}.json`);
-            toast('세션 백업 파일 다운로드됨 (프롬프트 제외)', 'success');
-        });
+        // v0.7.10: export 체크박스 매트릭스 + 프리셋
+        const exportMatrix = $('.tw-ws-export-matrix', overlay);
+        function getExportMatrix() {
+            const get = (key) => {
+                const el = exportMatrix && exportMatrix.querySelector(`input[data-export-key="${key}"]`);
+                return !!(el && el.checked);
+            };
+            return {
+                sessions: get('sessions'),
+                prompts: get('prompts'),
+                batchRuns: get('batchRuns'),
+                overrides: get('overrides'),
+                stripRaw: get('stripRaw'),
+            };
+        }
+        function setExportMatrix(state) {
+            for (const [k, v] of Object.entries(state)) {
+                const el = exportMatrix && exportMatrix.querySelector(`input[data-export-key="${k}"]`);
+                if (el) el.checked = !!v;
+            }
+        }
+        function refreshExportMatrixCounts() {
+            if (!exportMatrix) return;
+            const ws = (() => { try { return getWorkspaceStats(); } catch { return null; } })();
+            if (!ws) return;
+            const counts = {
+                sessions: ws.sessionCount,
+                prompts: ws.promptCount,
+                batchRuns: ws.runCount,
+                overrides: ws.overrideCount,
+            };
+            for (const [k, v] of Object.entries(counts)) {
+                const el = exportMatrix.querySelector(`[data-count="${k}"]`);
+                if (el) el.textContent = `(${v})`;
+            }
+        }
+        refreshExportMatrixCounts();
+        // 매트릭스 카운트는 워크스페이스 진입 시 한 번 더 갱신되도록 refreshWorkspaceUi에 hook
+        const _origRefreshWs = refreshWorkspaceUi;
+        refreshWorkspaceUi = function patchedRefreshWorkspaceUi() {
+            try { _origRefreshWs(); } catch (e) { dwarn('ws refresh 실패', e); }
+            try { refreshExportMatrixCounts(); } catch {}
+        };
 
-        // 전체 백업 (세션 + 프롬프트)
-        $('.tw-btn-export-all', overlay).addEventListener('click', () => {
-            const json = exportSessionsJson({ includeSessions: true, includePrompts: true });
-            downloadJson(json, `tms_backup_full_${new Date().toISOString().slice(0,10)}.json`);
-            toast('전체 백업 파일 다운로드됨 (세션 + 프롬프트)', 'success');
-        });
-
-        // v0.7.8 (#2): 워크스페이스 통째 백업 (세션 + 프롬프트 + 배치 run + override)
-        $('.tw-btn-export-workspace', overlay).addEventListener('click', () => {
+        $('.tw-btn-export-selected', overlay).addEventListener('click', () => {
+            const m = getExportMatrix();
+            if (!m.sessions && !m.prompts && !m.batchRuns && !m.overrides) {
+                toast('백업할 항목을 1개 이상 선택하세요.', 'warn');
+                return;
+            }
             const json = exportSessionsJson({
-                includeSessions: true,
-                includePrompts: true,
-                includeBatchRuns: true,
-                includeOverrides: true,
+                includeSessions: m.sessions,
+                includePrompts: m.prompts,
+                includeBatchRuns: m.batchRuns,
+                includeOverrides: m.overrides,
+                stripRawSegments: m.stripRaw,
             });
-            downloadJson(json, `tms_workspace_${new Date().toISOString().slice(0,10)}.json`);
-            toast('워크스페이스 백업 다운로드됨 (run raw segment 제외)', 'success');
+            const parts = [];
+            if (m.sessions) parts.push('s');
+            if (m.prompts) parts.push('p');
+            if (m.batchRuns) parts.push('r');
+            if (m.overrides) parts.push('o');
+            const tag = parts.join('') || 'empty';
+            const fname = `tms_backup_${tag}_${new Date().toISOString().slice(0,10)}.json`;
+            downloadJson(json, fname);
+            const labels = [];
+            if (m.sessions) labels.push('세션');
+            if (m.prompts) labels.push('프롬프트');
+            if (m.batchRuns) labels.push('run');
+            if (m.overrides) labels.push('override');
+            toast(`백업 다운로드: ${labels.join(' + ')}` + (m.batchRuns && m.stripRaw ? ' (raw 제외)' : ''), 'success');
+        });
+
+        overlay.querySelectorAll('.tw-btn-export-preset').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const preset = btn.getAttribute('data-preset');
+                if (preset === 'sessions') {
+                    setExportMatrix({ sessions: true, prompts: false, batchRuns: false, overrides: false });
+                } else if (preset === 'sessions+prompts') {
+                    setExportMatrix({ sessions: true, prompts: true, batchRuns: false, overrides: false });
+                } else if (preset === 'workspace') {
+                    setExportMatrix({ sessions: true, prompts: true, batchRuns: true, overrides: true });
+                }
+                toast(`프리셋 적용: ${btn.textContent.trim()}`, 'info');
+            });
         });
 
         function downloadJson(json, filename) {
@@ -7351,17 +7582,26 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     return;
                 }
 
+                // v0.7.10: 항목별 신규/덮어쓸/동일 카운트 미리보기
+                let diff = null;
+                try { diff = diffImportPreview(preview); } catch (e) { dwarn('diff 실패', e); }
+                const fmtDiff = (label, total, d) => {
+                    if (!d) return `• ${label} ${total}개`;
+                    return `• ${label} ${total}개 → 신규 ${d.added} / 덮어쓸 ${d.overwrite} / 동일 ${d.same}`;
+                };
+                const previewLines = [];
+                if (hasSessions) previewLines.push(fmtDiff('세션', sessionCount, diff && diff.sessions));
+                if (hasPrompts) previewLines.push(fmtDiff('프롬프트', promptCount, diff && diff.prompts));
+                if (hasBatchRuns) previewLines.push(fmtDiff('batch run', batchRunCount, diff && diff.batchRuns));
+                if (hasOverrides) previewLines.push(fmtDiff('override entry', overrideCount, diff && diff.overrides));
+
                 // 사용자에게 복원 범위 선택 요청
                 let restorePrompts = false;
                 if (hasPrompts) {
                     restorePrompts = await twConfirm({
                         title: '프롬프트 복원 여부',
-                        message: `이 백업에는 다음이 포함되어 있습니다:\n` +
-                            (hasSessions ? `• 세션 ${sessionCount}개\n` : '') +
-                            `• 시스템 프롬프트 ${promptCount}개\n` +
-                            (hasOverrides ? `• override ${overrideCount}개\n` : '') +
-                            (hasBatchRuns ? `• batch run ${batchRunCount}개\n` : '') +
-                            `\n프롬프트도 함께 복원하시겠습니까?`,
+                        message: `이 백업에는 다음이 포함되어 있습니다:\n\n` + previewLines.join('\n') +
+                            `\n\n프롬프트도 함께 복원하시겠습니까?`,
                         confirmLabel: '세션 + 프롬프트',
                         cancelLabel: '세션만',
                     });
@@ -7374,9 +7614,9 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     restoreBatchRuns = await twConfirm({
                         title: '워크스페이스 복원 여부',
                         message: `이 백업에 포함된 워크스페이스 데이터를 복원하시겠습니까?\n\n` +
-                            (hasBatchRuns ? `• batch run ${batchRunCount}개 (raw segment 제외)\n` : '') +
-                            (hasOverrides ? `• override ${overrideCount}개\n` : '') +
-                            `\n기존 데이터는 덮어씌워집니다.`,
+                            (hasBatchRuns ? fmtDiff('batch run', batchRunCount, diff && diff.batchRuns) + ' (raw segment 제외)\n' : '') +
+                            (hasOverrides ? fmtDiff('override entry', overrideCount, diff && diff.overrides) + '\n' : '') +
+                            `\n기존 데이터는 동일 키 기준으로 덮어씌워집니다.`,
                         confirmLabel: '복원',
                         cancelLabel: '건너뜀',
                         danger: true,
@@ -7384,13 +7624,18 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     restoreOverrides = restoreBatchRuns && hasOverrides;
                 }
 
-                // 세션 복원 최종 확인
+                // 세션 복원 최종 확인 — diff 요약 재표시
                 if (hasSessions) {
-                    const lines = [`세션 ${sessionCount}개`];
-                    if (restorePrompts) lines.push(`프롬프트 ${promptCount}개`);
-                    if (restoreBatchRuns) lines.push(`batch run ${batchRunCount}개`);
-                    if (restoreOverrides) lines.push(`override ${overrideCount}개`);
-                    const msg = `${lines.join(' / ')} 를 복원합니다.\n기존 데이터는 덮어씌워집니다.`;
+                    const lines = [];
+                    if (diff && diff.sessions) {
+                        lines.push(fmtDiff('세션', sessionCount, diff.sessions));
+                    } else {
+                        lines.push(`세션 ${sessionCount}개`);
+                    }
+                    if (restorePrompts) lines.push(fmtDiff('프롬프트', promptCount, diff && diff.prompts));
+                    if (restoreBatchRuns) lines.push(fmtDiff('batch run', batchRunCount, diff && diff.batchRuns));
+                    if (restoreOverrides) lines.push(fmtDiff('override entry', overrideCount, diff && diff.overrides));
+                    const msg = lines.join('\n') + `\n\n동일 키는 덮어쓰기됩니다 (값이 같으면 변화 없음).\n계속하시겠습니까?`;
                     const okRestore = await twConfirm({ title: '복원 확인', message: msg, danger: true });
                     if (!okRestore) {
                         importFileInput.value = '';
