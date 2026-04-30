@@ -8298,14 +8298,14 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 </div>
             </div>
         </div>
-    </div>categories" style="display:none; flex-direction:column; gap:8px; overflow-y:auto; min-height:0; padding-right:6px;">
+    </div>
+    <div class="tw-settings-content tw-settings-tab-categories" style="display:none; flex-direction:column; gap:8px; overflow-y:auto; min-height:0; padding-right:6px;">
         <div class="tw-stat-hint" style="margin-bottom:4px;">
             💡 Phase 1+2 분석에서 활성으로 분류된 카테고리의 본문이 Phase 3/4+5 프롬프트에 자동 주입됩니다.<br>
             본문이 비어 있는 슬롯은 무시됩니다. 카테고리 0(공통)은 항상 활성으로 취급됩니다.
         </div>
         <div class="tw-category-list" style="display:flex; flex-direction:column; gap:6px;"></div>
     </div>
-    <div class="tw-settings-content tw-settings-tab-
     <div class="tw-settings-content tw-settings-tab-sessions" style="display:none; flex-direction:column; gap:16px; overflow-y:auto; min-height:0; padding-right:6px;">
         <div class="tw-session-stats">
             <div class="tw-stat-title">📊 저장 현황</div>
