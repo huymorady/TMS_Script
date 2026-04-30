@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.44
+// @version      0.7.45
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.44)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.45)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.44';
+    const SCRIPT_VERSION = '0.7.45';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -5230,6 +5230,17 @@
 }
 .tw-phase-prompt-content:focus { outline: 2px solid #4ade80; outline-offset: -2px; }
 .tw-phase-prompt-actions { display: flex; gap: 6px; justify-content: flex-end; }
+/* v0.7.45: Phase 프롬프트 미리보기 영역 (Frame + 슬롯 본문 조합 결과). 기본 숨김. */
+.tw-phase-prompt-preview {
+    display: none; margin-top: 4px;
+    background: #141414; color: #cfcfcf; border: 1px solid #2a2a2a;
+    border-radius: 4px; padding: 8px 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+    max-height: 360px; overflow: auto;
+}
+.tw-phase-prompt-preview.is-open { display: block; }
+.tw-phase-prompt-preview-meta { color: #888; font-size: 11px; margin-bottom: 6px; }
 .tw-phase-prompts-divider { height: 1px; background: #333; margin: 8px 0; }
 .tw-category-item {
     background: #252525; border: 1px solid #333; border-radius: 6px;
@@ -8907,8 +8918,10 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                             placeholder="이 Phase에 보낼 시스템 프롬프트 본문을 입력하세요. 비워두면 기존 시스템 프롬프트로 폴백합니다."
                         >${escapeHtml(content)}</textarea>
                         <div class="tw-phase-prompt-actions">
+                            <button type="button" class="tw-btn tw-btn-ghost tw-btn-phase-prompt-preview" data-slot="${slot}">👁️ 미리보기</button>
                             <button type="button" class="tw-btn tw-btn-ghost tw-btn-phase-prompt-reset" data-slot="${slot}">↺ 기본값으로 복원</button>
                         </div>
+                        <pre class="tw-phase-prompt-preview" data-slot="${slot}" hidden></pre>
                     </div>
                 `;
             }).join('');
@@ -8937,6 +8950,42 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 ta.addEventListener('blur', () => {
                     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
                     commit();
+                });
+            });
+            // v0.7.45: 미리보기 버튼 — 클릭 시 getWorkflowBasePrompt(phaseTag) 결과를 인라인 패널에 토글 표시.
+            //   슬롯 본문이 비어 있으면 디폴트 시드 또는 chat 폴백이 적용된 실제 결과를 그대로 보여준다.
+            const _slotToPhaseTag = { phase12: '1+2', phase3: '3', phase45: '4+5' };
+            $$('.tw-btn-phase-prompt-preview', listEl).forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const slot = btn.dataset.slot;
+                    if (!BATCH_PHASE_SLOT_KEYS.includes(slot)) return;
+                    const item = btn.closest('.tw-phase-prompt-item');
+                    const pre = item && item.querySelector('.tw-phase-prompt-preview');
+                    if (!pre) return;
+                    const isOpen = pre.classList.contains('is-open');
+                    if (isOpen) {
+                        pre.classList.remove('is-open');
+                        pre.hidden = true;
+                        btn.textContent = '👁️ 미리보기';
+                        return;
+                    }
+                    let body = '';
+                    let source = 'unknown';
+                    try {
+                        body = getWorkflowBasePrompt(_slotToPhaseTag[slot]) || '';
+                        const stored = loadBatchPhasePrompts();
+                        if (typeof stored[slot] === 'string' && stored[slot].trim()) source = '사용자 슬롯 + Frame';
+                        else if ((BATCH_PHASE_PROMPT_DEFAULTS[slot] || '').trim()) source = '디폴트 시드 + Frame';
+                        else source = 'chat 활성 프롬프트 (legacy 폴백)';
+                    } catch (err) {
+                        body = `[미리보기 실패] ${err && err.message || err}`;
+                        source = 'error';
+                    }
+                    const meta = `<span class="tw-phase-prompt-preview-meta">출처: ${escapeHtml(source)} · ${body.length}자</span>\n`;
+                    pre.innerHTML = meta + escapeHtml(body);
+                    pre.classList.add('is-open');
+                    pre.hidden = false;
+                    btn.textContent = '🙈 미리보기 닫기';
                 });
             });
             $$('.tw-btn-phase-prompt-reset', listEl).forEach(btn => {
