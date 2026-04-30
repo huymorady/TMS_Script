@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.26
+// @version      0.7.27
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.26)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.27)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.26';
+    const SCRIPT_VERSION = '0.7.27';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -1850,8 +1850,20 @@
         }
 
         if (restorePrompts && hasPrompts) {
-            savePrompts(data.prompts);
-            promptsCount = data.prompts.length;
+            // v0.7.27 (#D1-P0-6): redacted prompt 복원 차단.
+            //   v0.7.26 #C5-P1-16에서 export 기본값이 redactPromptContent=true로 바뀌면서
+            //   prompt content가 string 대신 {redacted,length,hash} 객체로 백업되는 경우가 생겼다.
+            //   그걸 그대로 저장하면 이후 systemPrompt.trim() / buildPrefixPrompt에서 TypeError.
+            if (data.promptsRedacted) {
+                throw new Error('이 백업의 프롬프트 내용은 redacted 상태라 복원할 수 없습니다. 원문 포함 백업을 사용하세요 (export 시 redactPromptContent: false).');
+            }
+            // 방어적으로 content가 string이 아닌 항목은 걸러낸다.
+            const safe = (data.prompts || []).filter(p => p && typeof p.content === 'string');
+            if (safe.length !== (data.prompts || []).length) {
+                throw new Error(`프롬프트 ${(data.prompts || []).length - safe.length}개가 잘못된 형식(content가 string이 아닔)으로 복원 중단.`);
+            }
+            savePrompts(safe);
+            promptsCount = safe.length;
         }
 
         if (restoreOverrides && hasOverrides) {
@@ -6898,11 +6910,22 @@
 
     function storePhaseResult(run, phaseTag, raw, parsed, validation) {
         const phaseResult = { raw, parsed, validation, updatedAt: new Date().toISOString() };
+        // v0.7.27 (#D1-P0-1): downstream phase 결과 무효화.
+        //   Phase 1+2 재실행 → phase3/phase45 stale, Phase 3 재실행 → phase45 stale.
+        //   이전 코드는 상위 phase만 갈아끼우고 하위는 남겨둔 채로 renderReviewTable이
+        //   `usePhase45 = !!run.phase45?.validation?.ok`로 옥은 phase45 revision을 final 후보로
+        //   쓰는 정합성 버그가 있었다.
         if (phaseTag === '1+2') {
             run.phase12 = phaseResult;
+            run.phase3 = null;
+            run.phase45 = null;
+            delete run.validations['3'];
+            delete run.validations['4+5'];
             run.status = validation.ok ? 'phase12_ready' : 'failed';
         } else if (phaseTag === '3') {
             run.phase3 = phaseResult;
+            run.phase45 = null;
+            delete run.validations['4+5'];
             run.status = validation.ok ? 'phase3_ready' : 'failed';
         } else if (phaseTag === '4+5') {
             run.phase45 = phaseResult;
@@ -7521,14 +7544,16 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             }
             // v0.7.21 (#B5): run에 해당 stringId가 실제로 존재하는지 검증.
             //   없으면 review 표에도 안 나타나고 후일 혼동의 원인이 됨.
+            // v0.7.27 (#D1-P0-8): translations는 배열이다. hasOwnProperty(array, '12345')는
+            //   id가 배열 index와 우연히 일치할 때만 true라 실제 segment id(큰 숫자)는
+            //   항상 false. 유효한 세그먼트이어도 거절되는 버그였다.
+            //   배열을 순회하며 normalizeId로 비교해야 올바르다.
             try {
                 const runs = loadBatchRuns();
                 const run = runs[runId];
-                const phase3Map = run?.phase3?.parsed?.translations;
-                const has = phase3Map && (
-                    Object.prototype.hasOwnProperty.call(phase3Map, currentStringId) ||
-                    Object.prototype.hasOwnProperty.call(phase3Map, normalizeId(currentStringId))
-                );
+                const translations = run?.phase3?.parsed?.translations || [];
+                const targetId = normalizeId(currentStringId);
+                const has = Array.isArray(translations) && translations.some(it => normalizeId(it?.id) === targetId);
                 if (!has) {
                     toast(`run ${runId}에 세그먼트 ${currentStringId}가 없어 override로 굳힐 수 없습니다.`, 'warn');
                     return;
