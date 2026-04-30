@@ -9,7 +9,6 @@ browser_use_handoff.md
 spec-plan.md
 *.spec-plan.md
 *.test.js
-docs/
 tests/
 
 # 임시 체크/대화 로그
