@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.20
+// @version      0.7.21
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.20)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.21)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.20';
+    const SCRIPT_VERSION = '0.7.21';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -173,7 +173,12 @@
     }
 
     function parseRequiredInt(value, label) {
-        const n = parseInt(value, 10);
+        // v0.7.21 (#B4): parseInt는 "123abc"도 123으로 통과시킨다. URL param 검증은 엄격하게.
+        const s = String(value ?? '').trim();
+        if (!/^-?\d+$/.test(s)) {
+            throw new Error(`${label} 값을 URL에서 확인하지 못했습니다.`);
+        }
+        const n = parseInt(s, 10);
         if (!Number.isFinite(n)) {
             throw new Error(`${label} 값을 URL에서 확인하지 못했습니다.`);
         }
@@ -1278,7 +1283,8 @@
         return lsGet(LS_KEYS.SESSIONS, {});
     }
     function saveSessions(sessions) {
-        lsSet(LS_KEYS.SESSIONS, sessions);
+        // v0.7.21 (#B2): 저장 성공/실패를 호출부에 전파.
+        return lsSet(LS_KEYS.SESSIONS, sessions);
     }
     function getSession(stringId) {
         const sessions = loadSessions();
@@ -1594,14 +1600,18 @@
     // v0.7.11: 위험 작업 직전 안전망 백업. triggerBackupAsync('pre-action') wrapper.
     // - 호출 후 짧게 sleep해서 IDB 쓰기가 시작되도록.
     async function preActionBackup(actionLabel) {
+        // v0.7.21 (#B1): IDB write 완료를 실제로 기다린다 (기존 200ms sleep 제거).
+        //   IDB blocked/quota로 실패하면 false 반환 → 호출부가 reset/위험 액션을 중단.
         try {
-            if (typeof triggerBackupAsync === 'function') {
-                triggerBackupAsync('pre-action');
-                await new Promise(r => setTimeout(r, 200));
+            if (typeof createBackupNow === 'function') {
+                await createBackupNow('pre-action');
                 logActivity('backup', `pre-action 백업 (${actionLabel || 'unknown'})`);
                 return true;
             }
-        } catch (e) { try { console.warn(LOG_TAG, 'pre-action backup 실패', e); } catch {} }
+        } catch (e) {
+            try { console.warn(LOG_TAG, 'pre-action backup 실패', e); } catch {}
+            try { logActivity('error', `pre-action 백업 실패 (${actionLabel || 'unknown'}): ${e?.message || e}`); } catch {}
+        }
         return false;
     }
 
@@ -1842,15 +1852,27 @@
     }
 
     // fire-and-forget. 실패해도 운영에는 영향 없음 (LS가 source of truth).
+    // v0.7.21 (#B1): backup 완료 근거가 필요한 경로는 await 가능한
+    //   버전을 쓰도록 분리. 내부 IDB write Promise를 돌려준다.
+    //   실패 시 호출부에서 reset/위험 액션을 중단할 수 있도록 throw.
+    async function createBackupNow(trigger = 'manual') {
+        const snap = buildBackupSnapshot(trigger);
+        snap.slot = _nextBackupSlot();
+        await writeBackupSlot(snap);
+        return snap.slot;
+    }
+
     function triggerBackupAsync(trigger = 'manual') {
         try {
             const snap = buildBackupSnapshot(trigger);
             snap.slot = _nextBackupSlot();
-            writeBackupSlot(snap)
-                .then(() => dverbose(`backup slot ${snap.slot} 작성 (${trigger})`))
-                .catch((e) => dwarn('IDB backup 실패', e));
+            // v0.7.21 (#B1): fire-and-forget 경로. await 가 필요하면 createBackupNow 사용.
+            return writeBackupSlot(snap)
+                .then(() => { dverbose(`backup slot ${snap.slot} 작성 (${trigger})`); return snap.slot; })
+                .catch((e) => { dwarn('IDB backup 실패', e); throw e; });
         } catch (e) {
             dwarn('backup snapshot 빌드 실패', e);
+            return Promise.reject(e);
         }
     }
 
@@ -1891,27 +1913,50 @@
         // v0.7.18 (#3): 복원 시 전체 보존. (#2): segments 누락 run에 플래그.
         const restoredRuns = _markRunsAsRestored({ ...(snap.runs || {}) });
         // v0.7.19 (#3): 저장 실패 감지 — skipGc로 11건+ 복원시 quota 가능성 ↑. 실패 시 throw로 호출부에 알림.
+        // v0.7.21 (#B3): 부분 복원/부분 손실 방지 — 가장 큰 batchRuns를 먼저 저장해
+        //   quota 실패 시 sessions/overrides가 이미 덮이는 일 없이 롤백. 단,
+        //   merge 모드에서 snap.runs가 없으면 batchRuns step을 건너뛴다.
         let runsOk = true;
         if (mode === 'overwrite') {
-            saveSessions(snap.sessions || {});
-            saveReviewOverrides(snap.overrides || {});
             runsOk = saveBatchRuns(restoredRuns, { skipGc: true });
+            if (!runsOk) {
+                try { logActivity('error', `IDB 복원(overwrite): batch run 저장 실패 — sessions/overrides 복원 중단 slot=${slot}`, { runs: Object.keys(restoredRuns).length }); } catch (_) {}
+                throw new Error('batch run 저장 실패 — sessions/overrides는 복원하지 않았습니다. 오래된 run 정리 후 다시 시도하세요.');
+            }
+            const sOk = saveSessions(snap.sessions || {});
+            const oOk = saveReviewOverrides(snap.overrides || {});
+            if (!sOk || !oOk) {
+                try { logActivity('error', `IDB 복원(overwrite): sessions/overrides 저장 실패 slot=${slot}`, { sOk, oOk }); } catch (_) {}
+                throw new Error('sessions/overrides 저장 실패 — batch run은 복원되었으나 나머지 독립 복원 실패.');
+            }
         } else {
             // merge: 슬롯이 가진 키만 덮어씀
-            if (snap.sessions) saveSessions({ ...loadSessions(), ...snap.sessions });
+            if (snap.runs) {
+                runsOk = saveBatchRuns({ ...loadBatchRuns(), ...restoredRuns }, { skipGc: true });
+                if (!runsOk) {
+                    try { logActivity('error', `IDB 복원(merge): batch run 저장 실패 — sessions/overrides merge 중단 slot=${slot}`, { runs: Object.keys(restoredRuns).length }); } catch (_) {}
+                    throw new Error('batch run 저장 실패 — sessions/overrides는 merge하지 않았습니다. 오래된 run 정리 후 다시 시도하세요.');
+                }
+            }
+            if (snap.sessions) {
+                const ok = saveSessions({ ...loadSessions(), ...snap.sessions });
+                if (!ok) {
+                    try { logActivity('error', `IDB 복원(merge): sessions 저장 실패 slot=${slot}`); } catch (_) {}
+                    throw new Error('sessions 저장 실패 — batch run은 merge되었으나 sessions 실패.');
+                }
+            }
             if (snap.overrides) {
                 const cur = loadReviewOverrides();
                 const merged = { ...cur };
                 for (const [rid, b] of Object.entries(snap.overrides)) {
                     merged[rid] = { ...(merged[rid] || {}), ...b };
                 }
-                saveReviewOverrides(merged);
+                const ok = saveReviewOverrides(merged);
+                if (!ok) {
+                    try { logActivity('error', `IDB 복원(merge): overrides 저장 실패 slot=${slot}`); } catch (_) {}
+                    throw new Error('overrides 저장 실패 — batch run/sessions는 merge되었으나 overrides 실패.');
+                }
             }
-            if (snap.runs) runsOk = saveBatchRuns({ ...loadBatchRuns(), ...restoredRuns }, { skipGc: true });
-        }
-        if (!runsOk) {
-            try { logActivity('error', `IDB 복원: batch run 저장 실패 (LS quota?) slot=${slot} mode=${mode}`, { runs: Object.keys(restoredRuns).length }); } catch (_) {}
-            throw new Error('batch run 저장 실패 — LS 용량 초과 가능성. 오래된 run 정리 후 다시 시도하세요.');
         }
         return {
             sessions: Object.keys(snap.sessions || {}).length,
@@ -1976,7 +2021,8 @@
         return prompts;
     }
     function savePrompts(prompts) {
-        lsSet(LS_KEYS.SYSTEM_PROMPTS, prompts);
+        // v0.7.21 (#B2): 저장 성공/실패를 호출부에 전파.
+        return lsSet(LS_KEYS.SYSTEM_PROMPTS, prompts);
     }
 
     // ----- 활성 프롬프트 ID: 채팅/배치 분리 (v0.4.0+) -----
@@ -2221,7 +2267,8 @@
         return lsGet(LS_KEYS.REVIEW_OVERRIDES, {});
     }
     function saveReviewOverrides(map) {
-        lsSet(LS_KEYS.REVIEW_OVERRIDES, map);
+        // v0.7.21 (#B2): 저장 성공/실패를 호출부에 전파.
+        return lsSet(LS_KEYS.REVIEW_OVERRIDES, map);
     }
     function getReviewOverride(runId, stringId) {
         if (!runId) return null;
@@ -7266,6 +7313,21 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 toast('현재 활성 batch run이 없어 override로 굳힐 수 없습니다.', 'warn');
                 return;
             }
+            // v0.7.21 (#B5): run에 해당 stringId가 실제로 존재하는지 검증.
+            //   없으면 review 표에도 안 나타나고 후일 혼동의 원인이 됨.
+            try {
+                const runs = loadBatchRuns();
+                const run = runs[runId];
+                const phase3Map = run?.phase3?.parsed?.translations;
+                const has = phase3Map && (
+                    Object.prototype.hasOwnProperty.call(phase3Map, currentStringId) ||
+                    Object.prototype.hasOwnProperty.call(phase3Map, normalizeId(currentStringId))
+                );
+                if (!has) {
+                    toast(`run ${runId}에 세그먼트 ${currentStringId}가 없어 override로 굳힐 수 없습니다.`, 'warn');
+                    return;
+                }
+            } catch (e) { dwarn('override gate 검증 실패', e); }
             try {
                 setReviewOverride(runId, currentStringId, text);
                 toast(`override로 굳혔습니다 (run ${runId})`, 'success');
