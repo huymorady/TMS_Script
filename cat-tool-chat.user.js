@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.27
+// @version      0.7.28
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.27)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.28)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.27';
+    const SCRIPT_VERSION = '0.7.28';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -6956,6 +6956,35 @@
             return;
         }
 
+        // v0.7.28 (#D2-P1-4): storage cell 하드 덼어쓰기 보호.
+        //   workflow JSON이 아닌 일반 번역이 들어있으면 (사람이 넣었을 가능성) 명시 수락 요구.
+        //   v0.7.18 이하의 'warn' 로그만으로는 실수로 덼어쓰는 걸 완전 차단 못함.
+        try {
+            const cellSnapshot = await fetchSavedResultSnapshot(run.storageStringId);
+            const looksWorkflowJson = (() => {
+                if (!cellSnapshot.raw) return true; // 비어있으면 OK
+                try {
+                    const p = parseWorkflowJson(cellSnapshot.raw);
+                    return ['1+2', '3', '4+5'].includes(p?.phase);
+                } catch { return false; }
+            })();
+            if (cellSnapshot.raw && !looksWorkflowJson) {
+                const ok = await twConfirm({
+                    title: 'storageStringId 기존 번역 덼어쓰기',
+                    message: `#${run.storageStringId} 칸에 워크플로우 JSON이 아닌 기존 번역(${cellSnapshot.raw.length}자)이 있습니다.\nPhase ${phaseTag} 실행 결과가 이 칸을 덼어씁니다.\n\n계속할까요?`,
+                    danger: true,
+                });
+                if (!ok) {
+                    appendBatchLog(`Phase ${phaseTag} 실행 취소됨 — storage cell 덼어쓰기 거부`, 'info');
+                    return;
+                }
+                appendBatchLog(`Phase ${phaseTag}: storage cell 덼어쓰기 수락 (기존 내용 ${cellSnapshot.raw.length}자)`, 'warn');
+            }
+        } catch (e) {
+            // snapshot 조회 실패는 고장이므로 경고만으로 진행 (기존 동작 유지)
+            dwarn('storage cell snapshot 조회 실패 — confirm 생략', e);
+        }
+
         // override 보호 — phase 재실행은 최종 후보에 영향 줄 수 있음
         if ((phaseTag === '3' || phaseTag === '4+5') && run.runId) {
             const overrideCount = countReviewOverridesForRun(run.runId);
@@ -6986,7 +7015,11 @@
             const prompt = buildPromptForPhase(run, phaseTag);
             appendBatchLog(`Phase ${phaseTag} 실행 시작, prompt length=${prompt.length}`);
 
-            const previousRaw = getPreviousRawForPhase(run, phaseTag);
+            // v0.7.28 (#D2-P0-2): stale result 오판 차단을 위해 실행 직전 storage cell의
+            //   실제 raw를 snapshot으로 잡는다. 기존 in-memory `run.phase12?.raw` 기반은
+            //   storage에 아직 남아있는 동일 phase의 과거 결과를 새 결과로 오인할 수 있었음.
+            const beforeSnapshot = await fetchSavedResultSnapshot(run.storageStringId);
+            const previousRaw = beforeSnapshot.raw;
             const taskId = await callPrefixPromptTran(run.projectId, run.storageStringId, prompt, run.model);
             appendBatchLog(`task 등록 완료: ${taskId}`);
 
