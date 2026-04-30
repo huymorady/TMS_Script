@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.29
+// @version      0.7.30
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.29)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.30)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.29';
+    const SCRIPT_VERSION = '0.7.30';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -1839,12 +1839,34 @@
         let overridesCount = 0;
         let batchRunsCount = 0;
 
+        // v0.7.30 (#D4-P1-5): import 원자성 강화.
+        //   기존엔 saveSessions/savePrompts/saveReviewOverrides 반환값을 무시해
+        //   sessions 저장은 실패했지만 overrides/runs는 그대로 쓰이는 일이 있을 수 있었다.
+        //   import 시작 전 LS 스냅을 떨어 실패 시 rollback하고, 모든 save 반환값을 검사한다.
+        const _priorSnapshot = {
+            sessions: restoreSessions && hasSessions ? loadSessions() : null,
+            prompts: restorePrompts && hasPrompts ? loadPrompts() : null,
+            overrides: restoreOverrides && hasOverrides ? loadReviewOverrides() : null,
+            batchRuns: restoreBatchRuns && hasBatchRuns ? loadBatchRuns() : null,
+        };
+        function _rollbackImport(reason) {
+            try {
+                if (_priorSnapshot.sessions !== null) saveSessions(_priorSnapshot.sessions);
+                if (_priorSnapshot.prompts !== null) savePrompts(_priorSnapshot.prompts);
+                if (_priorSnapshot.overrides !== null) saveReviewOverrides(_priorSnapshot.overrides);
+                if (_priorSnapshot.batchRuns !== null) saveBatchRuns(_priorSnapshot.batchRuns, { skipGc: true });
+                try { logActivity('warn', `import rollback: ${reason}`); } catch (_) {}
+            } catch (e) {
+                try { logActivity('error', `import rollback 자체 실패: ${e.message}`); } catch (_) {}
+            }
+        }
+
         if (restoreSessions && hasSessions) {
-            if (mergeSessions) {
-                const existing = loadSessions();
-                saveSessions({ ...existing, ...data.sessions });
-            } else {
-                saveSessions(data.sessions);
+            const payload = mergeSessions ? { ...loadSessions(), ...data.sessions } : data.sessions;
+            const ok = saveSessions(payload);
+            if (!ok) {
+                _rollbackImport('saveSessions 실패');
+                throw new Error('sessions 저장 실패 — LS 용량 초과 가능성. 변경 사항은 롤백되었습니다.');
             }
             sessionsCount = Object.keys(data.sessions).length;
         }
@@ -1862,20 +1884,32 @@
             if (safe.length !== (data.prompts || []).length) {
                 throw new Error(`프롬프트 ${(data.prompts || []).length - safe.length}개가 잘못된 형식(content가 string이 아닔)으로 복원 중단.`);
             }
-            savePrompts(safe);
+            // v0.7.30 (#D4-P1-5): savePrompts 실패 전파.
+            const promptsOk = savePrompts(safe);
+            if (!promptsOk) {
+                _rollbackImport('savePrompts 실패');
+                throw new Error('prompts 저장 실패 — LS 용량 초과 가능성. 변경 사항은 롤백되었습니다.');
+            }
             promptsCount = safe.length;
         }
 
         if (restoreOverrides && hasOverrides) {
+            let payload;
             if (mergeOverrides) {
                 const existing = loadReviewOverrides();
                 const merged = { ...existing };
                 for (const [runId, bucket] of Object.entries(data.overrides)) {
                     merged[runId] = { ...(merged[runId] || {}), ...bucket };
                 }
-                saveReviewOverrides(merged);
+                payload = merged;
             } else {
-                saveReviewOverrides(data.overrides);
+                payload = data.overrides;
+            }
+            // v0.7.30 (#D4-P1-5): saveReviewOverrides 실패 전파.
+            const ok = saveReviewOverrides(payload);
+            if (!ok) {
+                _rollbackImport('saveReviewOverrides 실패');
+                throw new Error('overrides 저장 실패 — LS 용량 초과 가능성. 변경 사항은 롤백되었습니다.');
             }
             overridesCount = Object.values(data.overrides).reduce((sum, b) => sum + Object.keys(b || {}).length, 0);
         }
@@ -1890,7 +1924,8 @@
                 : saveBatchRuns(incoming, { skipGc: true });
             if (!ok) {
                 try { logActivity('error', `import: batch run 저장 실패 (LS quota?)`, { count: Object.keys(incoming).length }); } catch (_) {}
-                throw new Error('batch run 저장 실패 — LS 용량 초과 가능성. 워크스페이스 탭에서 워래된 run 정리 후 다시 시도하세요.');
+                _rollbackImport('saveBatchRuns 실패');
+                throw new Error('batch run 저장 실패 — LS 용량 초과 가능성. 워크스페이스 탭에서 워래된 run 정리 후 다시 시도하세요. 변경 사항은 롤백되었습니다.');
             }
             batchRunsCount = Object.keys(data.batchRuns).length;
         }
@@ -2169,8 +2204,15 @@
         });
         if (!ok) return false;
         try {
-            if (snap.sessions) saveSessions(snap.sessions);
-            if (snap.overrides) saveReviewOverrides(snap.overrides);
+            // v0.7.30 (#D4-P1-5): 자동 복원도 sessions/overrides save 반환값 점검.
+            if (snap.sessions) {
+                const sOk = saveSessions(snap.sessions);
+                if (!sOk) throw new Error('sessions 저장 실패 — LS 용량 초과 가능성');
+            }
+            if (snap.overrides) {
+                const oOk = saveReviewOverrides(snap.overrides);
+                if (!oOk) throw new Error('overrides 저장 실패 — LS 용량 초과 가능성');
+            }
             // v0.7.18 (#2,#3): 복원본 run에 플래그 + 전체 보존 (최근 10개 잘림 방지)
             // v0.7.19 (#3): 저장 실패 감지
             if (snap.runs) {
@@ -8335,8 +8377,9 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     });
                     if (!ok) return;
                     try {
-                        triggerBackupAsync('pre-restore'); // 안전망
-                        await new Promise(r => setTimeout(r, 200));
+                        // v0.7.30 (#D4-P1-5): triggerBackupAsync + 200ms sleep 대신 createBackupNow await —
+                        //   실제로 모듄 backup이 끝난 뒤에만 복원을 진행해서 safety net이 실제로 동작하게 만든다.
+                        try { await createBackupNow('pre-restore'); } catch (be) { dwarn('pre-restore backup 실패', be); }
                         const r = await restoreFromBackupSlot(slot, 'overwrite');
                         logActivity('restore', `IDB 슬롯 복원`, { slot, sessions: r.sessions, runs: r.runs, overrides: r.overrides });
                         toast(`복원 완료: 세션 ${r.sessions} / run ${r.runs} / override ${r.overrides}`, 'success');
@@ -8364,8 +8407,8 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     const scope = await twChooseRestoreScope({ slot, counts });
                     if (!scope) return;
                     try {
-                        triggerBackupAsync('pre-restore');
-                        await new Promise(r => setTimeout(r, 200));
+                        // v0.7.30 (#D4-P1-5): 부분 복원도 동일하게 사전 백업 await.
+                        try { await createBackupNow('pre-restore'); } catch (be) { dwarn('pre-restore backup 실패', be); }
                         const r = await restoreFromBackupSlot(slot, 'overwrite', scope);
                         const picked = [scope.sessions && '세션', scope.runs && 'run', scope.overrides && 'override'].filter(Boolean).join(' / ');
                         logActivity('restore', `IDB 슬롯 부분 복원`, { slot, picked, sessions: r.sessions, runs: r.runs, overrides: r.overrides });
