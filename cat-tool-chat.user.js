@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.37
+// @version      0.7.38
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.37)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.38)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.37';
+    const SCRIPT_VERSION = '0.7.38';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -70,6 +70,10 @@
         OVERRIDE_WRITE_COUNTER: 'tms_workflow_override_write_counter', // v0.7.7 (#12): override 쓰기 누적 카운터 (threshold마다 backup trigger)
         SESSION_WRITE_COUNTER: 'tms_workflow_session_write_counter', // v0.7.23 (#C2-P1-13): 세션 쓰기 누적 카운터
         ACTIVITY_LOG: 'tms_workflow_activity_log_v1', // v0.7.11: Activity ring (감사 로그). 메모리 + LS 동기화.
+        // v0.7.38 (#D12): Phase 1+2 출력의 active_categories와 짝을 이루는 카테고리별 세부 가이드라인.
+        //   구조: { [id:number]: { name:string, content:string } }. id 0–21 (V3.1 프롬프트 명세).
+        //   프로젝트 파일별로 동기화되지 않는 전역 설정.
+        CATEGORY_GUIDELINES: 'tms_workflow_category_guidelines_v1',
     };
 
     // v0.7.7 (#10): 현재 스키마 버전. 신규 LS key/필드를 추가하거나 기존 구조를 변경할 때 +1.
@@ -95,6 +99,39 @@
         name: '기본',
         content: '',
     };
+
+    // v0.7.38 (#D12): Phase 1+2 출력의 active_categories[].id와 일치하는 22개 카테고리 카탈로그.
+    //   V3.1 워크플로우 프롬프트 명세 그대로. 0번은 항상 활성(공통 가이드라인).
+    //   실제 가이드라인 텍스트는 LS_KEYS.CATEGORY_GUIDELINES에 사용자가 채워 넣음.
+    const CATEGORY_CATALOG = Object.freeze([
+        { id: 0,  name: '📌 공통 번역 가이드라인 (항상 활성)' },
+        { id: 1,  name: '🖥️ 인터페이스(UI)' },
+        { id: 2,  name: '📢 시스템 메시지' },
+        { id: 3,  name: '💡 툴팁 및 힌트' },
+        { id: 4,  name: '📖 튜토리얼 및 가이드' },
+        { id: 5,  name: '💬 메인 시나리오 대사' },
+        { id: 6,  name: '🗨️ 서브 이벤트 대사' },
+        { id: 7,  name: '🎙️ 성우 녹음 대본' },
+        { id: 8,  name: '📺 컷신 및 영상 자막' },
+        { id: 9,  name: '⚔️ 아이템 정보' },
+        { id: 10, name: '✨ 스킬 및 능력 설명' },
+        { id: 11, name: '📜 퀘스트 목표 및 진행 안내' },
+        { id: 12, name: '🌍 배경 설정 및 세계관 정보' },
+        { id: 13, name: '📣 게임 공지 및 이벤트 안내' },
+        { id: 14, name: '📈 마케팅 및 프로모션 콘텐츠' },
+        { id: 15, name: '🛒 스토어 및 상점 콘텐츠' },
+        { id: 16, name: '🏆 업적 및 칭호' },
+        { id: 17, name: '📌 커뮤니티 및 소셜 메시지' },
+        { id: 18, name: '🛠️ 패치 및 업데이트 내역' },
+        { id: 19, name: '🔐 법적 고지 및 정책 문서' },
+        { id: 20, name: '🧩 기타 번역 항목 및 사용자 지정 카테고리' },
+        { id: 21, name: '⭐ 문체 참고 가이드' },
+    ]);
+    const CATEGORY_ID_SET = new Set(CATEGORY_CATALOG.map(c => c.id));
+    function getCategoryName(id) {
+        const c = CATEGORY_CATALOG.find(x => x.id === id);
+        return c ? c.name : `(unknown id ${id})`;
+    }
 
     const MODELS = ['claude-sonnet-4-6', 'gpt-5.2-chat', 'deepseek-v3'];
 
@@ -2383,6 +2420,66 @@
         return lsSet(LS_KEYS.SYSTEM_PROMPTS, prompts);
     }
 
+    // v0.7.38 (#D12): 카테고리별 세부 가이드라인 LS 저장소.
+    //   구조: { [id:number]: { name:string, content:string } }
+    //   id가 CATEGORY_ID_SET에 없으면 무시. content가 비어있으면 주입 단계에서 skip.
+    function loadCategoryGuidelines() {
+        const v = lsGet(LS_KEYS.CATEGORY_GUIDELINES, {});
+        if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+        const out = {};
+        for (const [k, val] of Object.entries(v)) {
+            const id = Number(k);
+            if (!Number.isInteger(id) || !CATEGORY_ID_SET.has(id)) continue;
+            if (!val || typeof val !== 'object') continue;
+            out[id] = {
+                name: typeof val.name === 'string' ? val.name : getCategoryName(id),
+                content: typeof val.content === 'string' ? val.content : '',
+            };
+        }
+        return out;
+    }
+    function saveCategoryGuidelines(map) {
+        return lsSet(LS_KEYS.CATEGORY_GUIDELINES, map || {});
+    }
+    function getCategoryGuidelineContent(id) {
+        const map = loadCategoryGuidelines();
+        const v = map[id];
+        return (v && typeof v.content === 'string') ? v.content : '';
+    }
+    // v0.7.38 (#D12): Phase 1+2 compact 결과의 cats 배열을 정규화.
+    //   숫자 또는 {id:number}만 받고 카탈로그에 있는 것만 유지 + 중복 제거 + 0번은 항상 포함.
+    //   0번 슬롯이 비어있어도 활성 표시는 한다 (사용자가 채워두면 자동 주입).
+    function normalizeActiveCategoryIds(rawIds) {
+        const out = new Set([0]); // 0번은 항상 활성
+        if (Array.isArray(rawIds)) {
+            for (const v of rawIds) {
+                const id = (typeof v === 'object' && v) ? Number(v.id) : Number(v);
+                if (Number.isInteger(id) && CATEGORY_ID_SET.has(id)) out.add(id);
+            }
+        }
+        return [...out].sort((a, b) => a - b);
+    }
+    // v0.7.38 (#D12): Phase 3/4+5 프롬프트에 끼울 카테고리 가이드라인 블록 빌드.
+    //   activeIds 중 content가 채워진 것만 포함. 모두 비어있으면 빈 문자열.
+    function buildActiveCategoryGuidelinesBlock(activeIds) {
+        const ids = Array.isArray(activeIds) ? activeIds : [];
+        const map = loadCategoryGuidelines();
+        const sections = [];
+        for (const id of ids) {
+            const content = (map[id]?.content || '').trim();
+            if (!content) continue;
+            sections.push(`## [카테고리 ${id}] ${getCategoryName(id)}\n${content}`);
+        }
+        if (!sections.length) return '';
+        return [
+            '# 활성 카테고리별 세부 가이드라인',
+            '아래 가이드라인은 Phase 1+2 분석에서 활성화된 카테고리에 해당합니다.',
+            '번역/검수 시 시스템 프롬프트와 함께 반드시 준수하세요.',
+            '',
+            ...sections,
+        ].join('\n\n');
+    }
+
     // ----- 활성 프롬프트 ID: 채팅/배치 분리 (v0.4.0+) -----
     // 기존 단일 ACTIVE_PROMPT_ID에서 마이그레이션. 한 번만 실행하면 충분.
     function migrateActivePromptIdsIfNeeded() {
@@ -3283,6 +3380,10 @@
             logs: [],
             lastExpectedPhase: null,
             lastError: null,
+            // v0.7.38 (#D12): Phase 1+2 분석으로 채워질 활성 카테고리 ID 배열.
+            //   새 run 생성 시 빈 배열로 시작 → Phase 1+2 성공 직후 storePhaseResult가 채움.
+            //   카탈로그 0번(공통 가이드)은 normalizeActiveCategoryIds가 항상 포함시킨다.
+            activeCategoryIds: [],
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
         };
@@ -3415,6 +3516,15 @@
             '출력 JSON의 최상위에 반드시 "attempt_id" 필드를 추가하고 위 값을 그대로 복사하세요.',
             `예: {"phase": "${phaseTag}", "attempt_id": "${attemptId}", ...}`,
         ] : [];
+        // v0.7.38 (#D12): Phase 3/4+5에 한해 활성 카테고리 가이드라인을 주입.
+        //   Phase 1+2는 카테고리 자체를 결정하는 단계라 주입하지 않는다.
+        //   activeCategoryIds가 비어있거나 모든 슬롯이 비면 빈 문자열 → 블록 생략.
+        const categoryBlocks = (phaseTag === '3' || phaseTag === '4+5')
+            ? (function () {
+                const block = buildActiveCategoryGuidelinesBlock(run.activeCategoryIds || []);
+                return block ? ['---', block] : [];
+            })()
+            : [];
         return [
             getWorkflowBasePrompt(),
             '---',
@@ -3428,6 +3538,7 @@
             formatBatchSegmentList(run),
             '',
             ...(extraBlocks.length ? [...extraBlocks, ''] : []),
+            ...(categoryBlocks.length ? [...categoryBlocks, ''] : []),
             '---',
             '',
             `[CURRENT_PHASE: ${phaseTag}]`,
@@ -5719,6 +5830,17 @@
                 storageBadge = `<span class="tw-run-storage-mismatch" title="Phase 재실행 결과는 storageStringId=${escapeHtml(ssid)} 세그먼트의 번역 칸에 써집니다. 현재 보고 있는 세그먼트(${escapeHtml(csid)})가 아닙니다.">📝 쓰기 대상: ${escapeHtml(ssid)}</span>`;
             }
         } catch (_) { /* normalizeId 실패 — 배지 생략 */ }
+        // v0.7.38 (#D12): Phase 1+2가 결정한 활성 카테고리 칩 (read-only).
+        //   activeCategoryIds가 비어있으면 칩 자체를 숨김.
+        let categoriesBadge = '';
+        try {
+            const ids = Array.isArray(run.activeCategoryIds) ? run.activeCategoryIds : [];
+            if (ids.length) {
+                const tooltip = ids.map(id => `[${id}] ${getCategoryName(id)}`).join('\n');
+                const chips = ids.map(id => `#${id}`).join(' ');
+                categoriesBadge = `<span class="tw-run-categories-badge" title="${escapeHtml(tooltip)}" style="background:#2a3a4a; color:#9ec1e6; padding:2px 6px; border-radius:3px; font-size:11px;">🎨 활성 카테고리: ${escapeHtml(chips)}</span>`;
+            }
+        } catch (_) { /* 배지 생략 */ }
         el.innerHTML = `
             <span class="tw-batch-run-id" title="runId: ${escapeHtml(String(run.runId || ''))}${run.label ? `\n라벨: ${escapeHtml(String(run.label))}` : ''}">🏃 ${escapeHtml(run.label || runIdShort)}</span>
             <span class="tw-batch-run-meta">project <b>${escapeHtml(String(run.projectId || '?'))}</b> / file <b>${escapeHtml(String(run.fileId || '?'))}</b> / lang <b>${escapeHtml(String(run.languageId || '?'))}</b></span>
@@ -5726,6 +5848,7 @@
             ${pageBadge}
             ${restoredBadge}
             ${storageBadge}
+            ${categoriesBadge}
             <span class="tw-batch-run-stamp">${escapeHtml(stamp)}</span>
         `;
     }
@@ -7250,6 +7373,8 @@
                 phase3: null,
                 phase45: null,
                 validations: {},
+                // v0.7.38 (#D12): 새 수집 = 새 분석 사이클. 이전 활성 카테고리 초기화.
+                activeCategoryIds: [],
             });
             appendBatchLog(`파일 전체 TB 용어 ${tbSummary.length}개 준비`);
             if (storageSnapshot.raw) {
@@ -7332,6 +7457,15 @@
             delete run.validations['3'];
             delete run.validations['4+5'];
             run.status = validation.ok ? 'phase12_ready' : 'failed';
+            // v0.7.38 (#D12): Phase 1+2 성공 시점에 활성 카테고리 동기화.
+            //   compact 스키마: 최상위 cats:[13,2] 또는 그룹별 cats가 합쳐진 형태.
+            //   실패 시 또는 cats 누락 시 [0]만 남겨 공통 가이드는 유지.
+            if (validation.ok) {
+                const rawCats = Array.isArray(parsed?.cats) ? parsed.cats : [];
+                run.activeCategoryIds = normalizeActiveCategoryIds(rawCats);
+            } else {
+                run.activeCategoryIds = normalizeActiveCategoryIds([]);
+            }
         } else if (phaseTag === '3') {
             run.phase3 = phaseResult;
             run.phase45 = null;
@@ -8137,6 +8271,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         <span class="tw-settings-header-title">⚙️ 설정</span>
         <div class="tw-settings-tabs">
             <button class="tw-settings-tab active" data-tab="prompts">📝 시스템 프롬프트</button>
+            <button class="tw-settings-tab" data-tab="categories">🎨 카테고리 가이드라인</button>
             <button class="tw-settings-tab" data-tab="sessions">🧰 워크스페이스</button>
         </div>
         <button class="tw-btn tw-btn-ghost tw-btn-settings-close">닫기</button>
@@ -8163,7 +8298,14 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 </div>
             </div>
         </div>
+    </div>categories" style="display:none; flex-direction:column; gap:8px; overflow-y:auto; min-height:0; padding-right:6px;">
+        <div class="tw-stat-hint" style="margin-bottom:4px;">
+            💡 Phase 1+2 분석에서 활성으로 분류된 카테고리의 본문이 Phase 3/4+5 프롬프트에 자동 주입됩니다.<br>
+            본문이 비어 있는 슬롯은 무시됩니다. 카테고리 0(공통)은 항상 활성으로 취급됩니다.
+        </div>
+        <div class="tw-category-list" style="display:flex; flex-direction:column; gap:6px;"></div>
     </div>
+    <div class="tw-settings-content tw-settings-tab-
     <div class="tw-settings-content tw-settings-tab-sessions" style="display:none; flex-direction:column; gap:16px; overflow-y:auto; min-height:0; padding-right:6px;">
         <div class="tw-session-stats">
             <div class="tw-stat-title">📊 저장 현황</div>
@@ -8276,6 +8418,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         // ==== 탭 전환 ====
         const tabButtons = $$('.tw-settings-tab', overlay);
         const promptsTab = $('.tw-settings-tab-prompts', overlay);
+        const categoriesTab = $('.tw-settings-tab-categories', overlay);
         const sessionsTab = $('.tw-settings-tab-sessions', overlay);
         tabButtons.forEach(btn => {
             btn.addEventListener('click', () => {
@@ -8283,13 +8426,75 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 btn.classList.add('active');
                 const tab = btn.dataset.tab;
                 promptsTab.style.display = tab === 'prompts' ? 'flex' : 'none';
+                if (categoriesTab) categoriesTab.style.display = tab === 'categories' ? 'flex' : 'none';
                 sessionsTab.style.display = tab === 'sessions' ? 'flex' : 'none';
                 if (tab === 'sessions') {
                     if (typeof refreshWorkspaceUi === 'function') refreshWorkspaceUi();
                     else refreshSessionStats();
                 }
+                if (tab === 'categories' && typeof refreshCategoryGuidelines === 'function') {
+                    refreshCategoryGuidelines();
+                }
             });
         });
+
+        // v0.7.38 (#D12): 카테고리 가이드라인 탭 렌더 + 저장.
+        //   22개 슬롯을 collapsible <details>로 그려 페이지 길이를 통제.
+        //   textarea blur 또는 입력 디바운스 시 LS 저장. 0번은 항상 펼친 상태.
+        function refreshCategoryGuidelines() {
+            if (!categoriesTab) return;
+            const listEl = $('.tw-category-list', categoriesTab);
+            if (!listEl) return;
+            const map = loadCategoryGuidelines();
+            listEl.innerHTML = CATEGORY_CATALOG.map(cat => {
+                const v = map[cat.id] || { name: cat.name, content: '' };
+                const filled = (v.content || '').trim().length > 0;
+                const open = (cat.id === 0 || filled) ? ' open' : '';
+                const badge = filled ? '<span style="color:#4caf50; margin-left:6px;">●</span>' : '<span style="color:#888; margin-left:6px;">○</span>';
+                return `
+                    <details class="tw-category-item" data-id="${cat.id}"${open} style="border:1px solid #3a3a3a; border-radius:4px; padding:6px 8px;">
+                        <summary style="cursor:pointer; user-select:none; font-weight:500;">
+                            <span>[${cat.id}] ${escapeHtml(cat.name)}</span>${badge}
+                        </summary>
+                        <textarea class="tw-category-content" data-id="${cat.id}"
+                            placeholder="이 카테고리의 세부 가이드라인을 입력하세요. 비워 두면 주입되지 않습니다."
+                            style="width:100%; min-height:120px; margin-top:6px; box-sizing:border-box; resize:vertical; font-family:inherit; font-size:12px;"
+                        >${escapeHtml(v.content || '')}</textarea>
+                    </details>
+                `;
+            }).join('');
+            $$('.tw-category-content', listEl).forEach(ta => {
+                let saveTimer = null;
+                const commit = () => {
+                    const id = Number(ta.dataset.id);
+                    if (!CATEGORY_ID_SET.has(id)) return;
+                    const cur = loadCategoryGuidelines();
+                    cur[id] = { name: getCategoryName(id), content: ta.value };
+                    saveCategoryGuidelines(cur);
+                    // 슬롯 채워짐/비어있음 표시 갱신 (요약 영역의 ●/○)
+                    const det = ta.closest('details');
+                    if (det) {
+                        const sum = det.querySelector('summary');
+                        if (sum) {
+                            const filled = (ta.value || '').trim().length > 0;
+                            const dot = sum.querySelector('span:last-child');
+                            if (dot) {
+                                dot.textContent = filled ? '●' : '○';
+                                dot.style.color = filled ? '#4caf50' : '#888';
+                            }
+                        }
+                    }
+                };
+                ta.addEventListener('input', () => {
+                    if (saveTimer) clearTimeout(saveTimer);
+                    saveTimer = setTimeout(commit, 400);
+                });
+                ta.addEventListener('blur', () => {
+                    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+                    commit();
+                });
+            });
+        }
 
         // ==== 시스템 프롬프트 탭 ====
         // 잠금 토글: 채팅·배치 활성 프롬프트 동기화
