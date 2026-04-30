@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.40
+// @version      0.7.41
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.40)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.41)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.40';
+    const SCRIPT_VERSION = '0.7.41';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -1877,6 +1877,7 @@
             includePrompts = false,
             includeBatchRuns = false,
             includeOverrides = false,
+            includeCategoryGuidelines = false, // v0.7.41: 카테고리 가이드라인 22개 슬롯 백업
             stripRawSegments = true, // batch run의 무거운 raw 섹션 기본 제거
             redactPromptContent = true, // v0.7.26 #C5-P1-16: 기본 redact, 명시적으로 false 줄 때만 raw
         } = opts;
@@ -1906,6 +1907,11 @@
                 }
             } catch { data.batchRuns = {}; }
         }
+        // v0.7.41: 카테고리 가이드라인 (원본 그대로 명시적 포함 시에만).
+        if (includeCategoryGuidelines) {
+            try { data.categoryGuidelines = loadCategoryGuidelines(); } catch { data.categoryGuidelines = {}; }
+            try { data.categoryGuidelinesEnabled = loadCategoryGuidelinesEnabled(); } catch { data.categoryGuidelinesEnabled = true; }
+        }
         return JSON.stringify(data, null, 2);
     }
 
@@ -1917,6 +1923,7 @@
             restorePrompts = false,
             restoreOverrides = false,
             restoreBatchRuns = false,
+            restoreCategoryGuidelines = false, // v0.7.41
             mergeSessions = false, // true면 기존 세션에 병합, false면 덮어쓰기
             mergeOverrides = false,
             mergeBatchRuns = false,
@@ -1927,8 +1934,9 @@
         const hasPrompts = !!data.prompts;
         const hasOverrides = !!data.overrides;
         const hasBatchRuns = !!data.batchRuns;
-        if (!hasSessions && !hasPrompts && !hasOverrides && !hasBatchRuns) {
-            throw new Error('잘못된 형식: sessions/prompts/overrides/batchRuns 중 하나도 없습니다.');
+        const hasCategoryGuidelines = data.categoryGuidelines !== undefined; // v0.7.41
+        if (!hasSessions && !hasPrompts && !hasOverrides && !hasBatchRuns && !hasCategoryGuidelines) {
+            throw new Error('잘못된 형식: sessions/prompts/overrides/batchRuns/categoryGuidelines 중 하나도 없습니다.');
         }
 
         // v0.7.35 (#D9-P1-4): pre-validation — 저장 전에 포맷 검증을 한근한 다음 저장 시작.
@@ -1965,6 +1973,7 @@
             _validatedPromptList = safe;
         }
 
+        let categoryGuidelinesCount = 0;
         let sessionsCount = 0;
         let promptsCount = 0;
         let overridesCount = 0;
@@ -2057,9 +2066,24 @@
             batchRunsCount = Object.keys(data.batchRuns).length;
         }
 
+        // v0.7.41: 카테고리 가이드라인 복원 (항상 overwrite). enabled 스위치도 같이 적용.
+        if (restoreCategoryGuidelines && hasCategoryGuidelines) {
+            const incoming = (data.categoryGuidelines && typeof data.categoryGuidelines === 'object' && !Array.isArray(data.categoryGuidelines))
+                ? data.categoryGuidelines : {};
+            const cgOk = saveCategoryGuidelines(incoming);
+            if (!cgOk) {
+                _rollbackImport('saveCategoryGuidelines 실패');
+                throw new Error('categoryGuidelines 저장 실패 — LS 용량 초과 가능성. 변경 사항은 롤백되었습니다.');
+            }
+            if (typeof data.categoryGuidelinesEnabled === 'boolean') {
+                try { saveCategoryGuidelinesEnabled(data.categoryGuidelinesEnabled); } catch (_) {}
+            }
+            categoryGuidelinesCount = Object.keys(incoming).length;
+        }
+
         return {
-            sessionsCount, promptsCount, overridesCount, batchRunsCount,
-            hasSessions, hasPrompts, hasOverrides, hasBatchRuns,
+            sessionsCount, promptsCount, overridesCount, batchRunsCount, categoryGuidelinesCount,
+            hasSessions, hasPrompts, hasOverrides, hasBatchRuns, hasCategoryGuidelines,
         };
     }
 
@@ -8479,7 +8503,9 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             <div class="tw-stat-title">📦 백업 · 복원</div>
             <div class="tw-ws-export-matrix" data-role="export-matrix">
                 <label><input type="checkbox" data-export-key="sessions" checked> 💬 세션 <span class="tw-ws-matrix-count" data-count="sessions"></span></label>
-                <label><input type="checkbox" data-export-key="prompts"> 📝 프롬프트 <span class="tw-ws-matrix-count" data-count="prompts"></span></label>
+                <label><input type="checkbox" data-export-key="prompts"> 📝 프롬프트 (제목만) <span class="tw-ws-matrix-count" data-count="prompts"></span></label>
+                <label title="프롬프트 본문까지 원본 포함. 공유/다른 기기로 이동 시 노출 주의."><input type="checkbox" data-export-key="promptContent"> ⚠ 프롬프트 본문 포함 (raw)</label>
+                <label><input type="checkbox" data-export-key="categoryGuidelines"> 🎨 카테고리 가이드라인 <span class="tw-ws-matrix-count" data-count="categoryGuidelines"></span></label>
                 <label><input type="checkbox" data-export-key="batchRuns"> 🧪 Batch Run <span class="tw-ws-matrix-count" data-count="batchRuns"></span></label>
                 <label><input type="checkbox" data-export-key="overrides"> ✂ Override <span class="tw-ws-matrix-count" data-count="overrides"></span></label>
                 <label title="batch run의 무거운 raw segment 제외 (권장)"><input type="checkbox" data-export-key="stripRaw" checked> raw segment 제외</label>
@@ -8598,13 +8624,24 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             const hideEmptyToggle = $('.tw-category-hide-empty-toggle', categoriesTab);
             const hideEmpty = !!(hideEmptyToggle && hideEmptyToggle.checked);
 
+            // v0.7.41 (버그 #1, #3): 재렬더 전 사용자가 직접 펼치거나 접은 open 상태를
+            //   완전 보존한다. 이전에는 innerHTML 재작성 시 filled 규칙으로 자동
+            //   되돌려서, 탭 재진입 또는 "명시적 빈 슬롯 숨김" 토글 시 사용자의
+            //   접음 상태가 잃는 문제가 있었다.
+            const _persistedOpen = categoriesTab._openState || (categoriesTab._openState = new Map());
+            // 현재 DOM이 있으면 최신 open 상태를 먼저 흥수한다 (toggle 이벤트를 놓친 케이스 대비).
+            $$('.tw-category-item', listEl).forEach(d => { _persistedOpen.set(d.dataset.id, d.open); });
+
             // ---- 슬롯 렌더 ----
             listEl.innerHTML = CATEGORY_CATALOG.map(cat => {
                 const v = map[cat.id] || { name: cat.name, content: '' };
                 const content = v.content || '';
                 const filled = content.trim().length > 0;
                 const isActive = activeIdSet.has(cat.id);
-                const open = (cat.id === 0 || filled) ? ' open' : '';
+                const idKey = String(cat.id);
+                const open = (_persistedOpen.has(idKey)
+                    ? _persistedOpen.get(idKey)
+                    : (cat.id === 0 || filled)) ? ' open' : '';
                 const badgeCls = filled ? 'is-filled' : 'is-empty';
                 const badgeChar = filled ? '●' : '○';
                 const len = content.length;
@@ -8631,6 +8668,12 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     </details>
                 `;
             }).join('');
+            // v0.7.41: 새로 렌더된 <details>에 toggle 이벤트를 붙여 사용자 접음/펼침을
+            //   _persistedOpen에 즉시 반영한다. (collapse-all / expand-all도 toggle이 발생함)
+            $$('.tw-category-item', listEl).forEach(d => {
+                _persistedOpen.set(d.dataset.id, d.open);
+                d.addEventListener('toggle', () => { _persistedOpen.set(d.dataset.id, d.open); });
+            });
             $$('.tw-category-content', listEl).forEach(ta => {
                 let saveTimer = null;
                 const commit = () => {
@@ -8705,7 +8748,8 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 });
                 const collapseBtn = $('.tw-btn-category-collapse-all', categoriesTab);
                 if (collapseBtn) collapseBtn.addEventListener('click', () => {
-                    $$('.tw-category-item', listEl).forEach(d => { if (d.dataset.id !== '0') d.open = false; });
+                    // v0.7.41 (버그 #2): 공통 카테고리(id=0)도 함께 접는다.
+                    $$('.tw-category-item', listEl).forEach(d => { d.open = false; });
                 });
             }
         }
@@ -9413,6 +9457,8 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             return {
                 sessions: get('sessions'),
                 prompts: get('prompts'),
+                promptContent: get('promptContent'),
+                categoryGuidelines: get('categoryGuidelines'),
                 batchRuns: get('batchRuns'),
                 overrides: get('overrides'),
                 stripRaw: get('stripRaw'),
@@ -9428,11 +9474,17 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             if (!exportMatrix) return;
             const ws = (() => { try { return getWorkspaceStats(); } catch { return null; } })();
             if (!ws) return;
+            let cgCount = 0;
+            try {
+                const cg = loadCategoryGuidelines();
+                cgCount = Object.keys(cg).filter(k => (cg[k]?.content || '').trim().length > 0).length;
+            } catch (_) {}
             const counts = {
                 sessions: ws.sessionCount,
                 prompts: ws.promptCount,
                 batchRuns: ws.runCount,
                 overrides: ws.overrideCount,
+                categoryGuidelines: cgCount,
             };
             for (const [k, v] of Object.entries(counts)) {
                 const el = exportMatrix.querySelector(`[data-count="${k}"]`);
@@ -9453,7 +9505,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
         $('.tw-btn-export-selected', overlay).addEventListener('click', () => {
             const m = getExportMatrix();
-            if (!m.sessions && !m.prompts && !m.batchRuns && !m.overrides) {
+            if (!m.sessions && !m.prompts && !m.batchRuns && !m.overrides && !m.categoryGuidelines) {
                 toast('백업할 항목을 1개 이상 선택하세요.', 'warn');
                 return;
             }
@@ -9462,11 +9514,14 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 includePrompts: m.prompts,
                 includeBatchRuns: m.batchRuns,
                 includeOverrides: m.overrides,
+                includeCategoryGuidelines: m.categoryGuidelines,
                 stripRawSegments: m.stripRaw,
+                redactPromptContent: !m.promptContent, // v0.7.41: 본문 포함 체크 시 raw
             });
             const parts = [];
             if (m.sessions) parts.push('s');
             if (m.prompts) parts.push('p');
+            if (m.categoryGuidelines) parts.push('c');
             if (m.batchRuns) parts.push('r');
             if (m.overrides) parts.push('o');
             const tag = parts.join('') || 'empty';
@@ -9474,7 +9529,8 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             downloadJson(json, fname);
             const labels = [];
             if (m.sessions) labels.push('세션');
-            if (m.prompts) labels.push('프롬프트');
+            if (m.prompts) labels.push(m.promptContent ? '프롬프트(raw)' : '프롬프트(제목)');
+            if (m.categoryGuidelines) labels.push('카테고리');
             if (m.batchRuns) labels.push('run');
             if (m.overrides) labels.push('override');
             toast(`백업 다운로드: ${labels.join(' + ')}` + (m.batchRuns && m.stripRaw ? ' (raw 제외)' : ''), 'success');
@@ -9484,11 +9540,11 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             btn.addEventListener('click', () => {
                 const preset = btn.getAttribute('data-preset');
                 if (preset === 'sessions') {
-                    setExportMatrix({ sessions: true, prompts: false, batchRuns: false, overrides: false });
+                    setExportMatrix({ sessions: true, prompts: false, promptContent: false, categoryGuidelines: false, batchRuns: false, overrides: false });
                 } else if (preset === 'sessions+prompts') {
-                    setExportMatrix({ sessions: true, prompts: true, batchRuns: false, overrides: false });
+                    setExportMatrix({ sessions: true, prompts: true, promptContent: false, categoryGuidelines: false, batchRuns: false, overrides: false });
                 } else if (preset === 'workspace') {
-                    setExportMatrix({ sessions: true, prompts: true, batchRuns: true, overrides: true });
+                    setExportMatrix({ sessions: true, prompts: true, promptContent: true, categoryGuidelines: true, batchRuns: true, overrides: true });
                 }
                 toast(`프리셋 적용: ${btn.textContent.trim()}`, 'info');
             });
@@ -9517,14 +9573,18 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 const hasPrompts = !!preview.prompts;
                 const hasOverrides = !!preview.overrides; // v0.7.8 (#2)
                 const hasBatchRuns = !!preview.batchRuns; // v0.7.8 (#2)
+                const hasCategoryGuidelines = preview.categoryGuidelines !== undefined; // v0.7.41
                 const sessionCount = hasSessions ? Object.keys(preview.sessions).length : 0;
                 const promptCount = hasPrompts ? preview.prompts.length : 0;
                 const overrideCount = hasOverrides
                     ? Object.values(preview.overrides).reduce((s, b) => s + Object.keys(b || {}).length, 0)
                     : 0;
                 const batchRunCount = hasBatchRuns ? Object.keys(preview.batchRuns).length : 0;
+                const categoryGuidelineCount = hasCategoryGuidelines
+                    ? Object.keys(preview.categoryGuidelines || {}).filter(k => (preview.categoryGuidelines[k]?.content || '').trim().length > 0).length
+                    : 0;
 
-                if (!hasSessions && !hasPrompts && !hasOverrides && !hasBatchRuns) {
+                if (!hasSessions && !hasPrompts && !hasOverrides && !hasBatchRuns && !hasCategoryGuidelines) {
                     toast('유효하지 않은 백업 파일입니다.', 'error');
                     importFileInput.value = '';
                     return;
@@ -9540,6 +9600,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 const previewLines = [];
                 if (hasSessions) previewLines.push(fmtDiff('세션', sessionCount, diff && diff.sessions));
                 if (hasPrompts) previewLines.push(fmtDiff('프롬프트', promptCount, diff && diff.prompts));
+                if (hasCategoryGuidelines) previewLines.push(`• 카테고리 가이드라인 ${categoryGuidelineCount}개`);
                 if (hasBatchRuns) previewLines.push(fmtDiff('batch run', batchRunCount, diff && diff.batchRuns));
                 if (hasOverrides) previewLines.push(fmtDiff('override entry', overrideCount, diff && diff.overrides));
 
@@ -9552,6 +9613,18 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                             `\n\n프롬프트도 함께 복원하시겠습니까?`,
                         confirmLabel: '세션 + 프롬프트',
                         cancelLabel: '세션만',
+                    });
+                }
+
+                // v0.7.41: 카테고리 가이드라인 복원 여부
+                let restoreCategoryGuidelines = false;
+                if (hasCategoryGuidelines) {
+                    restoreCategoryGuidelines = await twConfirm({
+                        title: '카테고리 가이드라인 복원',
+                        message: `이 백업에는 카테고리 가이드라인 ${categoryGuidelineCount}개가 있습니다.\n\n기존 22개 슬롯은 통째로 덮어쓰여집니다.\n복원하시겠습니까?`,
+                        confirmLabel: '복원',
+                        cancelLabel: '건너뜀',
+                        danger: true,
                     });
                 }
 
@@ -9596,11 +9669,13 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     restorePrompts: restorePrompts,
                     restoreOverrides: restoreOverrides,
                     restoreBatchRuns: restoreBatchRuns,
+                    restoreCategoryGuidelines: restoreCategoryGuidelines,
                 });
 
                 const parts = [];
                 if (result.sessionsCount > 0) parts.push(`세션 ${result.sessionsCount}개`);
                 if (result.promptsCount > 0) parts.push(`프롬프트 ${result.promptsCount}개`);
+                if (result.categoryGuidelinesCount > 0) parts.push(`카테고리 ${result.categoryGuidelinesCount}개`);
                 if (result.batchRunsCount > 0) parts.push(`batch run ${result.batchRunsCount}개`);
                 if (result.overridesCount > 0) parts.push(`override ${result.overridesCount}개`);
                 toast(`복원 완료: ${parts.join(', ')}`, 'success');
@@ -9610,6 +9685,10 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 if (result.promptsCount > 0) {
                     renderAllPromptSelects(modalEl);
                     refresh(); // 프롬프트 편집 화면도 갱신
+                }
+                // v0.7.41: 카테고리 가이드라인 복원 시 settings 패널도 갱신
+                if (result.categoryGuidelinesCount > 0) {
+                    try { refreshExportMatrixCounts(); } catch (_) {}
                 }
             } catch (err) {
                 toast('복원 실패: ' + err.message, 'error');
