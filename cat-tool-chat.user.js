@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.43
+// @version      0.7.44
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.43)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.44)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.43';
+    const SCRIPT_VERSION = '0.7.44';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -2510,10 +2510,81 @@
         phase3: 'Phase 2 — 번역',
         phase45: 'Phase 3 — 검수',
     };
+    // v0.7.44: 모든 Phase 슬롯 위에 자동 prepend되는 코드 고정 frame.
+    //   역할 1줄 + 하드 출력 규칙(5 safety guarantees). 슬롯 본문에서 중복 작성 금지.
+    //   frame은 LS에 저장되지 않고 코드 업데이트로만 변한다.
+    const BATCH_PHASE_FRAME = [
+        '# 역할',
+        '너는 중국어(zh-Hans) → 한국어(ko) 게임 번역 전문가다. 아래 단계 지시에 따라 작업한다.',
+        '',
+        '# 하드 출력 규칙 (모든 응답에 항상 적용)',
+        '1. 출력은 단일 JSON 한 개만 허용. markdown 헤더, 설명문, ```json 펜스, 추가 텍스트 금지.',
+        '2. 응답 JSON의 모든 id는 입력 "Allowed IDs" 안의 값과 정확히 일치해야 한다. 누락·추가·추정 ID 금지.',
+        '3. placeholder, HTML/XML 태그, 변수 토큰, 숫자, URL은 원문을 1:1 보존한다.',
+        '4. 입력에서 지정한 attempt_id를 응답 JSON 최상위에 "attempt_id" 필드로 그대로 복사한다.',
+        '5. 본문 외 reason, summary, notes, warnings, next_step 등 자유 서술 필드 금지. (스키마에 정의된 것만 허용)',
+    ].join('\n');
+    // v0.7.44: 디폴트 시드 — 사용자가 슬롯을 비워두면 이 본문이 사용된다.
+    //   Frame과 builder의 extraBlocks(스키마/Allowed IDs/직전 raw)와 결합되어 최종 프롬프트가 된다.
+    //   기존 monolith(~9.4k chars)와 달리 phase별로만 필요한 지시만 담는다.
     const BATCH_PHASE_PROMPT_DEFAULTS = {
-        phase12: '',
-        phase3: '',
-        phase45: '',
+        phase12: [
+            '# Phase 1 — 세그먼트 분석 및 그룹화',
+            '',
+            '## 목표',
+            '- 각 세그먼트의 도메인 카테고리를 0~21 범위에서 1~3개 선정한다.',
+            '- 같은 톤/카테고리/규칙 묶음을 갖는 세그먼트들을 group으로 묶는다.',
+            '- 이 단계에서는 분석/그룹화만 수행. 번역, 검수, 자유 서술은 금지.',
+            '',
+            '## 카테고리 가이드',
+            '- 0번은 공통(항상 활성)이며, 1~21번은 도메인별(UI/시스템, NPC 대사, 아이템명, 스킬 설명, 미션, 도움말, 약관 등).',
+            '- 활성 카테고리는 Phase 2/3 단계에서 본문이 자동 주입된다. 여기서는 cats 배열로 id만 선정.',
+            '',
+            '## 그룹화 규칙',
+            '- 같은 화면/창(UI area), 같은 화자, 같은 출력 매체끼리 묶는다.',
+            '- group마다 tone(formal_mail / colloquial / system_terse / lore_narrative / button_label 등), rules("preserve_placeholders", "use_tb_terms" 등)를 명시한다.',
+            '- 备注(col8/col9)에 placeholder 매핑이 있으면 group rules에 "preserve_placeholders" 추가.',
+            '- 모든 Allowed IDs는 정확히 하나의 group.ids에 속해야 한다.',
+        ].join('\n'),
+        phase3: [
+            '# Phase 2 — 한국어 번역',
+            '',
+            '## 목표',
+            '- Phase 1 그룹 전략과 활성 카테고리 가이드라인을 따라 한국어 번역을 생성한다.',
+            '- 카테고리 분류, 그룹 구조는 Phase 1 결과를 그대로 사용. 새로 분석하지 마라.',
+            '',
+            '## 우선순위',
+            '1. TB 사전 용어가 있으면 그대로 사용 (대소문자/공백/구두점 정확히).',
+            '2. placeholder({0}, %s, %d, <color>, <br>, &lt;...&gt;, 숫자, URL 등)는 원문 위치/형태/개수 1:1 보존.',
+            '3. 글자수 제한이 지정된 세그먼트는 한국어 결과도 한도 내로.',
+            '4. 그룹 tone과 활성 카테고리 가이드라인을 적용.',
+            '5. 의역은 의미·뉘앙스 보존 한도에서만 허용.',
+            '',
+            '## 금지',
+            '- 설명문, 주석, 영어 번역 혼입.',
+            '- placeholder 임의 생성/제거/순서 변경.',
+            '- 카테고리 재분류 또는 그룹 재구성.',
+            '- 한 세그먼트에 여러 번역 후보 나열 (단일 t만 출력).',
+        ].join('\n'),
+        phase45: [
+            '# Phase 3 — 번역 검수',
+            '',
+            '## 목표',
+            '- Phase 2 번역을 점검해 필요할 때만 수정한다. 처음부터 다시 번역하지 마라.',
+            '- 문제 없으면 {"t": null, "r": []}. 수정이 필요할 때만 t에 최종 한국어, r에 사유 코드 배열.',
+            '',
+            '## 점검 항목 (체크리스트)',
+            '- term: TB 사전 용어 일치 / 누락된 사전 용어 적용',
+            '- placeholder: 토큰 위치·개수·형태가 원문과 동일',
+            '- style: 그룹 tone, 활성 카테고리 가이드라인 충족',
+            '- char_limit: 글자수 한도 초과 여부',
+            '- grammar: 한국어 어법, 띄어쓰기, 종결어미 일관성',
+            '',
+            '## 출력 규칙',
+            '- r은 위 5개 코드만 사용 (term / placeholder / style / char_limit / grammar). 자유 서술 금지.',
+            '- t는 한국어 번역만. 설명, 영어 표기, 메타 정보 혼입 금지.',
+            '- placeholder/숫자/URL은 Phase 2 결과의 원문 토큰을 그대로 유지.',
+        ].join('\n'),
     };
     function _normalizeBatchPhasePromptSlot(slot) {
         return BATCH_PHASE_SLOT_KEYS.includes(slot) ? slot : null;
@@ -3629,10 +3700,14 @@
 
     function getWorkflowBasePrompt(phaseTag) {
         // v0.7.43: Phase별 사용자 슬롯이 있으면 그 본문을 사용, 없으면 기존 chat 프롬프트로 폴백.
+        // v0.7.44: 슬롯 본문(또는 디폴트 시드) 위에 BATCH_PHASE_FRAME을 항상 prepend.
+        //   레거시 폴백(chat 프롬프트) 경로에서는 frame을 끼우지 않는다 — 폴백 본문이 이미 자체 frame을 포함한 monolith라고 가정.
         const slot = phaseTagToSlot(phaseTag);
         if (slot) {
             const slotBody = (getBatchPhasePrompt(slot) || '').trim();
-            if (slotBody) return slotBody;
+            if (slotBody) {
+                return `${BATCH_PHASE_FRAME}\n\n${slotBody}`;
+            }
         }
         const activePrompt = getBatchActivePrompt();
         const content = activePrompt?.content || '';
@@ -3674,13 +3749,11 @@
     function buildBatchPhasePrompt(phaseTag, run, extraBlocks, finalInstruction, attemptId) {
         const tbSummaryBlock = formatBatchTbSummary(run.tbSummary || buildBatchTbSummary(run.segments));
         // v0.7.33 (#D7-P1-2): attempt_id echo 강제.
-        //   응답 JSON 최상위에 attempt_id를 복사하도록 명시. 검증은 waitForExpectedBatchResult.
+        // v0.7.44: Frame 규칙 #4가 attempt_id echo 의무를 이미 명시하므로 이 블록은 1줄 알림으로 축약.
+        //   builder는 [ATTEMPT_ID: x] 마커와 짧은 reminder만 남긴다.
         const attemptBlock = attemptId ? [
             '',
-            '# 응답 식별 (필수)',
-            `이 실행의 attempt_id는 "${attemptId}"입니다.`,
-            '출력 JSON의 최상위에 반드시 "attempt_id" 필드를 추가하고 위 값을 그대로 복사하세요.',
-            `예: {"phase": "${phaseTag}", "attempt_id": "${attemptId}", ...}`,
+            `# attempt_id 강제: 응답 JSON 최상위에 "attempt_id":"${attemptId}"를 그대로 복사 (Frame 규칙 #4).`,
         ] : [];
         // v0.7.38 (#D12): Phase 3/4+5에 한해 활성 카테고리 가이드라인을 주입.
         //   Phase 1+2는 카테고리 자체를 결정하는 단계라 주입하지 않는다.
