@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.22
+// @version      0.7.23
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.22)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.23)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.22';
+    const SCRIPT_VERSION = '0.7.23';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -68,6 +68,7 @@
         SCHEMA_VERSION: 'tms_workflow_schema_version', // v0.7.7 (#10): LS 스키마 버전 가드 (정수). 향후 마이그레이션 분기점.
         BACKUP_NEXT_SLOT: 'tms_workflow_backup_next_slot', // v0.7.7 (#12): IDB ring 안의 다음 쓸 slot 인덱스 (0..N-1)
         OVERRIDE_WRITE_COUNTER: 'tms_workflow_override_write_counter', // v0.7.7 (#12): override 쓰기 누적 카운터 (threshold마다 backup trigger)
+        SESSION_WRITE_COUNTER: 'tms_workflow_session_write_counter', // v0.7.23 (#C2-P1-13): 세션 쓰기 누적 카운터
         ACTIVITY_LOG: 'tms_workflow_activity_log_v1', // v0.7.11: Activity ring (감사 로그). 메모리 + LS 동기화.
     };
 
@@ -86,6 +87,8 @@
     const BACKUP_STORE = 'snapshots';
     const BACKUP_SLOT_COUNT = 5;
     const OVERRIDE_BACKUP_THRESHOLD = 10;
+    // v0.7.23 (#C2-P1-13): 세션 쓰기 누적 N회마다 자동 백업. override 보다 빈도가 높아서 threshold는 크게.
+    const SESSION_BACKUP_THRESHOLD = 30;
 
     const DEFAULT_PROMPT = {
         id: 'default',
@@ -186,8 +189,26 @@
     }
 
     function lsGet(key, def = null) {
-        try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : def; }
-        catch { return def; }
+        // v0.7.23 (#C2-P1-15): 손상된 JSON을 식별해서 격리소로 옮긴다.
+        //   default 만 넘겨 조용히 더팝해 원소실되는 패턴을 차단.
+        let raw = null;
+        try { raw = localStorage.getItem(key); } catch { return def; }
+        if (raw == null || raw === '') return def;
+        try { return JSON.parse(raw); }
+        catch (e) {
+            try {
+                const quarantineKey = `__tms_corrupted_${key}_${Date.now()}`;
+                localStorage.setItem(quarantineKey, raw);
+                console.error('[TMS Workflow] LS 손상 감지', key, '→', quarantineKey, e);
+                if (typeof logActivity === 'function') {
+                    logActivity('error', `LS 손상 격리: ${key} → ${quarantineKey}`, { len: raw.length, head: String(raw).slice(0, 80) });
+                }
+                if (typeof toast === 'function') {
+                    try { toast(`${key} 데이터 손상 — 원본은 ${quarantineKey}에 보관. 워크스페이스 탭 > IDB 슬롯에서 복원하세요.`, 'error'); } catch {}
+                }
+            } catch (_) {}
+            return def;
+        }
     }
     // v0.7.18 (#4): 저장 성공/실패 반환.
     //   호출부에서 quota 등 실패를 감지해 UI/토스트로 올릴 수 있도록.
@@ -1288,7 +1309,9 @@
     // §7  세션 관리 (TTL 기반 자동 정리 + 수동 관리)
     // ========================================================================
     function loadSessions() {
-        return lsGet(LS_KEYS.SESSIONS, {});
+        const v = lsGet(LS_KEYS.SESSIONS, {});
+        // v0.7.23 (#C2-P1-28): 타입 가드 — 부패당한 구조 시 기본값으로 폴백.
+        return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
     }
     function saveSessions(sessions) {
         // v0.7.21 (#B2): 저장 성공/실패를 호출부에 전파.
@@ -1302,7 +1325,12 @@
         const sessions = loadSessions();
         session.updated = Date.now(); // 마지막 업데이트 시각 기록
         sessions[stringId] = session;
-        saveSessions(sessions);
+        const ok = saveSessions(sessions);
+        // v0.7.23 (#C2-P1-13): 세션 쓰기 누적 카운터 — N회마다 backup trigger.
+        if (ok) {
+            try { _bumpSessionWriteCounter(); } catch (e) { dwarn('session backup counter bump 실패', e); }
+        }
+        return ok;
     }
     function clearSession(stringId) {
         const sessions = loadSessions();
@@ -1584,6 +1612,7 @@
             LS_KEYS.APPLIED_FROM_BATCH,
             LS_KEYS.REVIEW_OVERRIDES,
             LS_KEYS.OVERRIDE_WRITE_COUNTER,
+            LS_KEYS.SESSION_WRITE_COUNTER,
             LS_KEYS.BACKUP_NEXT_SLOT,
             LS_KEYS.COMPACT_MODE,
         ];
@@ -1895,6 +1924,19 @@
         }
     }
 
+    // v0.7.23 (#C2-P1-13): 세션 쓰기 N회마다 백업 trigger.
+    //   원래 override 변경만 카운트해서 chat-only 워크플로우에서는 백업이 안 돌았음.
+    function _bumpSessionWriteCounter() {
+        const cur = Number(lsGet(LS_KEYS.SESSION_WRITE_COUNTER, 0)) || 0;
+        const next = cur + 1;
+        if (next >= SESSION_BACKUP_THRESHOLD) {
+            lsSet(LS_KEYS.SESSION_WRITE_COUNTER, 0);
+            triggerBackupAsync('session-batch');
+        } else {
+            lsSet(LS_KEYS.SESSION_WRITE_COUNTER, next);
+        }
+    }
+
     // v0.7.18 (#2): 복원된 run은 segments가 빠져 있어 재실행 가드(L5258 phase12Btn disable)로 막힌다.
     //   사용자에게 "이 run은 복원본 — 결과 보관용"이라고 한 눈에 보이게 run에 플래그 주입.
     //   header 칩은 renderBatchRunHeader에서 렌더링.
@@ -2022,7 +2064,8 @@
     // ========================================================================
     function loadPrompts() {
         const prompts = lsGet(LS_KEYS.SYSTEM_PROMPTS);
-        if (!prompts || !prompts.length) {
+        // v0.7.23 (#C2-P1-28): 대상 타입은 배열. 객체/부패당 경우 기본값으로.
+        if (!Array.isArray(prompts) || prompts.length === 0) {
             lsSet(LS_KEYS.SYSTEM_PROMPTS, [DEFAULT_PROMPT]);
             return [DEFAULT_PROMPT];
         }
@@ -2272,7 +2315,9 @@
     // 리뷰 탭 인라인 수정 override (run+id 키, phase 데이터는 불변 유지)
     // ========================================================================
     function loadReviewOverrides() {
-        return lsGet(LS_KEYS.REVIEW_OVERRIDES, {});
+        const v = lsGet(LS_KEYS.REVIEW_OVERRIDES, {});
+        // v0.7.23 (#C2-P1-28): 객체 구조 가드.
+        return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
     }
     function saveReviewOverrides(map) {
         // v0.7.21 (#B2): 저장 성공/실패를 호출부에 전파.
@@ -2677,7 +2722,9 @@
     // §15 Batch workflow state + prompt builders
     // ========================================================================
     function loadBatchRuns() {
-        return lsGet(LS_KEYS.BATCH_RUNS, {});
+        const v = lsGet(LS_KEYS.BATCH_RUNS, {});
+        // v0.7.23 (#C2-P1-28): 객체 구조 가드.
+        return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
     }
 
     function saveBatchRuns(runs, opts = {}) {
