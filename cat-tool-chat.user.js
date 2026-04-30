@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.24
+// @version      0.7.25
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.24)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.25)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.24';
+    const SCRIPT_VERSION = '0.7.25';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -745,18 +745,18 @@
     // 세 스크립트 중 하나라도 수정하면 나머지 두 곳도 함께 갱신한다.
     // 커버:
     //   - {value1}, {0}, {한글}, {value-1}, {user.name} 등 중괄호 플레이스홀더
-    //   - %1$s, %2$d, %1$@ 등 위치적 printf
-    //   - %@, %s, %d 등 단순 printf
+    //   - %1$s, %2$d, %1$@, %1$i, %1$f 등 위치적 printf (v0.7.25 #C4-P2-22: i/f 추가)
+    //   - %@, %s, %d, %i, %f, %05d, %3.2f 등 단순 printf + width spec (v0.7.25 #C4-P2-22)
     //   - \n, \r, \t 이스케이프 시퀀스
     //   - <br>, <color=...>, <b>, <size=N>, <sprite=N> 등 임의 HTML/Unity rich text 태그
     //   - [color=#...], [b], [url=...], [sprite] 등 임의 BBCode 태그
     const TOKEN_PATTERN = new RegExp(
         '\\{[^{}]+\\}'                  // 중괄호 플레이스홀더
-        + '|%\\d+\\$[sd@]'              // 위치적 printf
-        + '|%[@sd]'                       // 단순 printf
+        + '|%\\d+\\$[sdif@]'           // 위치적 printf (i/f 포함)
+        + '|%[0-9]*(?:\\.[0-9]+)?[sdif@]' // 단순 printf + width/precision (i/f 포함)
         + '|\\\\[nrt]'                  // \n \r \t 리터럴
         + '|</?[a-zA-Z][^>]*>'            // 임의 HTML/Unity rich text
-        + '|\\[/?[a-zA-Z][^\\]]*\\]'   // 임의 BBCode
+        + '|\\[/?[a-zA-Z][^\\]]*\\]'  // 임의 BBCode
     , 'g');
 
     function extractPlaceholders(text) {
@@ -991,11 +991,14 @@
     // - charLimitOver: segment.char_limit이 있을 때 final 길이가 limit 초과 (없으면 origin_string 길이 * 2.5 + 30 임시 cap)
     // - placeholderOrderMismatch: source/target placeholder 출현 순서가 다름
     // - tbTermsMissed: tbTerms Map에 source가 있지만 final이 target을 포함하지 않음
-    function computeTranslationWarnings(items, sourceById, tbTerms) {
+    function computeTranslationWarnings(items, sourceById, tbTerms, opts = {}) {
         const charLimitOver = [];
         const placeholderOrderMismatch = [];
         const tbTermsMissed = [];
         const tb = tbTerms instanceof Map ? tbTerms : null;
+        // v0.7.25 (#C4-P2-23): TB 매칭 옥션. 기본값은 기존 동작 유지 (case-sensitive, minLen=1).
+        const tbCaseSensitive = opts.tbCaseSensitive !== false;
+        const tbMinLen = Number.isFinite(opts.tbMinLen) && opts.tbMinLen > 0 ? opts.tbMinLen : 1;
 
         for (const item of items) {
             if (typeof item.t !== 'string' || !item.t) continue;
@@ -1041,11 +1044,17 @@
             }
 
             // tb terms
+            // v0.7.25 (#C4-P2-23): caseSensitive/minLen 옥션 적용. 기본은 기존 동작.
             if (tb && tb.size && src) {
+                const haystackSrc = tbCaseSensitive ? src : src.toLowerCase();
+                const haystackDst = tbCaseSensitive ? finalText : finalText.toLowerCase();
                 const missed = [];
                 for (const [srcTerm, dstTerm] of tb) {
                     if (!srcTerm || !dstTerm) continue;
-                    if (src.includes(srcTerm) && !finalText.includes(dstTerm)) {
+                    if (srcTerm.length < tbMinLen) continue;
+                    const needleSrc = tbCaseSensitive ? srcTerm : srcTerm.toLowerCase();
+                    const needleDst = tbCaseSensitive ? dstTerm : dstTerm.toLowerCase();
+                    if (haystackSrc.includes(needleSrc) && !haystackDst.includes(needleDst)) {
                         missed.push({ src: srcTerm, expected: dstTerm });
                     }
                 }
@@ -1103,12 +1112,14 @@
             }
         }
 
+        // v0.7.25 (#C4-P2-24): \p{Script=Han}/u로 교체 — CJK Extensions A-G까지 커버.
+        //   기존 [\u4e00-\u9fff]는 BMP CJK 일부(Basic)만 감지 가능했다.
         const hanjaLike = translations
-            .filter(item => typeof item.t === 'string' && /[\u4e00-\u9fff]/.test(item.t))
+            .filter(item => typeof item.t === 'string' && /\p{Script=Han}/u.test(item.t))
             .map(item => normalizeId(item.id));
 
         // warn-only 추가 검증 (ok에 영향 없음)
-        const warnings = computeTranslationWarnings(translations, sourceById, options.tbTerms);
+        const warnings = computeTranslationWarnings(translations, sourceById, options.tbTerms, options.tbMatch);
 
         return {
             ok: phase3Compact?.phase === '3' &&
@@ -1126,6 +1137,8 @@
             missingPlaceholders,
             extraPlaceholders,
             hanjaLike,
+            // v0.7.25 (#C4-P2-23): TB 누락 요약 (warn-only 공개) — ok에는 영향 없음.
+            tbMissing: warnings.tbTermsMissed || [],
             warnings,
         };
     }
@@ -1204,8 +1217,9 @@
             }
         }
 
+        // v0.7.25 (#C4-P2-24): \p{Script=Han}/u로 교체 (Phase 4+5).
         const hanjaLike = revisions
-            .filter(item => /[\u4e00-\u9fff]/.test(finalTextById.get(normalizeId(item.id)) || ''))
+            .filter(item => /\p{Script=Han}/u.test(finalTextById.get(normalizeId(item.id)) || ''))
             .map(item => normalizeId(item.id));
 
         // \uc0ac\uc2e4\uc0c1 no-op\uc744 \uc81c\uc678\ud55c \uc2e4\uc81c \ubcc0\uacbd \uac74\uc218
@@ -1213,7 +1227,7 @@
 
         // warn-only 추가 검증 (final 텍스트 기준)
         const warnInputs = revisions.map(item => ({ id: normalizeId(item.id), gid: item.gid, t: finalTextById.get(normalizeId(item.id)) || '' }));
-        const warnings = computeTranslationWarnings(warnInputs, sourceById, options.tbTerms);
+        const warnings = computeTranslationWarnings(warnInputs, sourceById, options.tbTerms, options.tbMatch);
 
         return {
             ok: phase45Compact?.phase === '4+5' &&
@@ -1235,6 +1249,8 @@
             missingPlaceholders,
             extraPlaceholders,
             hanjaLike,
+            // v0.7.25 (#C4-P2-23): TB 누락 요약 (warn-only 공개).
+            tbMissing: warnings.tbTermsMissed || [],
             changedCount,
             warnings,
         };
@@ -5082,6 +5098,8 @@
         // v0.7.19 (#4): extra placeholder 게이트 사유도 요약에 노출
         if (validation.extraPlaceholders?.length) tokens.push(`플레이스홀더 추가 ${validation.extraPlaceholders.length}`);
         if (validation.hanjaLike?.length) tokens.push(`한자 잔존 ${validation.hanjaLike.length}`);
+        // v0.7.25 (#C4-P2-23): TB 누락도 요약 칩으로 노출 (warn-only — ok 제약 없음).
+        if (validation.tbMissing?.length) tokens.push(`TB 누락 ${validation.tbMissing.length}`);
         // Phase 4+5 전용
         if (validation.missingTField?.length) tokens.push(`t 필드 ${validation.missingTField.length}`);
         if (validation.invalidTType?.length) tokens.push(`t 타입 ${validation.invalidTType.length}`);
