@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.21
+// @version      0.7.22
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.21)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.22)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.21';
+    const SCRIPT_VERSION = '0.7.22';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -469,7 +469,15 @@
         const { projectId, fileId, languageId } = getUrlParams();
         const url = `/api/translate/strings/?id=${stringId}&project=${projectId}&target_language=${languageId}&file=${fileId}`;
         const data = await apiJson(url);
-        return data.data?.[0] || null;
+        const seg = data.data?.[0] || null;
+        // v0.7.22 (#C1-P0-2): 서버 응답이 요청한 stringId와 다른 세그먼트면 폐기.
+        //   nonce echo 가 없는 환경에서 stale/cross response 의 1차 방어선.
+        const segId = seg?.id ?? seg?.string_id ?? seg?.stringId;
+        if (segId != null && String(segId) !== String(stringId)) {
+            dwarn('fetchSegmentDetail: id 불일치 — 응답 폐기', { requested: stringId, got: segId });
+            return null;
+        }
+        return seg;
     }
 
     async function callPrefixPromptTran(projectId, stringId, prefixPrompt, model) {
@@ -6946,6 +6954,9 @@
     }
 
     async function loadSegmentInfo(stringId) {
+        // v0.7.22 (#C1-P1-7): 빠른 세그먼트 전환 시 동시 로드 race 방지.
+        //   token + stringId 둘 다 검증해야 같은 세그먼트로 빠르게 다시 들어왔을 때도 안전.
+        const token = ++loadSegmentInfo._token;
         const infoEl = $('.tw-seg-info', modalEl);
         const contentEl = $('.tw-context-content', modalEl);
         infoEl.textContent = `#${stringId} 정보 로딩 중…`;
@@ -6953,6 +6964,10 @@
 
         try {
             const seg = await fetchSegmentDetail(stringId);
+            if (token !== loadSegmentInfo._token || stringId !== currentStringId) {
+                dverbose('loadSegmentInfo stale 폐기', { stringId, current: currentStringId });
+                return;
+            }
             if (!seg) {
                 contentEl.innerHTML = '<span class="tw-muted">세그먼트 정보를 불러오지 못했습니다.</span>';
                 return;
@@ -7031,9 +7046,11 @@
 
             contentEl.innerHTML = sections.join('');
         } catch (e) {
+            if (token !== loadSegmentInfo._token) return;
             contentEl.innerHTML = `<span class="tw-muted">오류: ${escapeHtml(e.message)}</span>`;
         }
     }
+    loadSegmentInfo._token = 0;
 
     // ========================================================================
     // §19 채팅 흐름
@@ -7202,9 +7219,12 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             progressMsg.classList.remove('tw-msg-progress');
             $('.tw-msg-content', progressMsg).textContent = result;
 
-            // 세션에 AI 응답 저장 (snapshot 기준 — 항상 원래 세그먼트 세션에 저장)
-            session.messages.push({ role: 'ai', content: result });
-            setSession(requestStringId, session);
+            // v0.7.22 (#C1-P1-10): 세션을 재로딩해서 push — 그 사이에 사용자가
+            //   같은 세그먼트에 새 메시지를 더 쌓았을 수 있으므로. (sendBtn은 한 번에 하나만
+            //   돌아가지만, 외부 경로—batch chat seed/import—로 세션이 변경될 수 있음)
+            const freshSession = getSession(requestStringId);
+            freshSession.messages.push({ role: 'ai', content: result });
+            setSession(requestStringId, freshSession);
 
             // v0.7.18 (#1): UI/segment 변경은 still 같은 세그먼트일 때만.
             //   세그먼트가 바뀐 경우는 저장만 하고 UI 갱신/segment mutation 생략.
