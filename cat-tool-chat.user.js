@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.32
+// @version      0.7.33
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.32)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.33)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -31,12 +31,12 @@
     //   §13 batch → chat 시드 (importBatchResultToChat)        ............ ~2775
     //   §14 컨텍스트 수집 / 프롬프트 조립 (§14a/§14b)         ............ ~2860
     //   §15 Batch workflow state + prompt builders             ............ ~2933
-    //   §16 모달 UI (HTML 템플릿 + CSS)                        ............ ~3466
-    //   §17 이벤트 핸들러 (배치/리뷰/세션/워크스페이스)        ............ ~4752
-    //   §18 모달 Show/Hide + 세그먼트 자동 감지                ............ ~7249
-    //   §19 채팅 흐름                                          ............ ~7442
-    //   §20 시스템 프롬프트/설정 패널 (모달 우측)              ............ ~7829
-    //   §21 단축키 등록 (Alt+Z) + 디버그 export                ............ ~8905
+    //   §16 모달 UI (HTML 템플릿 + CSS)                        ............ ~3515
+    //   §17 이벤트 핸들러 (배치/리뷰/세션/워크스페이스)        ............ ~4801
+    //   §18 모달 Show/Hide + 세그먼트 자동 감지                ............ ~7316
+    //   §19 채팅 흐름                                          ............ ~7509
+    //   §20 시스템 프롬프트/설정 패널 (모달 우측)              ............ ~7896
+    //   §21 단축키 등록 (Alt+Z) + 디버그 export                ............ ~8972
     // ========================================================================
     // 버전 주석 정책 (v0.7.15~):
     //   - v0.7.x : 변경 맥락이 살아있을 동안 inline 유지
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.32';
+    const SCRIPT_VERSION = '0.7.33';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -2994,6 +2994,17 @@
         return `${stamp}${ms}-p${pid}-f${fid}-l${lid}-${rand}`;
     }
 
+    // v0.7.33 (#D7-P1-2): attempt_id echo용 식별자 생성.
+    //   onRunBatchPhase 매 실행마다 새로 발급하고 prompt에 주입한다. LLM이 응답 JSON
+    //   최상위에 attempt_id를 그대로 echo하지 않으면 storage cell의 결과는 stale로 간주.
+    //   이전 실행의 결과가 storage에 그대로 남아있는 경우(LLM 미수신/타임아웃)에도
+    //   `raw === previousRaw` 비교만으로는 구분 어려운 케이스를 보강한다.
+    function makeAttemptId() {
+        const ts = Date.now().toString(36);
+        const rand = Math.random().toString(36).slice(2, 8).padEnd(6, '0');
+        return `att_${ts}_${rand}`;
+    }
+
     function batchRunMatchesCurrentUrl(run) {
         if (!run) return false;
         const params = getUrlParams();
@@ -3204,9 +3215,13 @@
 
     async function fetchSavedResultSnapshot(storageStringId) {
         const seg = await fetchSegmentDetail(storageStringId);
+        // v0.7.33 (#D7-P1-3): seg=null(요청 stringId와 응답 mismatch / fetch 실패)을
+        //   raw='' empty cell과 구분하기 위해 fetchOk 플래그 동봉. 호출부에서
+        //   "비어있어서 OK" 판정과 "조회 자체 실패" 판정을 분리한다.
         return {
             raw: seg?.active_result?.result || '',
             segment: seg,
+            fetchOk: seg !== null,
         };
     }
 
@@ -3248,8 +3263,17 @@
         }).join('\n\n');
     }
 
-    function buildBatchPhasePrompt(phaseTag, run, extraBlocks, finalInstruction) {
+    function buildBatchPhasePrompt(phaseTag, run, extraBlocks, finalInstruction, attemptId) {
         const tbSummaryBlock = formatBatchTbSummary(run.tbSummary || buildBatchTbSummary(run.segments));
+        // v0.7.33 (#D7-P1-2): attempt_id echo 강제.
+        //   응답 JSON 최상위에 attempt_id를 복사하도록 명시. 검증은 waitForExpectedBatchResult.
+        const attemptBlock = attemptId ? [
+            '',
+            '# 응답 식별 (필수)',
+            `이 실행의 attempt_id는 "${attemptId}"입니다.`,
+            '출력 JSON의 최상위에 반드시 "attempt_id" 필드를 추가하고 위 값을 그대로 복사하세요.',
+            `예: {"phase": "${phaseTag}", "attempt_id": "${attemptId}", ...}`,
+        ] : [];
         return [
             getWorkflowBasePrompt(),
             '---',
@@ -3266,8 +3290,10 @@
             '---',
             '',
             `[CURRENT_PHASE: ${phaseTag}]`,
+            ...(attemptId ? [`[ATTEMPT_ID: ${attemptId}]`] : []),
             '',
             finalInstruction,
+            ...attemptBlock,
         ].join('\n');
     }
 
@@ -3275,7 +3301,7 @@
         return (run.segments || []).map(seg => normalizeId(seg.id));
     }
 
-    function buildPhase12CompactPrompt(run) {
+    function buildPhase12CompactPrompt(run, attemptId) {
         const expectedIds = getBatchExpectedIds(run);
         return buildBatchPhasePrompt(
             '1+2',
@@ -3310,11 +3336,12 @@
                 '모든 Allowed IDs가 정확히 하나의 groups[].ids에 포함되어야 합니다.',
                 'Allowed IDs 밖의 id는 하나도 출력하지 마세요.',
                 '설명형 문장, 마크다운, 추가 필드는 출력하지 마세요.',
-            ].join('\n')
+            ].join('\n'),
+            attemptId
         );
     }
 
-    function buildPhase3CompactPrompt(run) {
+    function buildPhase3CompactPrompt(run, attemptId) {
         const expectedIds = getBatchExpectedIds(run);
         return buildBatchPhasePrompt(
             '3',
@@ -3351,11 +3378,12 @@
                 'Allowed IDs 밖의 id는 하나도 출력하지 마세요.',
                 '번역문에는 한국어 번역만 넣고 설명을 섞지 마세요.',
                 'placeholder와 value token은 원문 그대로 보존하세요.',
-            ].join('\n')
+            ].join('\n'),
+            attemptId
         );
     }
 
-    function buildPhase45CompactPrompt(run) {
+    function buildPhase45CompactPrompt(run, attemptId) {
         const expectedIds = getBatchExpectedIds(run);
         return buildBatchPhasePrompt(
             '4+5',
@@ -3401,14 +3429,18 @@
                 '문제 없으면 반드시 {"t": null, "r": []} 형태로 유지하세요.',
                 '수정 번역문 t에는 한국어 최종 번역만 넣고 설명을 섞지 마세요.',
                 'placeholder와 value token은 원문 그대로 보존하세요.',
-            ].join('\n')
+            ].join('\n'),
+            attemptId
         );
     }
 
-    async function waitForExpectedBatchResult(run, expectedPhase, previousRaw) {
+    async function waitForExpectedBatchResult(run, expectedPhase, previousRaw, expectedAttemptId) {
         let lastRaw = '';
         let lastParsed = null;
         let lastInspection = null;
+        // v0.7.33 (#D7-P1-2): attempt_id mismatch 추적용. loop를 빠져나간 뒤
+        //   "phase는 맞지만 attempt_id가 다른" 케이스를 STALE로 분류한다.
+        let lastAttemptMismatch = null;
 
         for (let attempt = 1; attempt <= BATCH_RESULT_RETRY_ATTEMPTS; attempt++) {
             const { raw } = await fetchSavedResultSnapshot(run.storageStringId);
@@ -3434,10 +3466,27 @@
             }
 
             if (parsed?.phase === expectedPhase && changed) {
+                // v0.7.33 (#D7-P1-2): attempt_id echo 검증.
+                //   응답에 attempt_id가 누락되었거나 expected와 다르면 다음 회차까지 대기.
+                //   loop 종료까지도 일치 못 하면 아래에서 STALE_RESULT로 분류.
+                if (expectedAttemptId) {
+                    const got = parsed.attempt_id || parsed.attemptId || null;
+                    if (got !== expectedAttemptId) {
+                        lastAttemptMismatch = got;
+                        appendBatchLog(`결과 ${attempt}차: phase 일치하나 attempt_id mismatch (expected=${expectedAttemptId}, got=${got || '없음'}) — 대기`, 'warn');
+                        await sleep(BATCH_RESULT_RETRY_INTERVAL_MS);
+                        continue;
+                    }
+                }
                 return { raw, parsed };
             }
 
             await sleep(BATCH_RESULT_RETRY_INTERVAL_MS);
+        }
+
+        // v0.7.33 (#D7-P1-2): phase는 맞지만 attempt_id가 끝까지 mismatch면 stale로 명시.
+        if (expectedAttemptId && lastParsed?.phase === expectedPhase && lastAttemptMismatch !== null) {
+            throw makeWorkflowError(`${expectedPhase} 응답의 attempt_id가 일치하지 않습니다 (expected=${expectedAttemptId}, got=${lastAttemptMismatch || '없음'}). 이전 실행 결과가 그대로 남아 있을 가능성이 큽니다.`, 'STALE_RESULT');
         }
 
         if (lastParsed?.phase === expectedPhase) {
@@ -7010,10 +7059,10 @@
         return '';
     }
 
-    function buildPromptForPhase(run, phaseTag) {
-        if (phaseTag === '1+2') return buildPhase12CompactPrompt(run);
-        if (phaseTag === '3') return buildPhase3CompactPrompt(run);
-        if (phaseTag === '4+5') return buildPhase45CompactPrompt(run);
+    function buildPromptForPhase(run, phaseTag, attemptId) {
+        if (phaseTag === '1+2') return buildPhase12CompactPrompt(run, attemptId);
+        if (phaseTag === '3') return buildPhase3CompactPrompt(run, attemptId);
+        if (phaseTag === '4+5') return buildPhase45CompactPrompt(run, attemptId);
         throw new Error(`알 수 없는 Phase: ${phaseTag}`);
     }
 
@@ -7099,8 +7148,17 @@
         // v0.7.28 (#D2-P1-4): storage cell 하드 덼어쓰기 보호.
         //   workflow JSON이 아닌 일반 번역이 들어있으면 (사람이 넣었을 가능성) 명시 수락 요구.
         //   v0.7.18 이하의 'warn' 로그만으로는 실수로 덼어쓰는 걸 완전 차단 못함.
+        // v0.7.33 (#D7-P1-3): snapshot 조회 실패는 fail-closed.
+        //   기존 catch는 dwarn만 하고 confirm을 생략한 채 진행해 사용자가
+        //   storage cell 상태를 모르고 덮어쓸 수 있었다. fetchOk=false도
+        //   동일하게 phase 실행 자체를 중단한다.
         try {
             const cellSnapshot = await fetchSavedResultSnapshot(run.storageStringId);
+            if (!cellSnapshot.fetchOk) {
+                appendBatchLog(`Phase ${phaseTag} 실행 중단 — storage cell 조회 실패 (segment id 불일치 가능성). 페이지 새로고침 후 다시 시도하세요.`, 'error');
+                toast(`storage cell 조회 실패로 ${phaseTag} 실행 중단`, 'error', 5000);
+                return;
+            }
             const looksWorkflowJson = (() => {
                 if (!cellSnapshot.raw) return true; // 비어있으면 OK
                 try {
@@ -7121,8 +7179,10 @@
                 appendBatchLog(`Phase ${phaseTag}: storage cell 덼어쓰기 수락 (기존 내용 ${cellSnapshot.raw.length}자)`, 'warn');
             }
         } catch (e) {
-            // snapshot 조회 실패는 고장이므로 경고만으로 진행 (기존 동작 유지)
-            dwarn('storage cell snapshot 조회 실패 — confirm 생략', e);
+            // v0.7.33 (#D7-P1-3): snapshot 조회 자체 실패도 fail-closed.
+            appendBatchLog(`Phase ${phaseTag} 실행 중단 — storage cell snapshot 조회 실패: ${e.message}`, 'error');
+            toast(`storage cell 조회 실패로 ${phaseTag} 실행 중단: ${e.message}`, 'error', 5000);
+            return;
         }
 
         // override 보호 — phase 재실행은 최종 후보에 영향 줄 수 있음
@@ -7152,13 +7212,20 @@
             persistBatchRun(run);
             renderBatchRun();
 
-            const prompt = buildPromptForPhase(run, phaseTag);
-            appendBatchLog(`Phase ${phaseTag} 실행 시작, prompt length=${prompt.length}`);
+            // v0.7.33 (#D7-P1-2): attempt_id 발급 — 매 실행마다 새 식별자를 prompt에 주입.
+            //   응답 JSON의 attempt_id가 echo되지 않거나 다르면 stale로 처리.
+            const attemptId = makeAttemptId();
+            const prompt = buildPromptForPhase(run, phaseTag, attemptId);
+            appendBatchLog(`Phase ${phaseTag} 실행 시작, prompt length=${prompt.length}, attemptId=${attemptId}`);
 
             // v0.7.28 (#D2-P0-2): stale result 오판 차단을 위해 실행 직전 storage cell의
             //   실제 raw를 snapshot으로 잡는다. 기존 in-memory `run.phase12?.raw` 기반은
             //   storage에 아직 남아있는 동일 phase의 과거 결과를 새 결과로 오인할 수 있었음.
+            // v0.7.33 (#D7-P1-3): snapshot 조회 실패는 fail-closed.
             const beforeSnapshot = await fetchSavedResultSnapshot(run.storageStringId);
+            if (!beforeSnapshot.fetchOk) {
+                throw makeWorkflowError(`Phase ${phaseTag} 실행 직전 storage cell snapshot 조회 실패 — segment id 불일치 가능성. 페이지 새로고침 후 재시도하세요.`, 'SNAPSHOT_FAIL');
+            }
             const previousRaw = beforeSnapshot.raw;
             const taskId = await callPrefixPromptTran(run.projectId, run.storageStringId, prompt, run.model);
             appendBatchLog(`task 등록 완료: ${taskId}`);
@@ -7172,7 +7239,7 @@
                 },
             });
 
-            const { raw, parsed } = await waitForExpectedBatchResult(run, phaseTag, previousRaw);
+            const { raw, parsed } = await waitForExpectedBatchResult(run, phaseTag, previousRaw, attemptId);
             const validation = validateParsedPhase(run, phaseTag, parsed);
             storePhaseResult(run, phaseTag, raw, parsed, validation);
             appendBatchLog(
