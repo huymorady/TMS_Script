@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.18
+// @version      0.7.19
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.18)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.19)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.18';
+    const SCRIPT_VERSION = '0.7.19';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -723,9 +723,20 @@
     // 붙어 있어도 첫 완전 객체만 반환한다. 못 찾으면 null.
     // v0.7.18 (#5): 앞쪽 닫히지 않은 `{` (예: "예: {")이 있으면 다음 후보에서 계속 탐색.
     //   이전에는 첫 시작점이 닫히지 않으면 바로 null 반환해서 뒤 정상 JSON을 놓쳐다.
+    // v0.7.19 (#1): extractAllJsonCandidates에 위임 — 첫 후보만 반환.
     function extractFirstJsonValue(text) {
+        const all = extractAllJsonCandidates(text);
+        return all.length ? all[0] : null;
+    }
+
+    // v0.7.19 (#1): 본문에서 모든 균형 잡힌 JSON 후보를 순서대로 추출.
+    //   앞쪽 "닫힌 엉뚱한 JSON"(예: `{"example":true}`)이 있어도 뒤의 진짜 JSON을
+    //   parseWorkflowJson이 expectedPhase로 골라낼 수 있도록 다중 후보를 제공.
+    //   닫히지 않은 시작점은 v0.7.18 (#5)와 동일하게 건너뛴다.
+    function extractAllJsonCandidates(text) {
         const src = String(text || '');
-        outer: for (let i = 0; i < src.length; i++) {
+        const out = [];
+        for (let i = 0; i < src.length; i++) {
             const ch = src[i];
             if (ch !== '{' && ch !== '[') continue;
             const open = ch;
@@ -733,6 +744,7 @@
             let depth = 0;
             let inString = false;
             let escape = false;
+            let closedAt = -1;
             for (let j = i; j < src.length; j++) {
                 const c = src[j];
                 if (escape) { escape = false; continue; }
@@ -745,34 +757,50 @@
                 if (c === open) depth++;
                 else if (c === close) {
                     depth--;
-                    if (depth === 0) return src.slice(i, j + 1);
+                    if (depth === 0) { closedAt = j; break; }
                 }
             }
-            // v0.7.18 (#5): 닫히지 않은 시작점. 다음 `{`/`[` 후보로 이동.
-            continue outer;
+            if (closedAt >= 0) {
+                out.push(src.slice(i, closedAt + 1));
+                i = closedAt; // 닫힌 괄호 이후에서 다음 후보 탐색
+            }
+            // 닫히지 않은 시작점은 버리고 i++로 다음 시작점 탐색 (v0.7.18 #5)
         }
-        return null;
+        return out;
     }
 
     function parseWorkflowJson(rawText, expectedPhase) {
         const cleaned = stripCodeFence(rawText);
-        let parsed;
+        // 1) 통째 파싱 시도
+        let parsed = null;
+        let firstError = null;
         try {
             parsed = JSON.parse(cleaned);
-        } catch (firstError) {
-            // 본문 뒤에 자연어가 붙은 경우(0.5.0 차단 패턴): 첫 균형 객체만 추출해 재시도.
-            const candidate = extractFirstJsonValue(cleaned);
-            if (!candidate || candidate === cleaned) throw firstError;
-            try {
-                parsed = JSON.parse(candidate);
-            } catch {
-                throw firstError;
+        } catch (e) {
+            firstError = e;
+        }
+        // 2) 통째 파싱 성공 + phase 일치(또는 expectedPhase 미지정) → 그대로 반환
+        if (parsed !== null && (!expectedPhase || parsed.phase === expectedPhase)) {
+            return parsed;
+        }
+        // 3) v0.7.19 (#1): 모든 JSON 후보를 순회하며 expectedPhase 일치 후보 탐색
+        const candidates = extractAllJsonCandidates(cleaned);
+        let firstParsed = parsed; // 통째 파싱이 성공했다면 이미 가진 값
+        for (const cand of candidates) {
+            if (cand === cleaned) continue; // 이미 위에서 시도함
+            let p;
+            try { p = JSON.parse(cand); } catch { continue; }
+            if (firstParsed === null) firstParsed = p;
+            if (!expectedPhase || p.phase === expectedPhase) return p;
+        }
+        // 4) phase 일치 후보 없음. 파싱은 되지만 phase가 다르면 명시적으로 알린다.
+        if (firstParsed !== null) {
+            if (expectedPhase && firstParsed.phase !== expectedPhase) {
+                throw new Error(`phase 불일치: 기대=${expectedPhase}, 실제=${firstParsed.phase}`);
             }
+            return firstParsed;
         }
-        if (expectedPhase && parsed.phase !== expectedPhase) {
-            throw new Error(`phase 불일치: 기대=${expectedPhase}, 실제=${parsed.phase}`);
-        }
-        return parsed;
+        throw firstError || new Error('JSON 파싱 실패 — 유효한 후보 없음');
     }
 
     function getJsonErrorContext(text, error) {
@@ -1689,11 +1717,15 @@
 
         if (restoreBatchRuns && hasBatchRuns) {
             // v0.7.18 (#3): import 시에도 10건 자동 잘림 방지 (skipGc)
-            if (mergeBatchRuns) {
-                const existing = loadBatchRuns();
-                saveBatchRuns({ ...existing, ...data.batchRuns }, { skipGc: true });
-            } else {
-                saveBatchRuns(data.batchRuns, { skipGc: true });
+            // v0.7.19 (#2): JSON export 기본값이 stripRawSegments=true라 import된 run도 segments 없음 → 백업 복원과 동일 표시.
+            // v0.7.19 (#3): 저장 실패 전파 (lsSet quota 수동 감지 → throw로 호출부에 알림)
+            const incoming = _markRunsAsRestored({ ...data.batchRuns });
+            const ok = mergeBatchRuns
+                ? saveBatchRuns({ ...loadBatchRuns(), ...incoming }, { skipGc: true })
+                : saveBatchRuns(incoming, { skipGc: true });
+            if (!ok) {
+                try { logActivity('error', `import: batch run 저장 실패 (LS quota?)`, { count: Object.keys(incoming).length }); } catch (_) {}
+                throw new Error('batch run 저장 실패 — LS 용량 초과 가능성. 워크스페이스 탭에서 워래된 run 정리 후 다시 시도하세요.');
             }
             batchRunsCount = Object.keys(data.batchRuns).length;
         }
@@ -1858,10 +1890,12 @@
         if (!snap) throw new Error(`slot ${slot} 비어 있음`);
         // v0.7.18 (#3): 복원 시 전체 보존. (#2): segments 누락 run에 플래그.
         const restoredRuns = _markRunsAsRestored({ ...(snap.runs || {}) });
+        // v0.7.19 (#3): 저장 실패 감지 — skipGc로 11건+ 복원시 quota 가능성 ↑. 실패 시 throw로 호출부에 알림.
+        let runsOk = true;
         if (mode === 'overwrite') {
             saveSessions(snap.sessions || {});
             saveReviewOverrides(snap.overrides || {});
-            saveBatchRuns(restoredRuns, { skipGc: true });
+            runsOk = saveBatchRuns(restoredRuns, { skipGc: true });
         } else {
             // merge: 슬롯이 가진 키만 덮어씀
             if (snap.sessions) saveSessions({ ...loadSessions(), ...snap.sessions });
@@ -1873,7 +1907,11 @@
                 }
                 saveReviewOverrides(merged);
             }
-            if (snap.runs) saveBatchRuns({ ...loadBatchRuns(), ...restoredRuns }, { skipGc: true });
+            if (snap.runs) runsOk = saveBatchRuns({ ...loadBatchRuns(), ...restoredRuns }, { skipGc: true });
+        }
+        if (!runsOk) {
+            try { logActivity('error', `IDB 복원: batch run 저장 실패 (LS quota?) slot=${slot} mode=${mode}`, { runs: Object.keys(restoredRuns).length }); } catch (_) {}
+            throw new Error('batch run 저장 실패 — LS 용량 초과 가능성. 오래된 run 정리 후 다시 시도하세요.');
         }
         return {
             sessions: Object.keys(snap.sessions || {}).length,
@@ -1909,7 +1947,14 @@
             if (snap.sessions) saveSessions(snap.sessions);
             if (snap.overrides) saveReviewOverrides(snap.overrides);
             // v0.7.18 (#2,#3): 복원본 run에 플래그 + 전체 보존 (최근 10개 잘림 방지)
-            if (snap.runs) saveBatchRuns(_markRunsAsRestored({ ...snap.runs }), { skipGc: true });
+            // v0.7.19 (#3): 저장 실패 감지
+            if (snap.runs) {
+                const runsOk = saveBatchRuns(_markRunsAsRestored({ ...snap.runs }), { skipGc: true });
+                if (!runsOk) {
+                    try { logActivity('error', `IDB auto-restore: batch run 저장 실패 (LS quota?)`, { runs: rCount }); } catch (_) {}
+                    throw new Error('batch run 저장 실패 — LS 용량 초과 가능성');
+                }
+            }
             toast(`IDB 백업 복원: 세션 ${sCount} / override ${oCount} / run ${rCount}`, 'success');
             return true;
         } catch (e) {
@@ -4847,6 +4892,8 @@
         if (validation.invalidTranslationType?.length) tokens.push(`번역타입 ${validation.invalidTranslationType.length}`);
         if (validation.emptyTranslations?.length) tokens.push(`빈 번역 ${validation.emptyTranslations.length}`);
         if (validation.missingPlaceholders?.length) tokens.push(`플레이스홀더 누락 ${validation.missingPlaceholders.length}`);
+        // v0.7.19 (#4): extra placeholder 게이트 사유도 요약에 노출
+        if (validation.extraPlaceholders?.length) tokens.push(`플레이스홀더 추가 ${validation.extraPlaceholders.length}`);
         if (validation.hanjaLike?.length) tokens.push(`한자 잔존 ${validation.hanjaLike.length}`);
         // Phase 4+5 전용
         if (validation.missingTField?.length) tokens.push(`t 필드 ${validation.missingTField.length}`);
