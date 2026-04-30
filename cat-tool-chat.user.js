@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.17
+// @version      0.7.18
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.17)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.18)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.17';
+    const SCRIPT_VERSION = '0.7.18';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -184,9 +184,12 @@
         try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : def; }
         catch { return def; }
     }
+    // v0.7.18 (#4): 저장 성공/실패 반환.
+    //   호출부에서 quota 등 실패를 감지해 UI/토스트로 올릴 수 있도록.
+    //   과거 코드는 반환값을 무시하므로 호환성 문제 없음.
     function lsSet(key, val) {
-        try { localStorage.setItem(key, JSON.stringify(val)); }
-        catch (e) { console.error('[TMS Workflow] localStorage write failed', e); }
+        try { localStorage.setItem(key, JSON.stringify(val)); return true; }
+        catch (e) { console.error('[TMS Workflow] localStorage write failed', key, e); return false; }
     }
 
     // v0.7.7 (#10): LS 스키마 버전 가드.
@@ -718,9 +721,11 @@
     // 텍스트에서 첫 번째 균형 잡힌 JSON 객체/배열 substring을 추출.
     // 문자열 리터럴과 이스케이프를 인지하므로 본문 뒤에 자연어/추가 블록이
     // 붙어 있어도 첫 완전 객체만 반환한다. 못 찾으면 null.
+    // v0.7.18 (#5): 앞쪽 닫히지 않은 `{` (예: "예: {")이 있으면 다음 후보에서 계속 탐색.
+    //   이전에는 첫 시작점이 닫히지 않으면 바로 null 반환해서 뒤 정상 JSON을 놓쳐다.
     function extractFirstJsonValue(text) {
         const src = String(text || '');
-        for (let i = 0; i < src.length; i++) {
+        outer: for (let i = 0; i < src.length; i++) {
             const ch = src[i];
             if (ch !== '{' && ch !== '[') continue;
             const open = ch;
@@ -743,8 +748,8 @@
                     if (depth === 0) return src.slice(i, j + 1);
                 }
             }
-            // 여기서 시작한 블록이 닫히지 않으면 더 뒤를 봐도 의미 없음.
-            return null;
+            // v0.7.18 (#5): 닫히지 않은 시작점. 다음 `{`/`[` 후보로 이동.
+            continue outer;
         }
         return null;
     }
@@ -1683,11 +1688,12 @@
         }
 
         if (restoreBatchRuns && hasBatchRuns) {
+            // v0.7.18 (#3): import 시에도 10건 자동 잘림 방지 (skipGc)
             if (mergeBatchRuns) {
                 const existing = loadBatchRuns();
-                saveBatchRuns({ ...existing, ...data.batchRuns });
+                saveBatchRuns({ ...existing, ...data.batchRuns }, { skipGc: true });
             } else {
-                saveBatchRuns(data.batchRuns);
+                saveBatchRuns(data.batchRuns, { skipGc: true });
             }
             batchRunsCount = Object.keys(data.batchRuns).length;
         }
@@ -1827,16 +1833,35 @@
         }
     }
 
+    // v0.7.18 (#2): 복원된 run은 segments가 빠져 있어 재실행 가드(L5258 phase12Btn disable)로 막힌다.
+    //   사용자에게 "이 run은 복원본 — 결과 보관용"이라고 한 눈에 보이게 run에 플래그 주입.
+    //   header 칩은 renderBatchRunHeader에서 렌더링.
+    function _markRunsAsRestored(runs) {
+        if (!runs || typeof runs !== 'object') return runs;
+        const stamp = new Date().toISOString();
+        for (const id of Object.keys(runs)) {
+            const r = runs[id];
+            if (!r || typeof r !== 'object') continue;
+            if (!Array.isArray(r.segments) || !r.segments.length) {
+                r.restoredFromBackup = true;
+                r.restoredAt = stamp;
+            }
+        }
+        return runs;
+    }
+
     // v0.7.9: 특정 슬롯에서 강제 복원 (수동 트리거). 호출부에서 confirm 책임.
     // mode: 'overwrite' (기본 — LS 통째 교체) | 'merge' (슬롯이 가진 키만 덮어씀)
     async function restoreFromBackupSlot(slot, mode = 'overwrite') {
         const all = await readAllBackupSlots();
         const snap = all.find(s => s && s.slot === slot);
         if (!snap) throw new Error(`slot ${slot} 비어 있음`);
+        // v0.7.18 (#3): 복원 시 전체 보존. (#2): segments 누락 run에 플래그.
+        const restoredRuns = _markRunsAsRestored({ ...(snap.runs || {}) });
         if (mode === 'overwrite') {
             saveSessions(snap.sessions || {});
             saveReviewOverrides(snap.overrides || {});
-            saveBatchRuns(snap.runs || {});
+            saveBatchRuns(restoredRuns, { skipGc: true });
         } else {
             // merge: 슬롯이 가진 키만 덮어씀
             if (snap.sessions) saveSessions({ ...loadSessions(), ...snap.sessions });
@@ -1848,7 +1873,7 @@
                 }
                 saveReviewOverrides(merged);
             }
-            if (snap.runs) saveBatchRuns({ ...loadBatchRuns(), ...snap.runs });
+            if (snap.runs) saveBatchRuns({ ...loadBatchRuns(), ...restoredRuns }, { skipGc: true });
         }
         return {
             sessions: Object.keys(snap.sessions || {}).length,
@@ -1883,7 +1908,8 @@
         try {
             if (snap.sessions) saveSessions(snap.sessions);
             if (snap.overrides) saveReviewOverrides(snap.overrides);
-            if (snap.runs) saveBatchRuns(snap.runs);
+            // v0.7.18 (#2,#3): 복원본 run에 플래그 + 전체 보존 (최근 10개 잘림 방지)
+            if (snap.runs) saveBatchRuns(_markRunsAsRestored({ ...snap.runs }), { skipGc: true });
             toast(`IDB 백업 복원: 세션 ${sCount} / override ${oCount} / run ${rCount}`, 'success');
             return true;
         } catch (e) {
@@ -2554,10 +2580,12 @@
         return lsGet(LS_KEYS.BATCH_RUNS, {});
     }
 
-    function saveBatchRuns(runs) {
+    function saveBatchRuns(runs, opts = {}) {
         // GC: 최근 updatedAt 기준 BATCH_RUNS_LIMIT개만 보관. activeRunId는 무조건 포함.
+        // v0.7.18 (#3): restore/import 경로에서는 opts.skipGc=true로 전체 보존.
+        //   그래야 백업에 run이 20개 있어도 복원 시 최근 10개로 조용히 잘리지 않음.
         const ids = Object.keys(runs || {});
-        if (ids.length > BATCH_RUNS_LIMIT) {
+        if (!opts.skipGc && ids.length > BATCH_RUNS_LIMIT) {
             const activeId = getActiveBatchRunId();
             const sorted = ids
                 .map(id => ({ id, ts: runs[id]?.updatedAt || runs[id]?.createdAt || '' }))
@@ -2568,7 +2596,7 @@
                 if (!keep.has(id)) delete runs[id];
             }
         }
-        lsSet(LS_KEYS.BATCH_RUNS, runs);
+        return lsSet(LS_KEYS.BATCH_RUNS, runs);
     }
 
     function getActiveBatchRunId() {
@@ -2615,7 +2643,13 @@
         run.updatedAt = new Date().toISOString();
         const runs = loadBatchRuns();
         runs[run.runId] = run;
-        saveBatchRuns(runs);
+        // v0.7.18 (#4): 저장 실패를 삼키지 않고 toast 경고 + activity log로 올린다.
+        const ok = saveBatchRuns(runs);
+        if (!ok) {
+            try { logActivity('error', `batch run 저장 실패 (LS quota?) — ${run.runId}`, { runId: run.runId, status: run.status }); } catch (_) {}
+            try { toast('⚠ batch run 저장 실패 — LS 용량 증가로 인한 가능성. 워크스페이스 탭에서 오래된 run 정리를 시도하세요.', 'error'); } catch (_) {}
+            return;
+        }
         setActiveBatchRunId(run.runId);
         // v0.7.7 (#12): phase45 완료 전이(신규/재시도)에만 backup trigger
         if (run.status === 'phase45_ready' && prevStatus !== 'phase45_ready') {
@@ -3533,6 +3567,11 @@
 /* v0.7.16 (#4): run.page와 현재 URL의 page가 다를 때 경고 배지 */
 .tw-batch-run-header .tw-run-page-mismatch {
     background: rgba(250,204,21,0.18); color: #facc15; border: 1px solid rgba(250,204,21,0.4);
+    padding: 1px 6px; border-radius: 4px; font-size: 10px; white-space: nowrap; cursor: help;
+}
+/* v0.7.18 (#2): IDB 백업에서 복원된 run 배지 — Phase 재실행 불가 안내 */
+.tw-batch-run-header .tw-run-restored-badge {
+    background: rgba(96,165,250,0.18); color: #60a5fa; border: 1px solid rgba(96,165,250,0.4);
     padding: 1px 6px; border-radius: 4px; font-size: 10px; white-space: nowrap; cursor: help;
 }
 /* Phase stepper — 좁은 사이드바(290px)에서도 깨지지 않게 세로 스택 */
@@ -4998,11 +5037,19 @@
                 pageBadge = `<span class="tw-run-page-mismatch" title="이 run은 page=${escapeHtml(runPage)}에서 수집됨. 현재 URL은 page=${escapeHtml(curPage)}. 같은 file/lang이라 활성 run으로 유지되지만, 적용 대상 세그먼트가 다를 수 있습니다.">⚠ run page=${escapeHtml(runPage)} · 현재 page=${escapeHtml(curPage)}</span>`;
             }
         } catch (_) { /* URL parse 실패 — 배지 생략 */ }
+        // v0.7.18 (#2): 백업에서 복원된 run은 segments가 없어 Phase 재실행 불가.
+        //   사용자에게 "결과 보관용" 임을 시각적으로 명시.
+        let restoredBadge = '';
+        if (run.restoredFromBackup) {
+            const ra = run.restoredAt ? String(run.restoredAt).slice(0, 19).replace('T', ' ') : '';
+            restoredBadge = `<span class="tw-run-restored-badge" title="이 run은 IDB 백업에서 복원되었습니다 (${escapeHtml(ra)}). segments raw가 없어 Phase 재실행은 불가하며, 결과 검토/적용만 가능합니다.\n재실행이 필요하면 같은 file/lang에서 새로 수집을 시작하세요.">📦 백업 복원 · 재실행 불가</span>`;
+        }
         el.innerHTML = `
             <span class="tw-batch-run-id" title="runId: ${escapeHtml(String(run.runId || ''))}${run.label ? `\n라벨: ${escapeHtml(String(run.label))}` : ''}">🏃 ${escapeHtml(run.label || runIdShort)}</span>
             <span class="tw-batch-run-meta">project <b>${escapeHtml(String(run.projectId || '?'))}</b> / file <b>${escapeHtml(String(run.fileId || '?'))}</b> / lang <b>${escapeHtml(String(run.languageId || '?'))}</b></span>
             <span class="tw-batch-run-meta">override <b>${overrides}</b></span>
             ${pageBadge}
+            ${restoredBadge}
             <span class="tw-batch-run-stamp">${escapeHtml(stamp)}</span>
         `;
     }
@@ -6973,13 +7020,20 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             return;
         }
 
+        // v0.7.18 (#1): 진입 시점의 stringId/segment를 즉시 snapshot으로 고정.
+        //   currentStringId/currentSegment는 watcher(L6684)가 0.5s마다 갱신하므로
+        //   await 경계를 넘으면 다른 세그먼트의 결과가 원래 세그먼트로 잘못 저장될 수 있다.
+        //   이후 모든 in-flight 참조는 request* 만 사용한다.
+        const requestStringId = currentStringId;
+        const requestSegment = currentSegment;
+
         const sendBtn = $('.tw-btn-send', modalEl);
         sendBtn.disabled = true;
 
         // 사용자 메시지 추가
-        const session = getSession(currentStringId);
+        const session = getSession(requestStringId);
         session.messages.push({ role: 'user', content: userMessage });
-        setSession(currentStringId, session);
+        setSession(requestStringId, session);
         appendMessage('user', userMessage);
         input.value = '';
 
@@ -6991,7 +7045,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             // 프롬프트 조립
             const activePrompt = getChatActivePrompt();
             const systemPrompt = activePrompt?.content || '';
-            const segmentCtx = buildSegmentContext(currentSegment);
+            const segmentCtx = buildSegmentContext(requestSegment);
 
             // 대화 이력은 방금 추가한 user를 제외하고 과거만
             const history = session.messages.slice(0, -1);
@@ -7012,7 +7066,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             const model = getSelectedModel();
 
             updateProgressMessage(progressMsg, '⏳ 작업 등록 중…');
-            const taskId = await callPrefixPromptTran(projectId, currentStringId, prefixPrompt, model);
+            const taskId = await callPrefixPromptTran(projectId, requestStringId, prefixPrompt, model);
 
             updateProgressMessage(progressMsg, '⏳ 처리 중… (5초 간격 폴링)');
             await pollTask(taskId, {
@@ -7023,7 +7077,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             });
 
             updateProgressMessage(progressMsg, '⏳ 결과 조회 중…');
-            const rawResult = await fetchActiveResult(currentStringId);
+            const rawResult = await fetchActiveResult(requestStringId);
             const result = sanitizeChatTranslation(rawResult);
             if (rawResult && result !== rawResult) {
                 dverbose('sanitize:', { before: rawResult, after: result });
@@ -7039,15 +7093,20 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             progressMsg.classList.remove('tw-msg-progress');
             $('.tw-msg-content', progressMsg).textContent = result;
 
-            // 세션에 AI 응답 저장
+            // 세션에 AI 응답 저장 (snapshot 기준 — 항상 원래 세그먼트 세션에 저장)
             session.messages.push({ role: 'ai', content: result });
-            setSession(currentStringId, session);
+            setSession(requestStringId, session);
 
-            // 세그먼트 정보 리프레시 (현재 번역 표시 갱신)
-            currentSegment.active_result = { ...currentSegment.active_result, result };
-            loadSegmentInfo(currentStringId);
-
-            updateAdoptButton(session);
+            // v0.7.18 (#1): UI/segment 변경은 still 같은 세그먼트일 때만.
+            //   세그먼트가 바뀐 경우는 저장만 하고 UI 갱신/segment mutation 생략.
+            if (currentStringId === requestStringId) {
+                requestSegment.active_result = { ...requestSegment.active_result, result };
+                loadSegmentInfo(requestStringId);
+                updateAdoptButton(session);
+            } else {
+                try { toast(`다른 세그먼트(${requestStringId})의 결과가 도착해 세션에 저장만 했습니다.`, 'info'); } catch (_) {}
+                dinfo('onSend: segment changed during await — store only', { requested: requestStringId, current: currentStringId });
+            }
         } catch (e) {
             progressMsg.classList.remove('tw-msg-progress');
             $('.tw-msg-content', progressMsg).textContent = `❌ 오류: ${e.message}`;
