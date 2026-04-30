@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.38
+// @version      0.7.39
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.38)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.39)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.38';
+    const SCRIPT_VERSION = '0.7.39';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -4964,6 +4964,40 @@
 @media (max-width: 760px) {
     .tw-final-edit-body { grid-template-columns: 1fr; }
 }
+
+/* v0.7.39: 카테고리 가이드라인 탭 — 최종 후보 편집 모달과 동일한 카드 스타일 */
+.tw-category-list { display: flex; flex-direction: column; gap: 10px; }
+.tw-category-item {
+    background: #252525; border: 1px solid #333; border-radius: 6px;
+    padding: 8px 10px;
+}
+.tw-category-item[open] { border-color: #3a3a3a; }
+.tw-category-item > summary {
+    cursor: pointer; user-select: none;
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 600; color: #4ade80; text-transform: uppercase;
+    list-style: none;
+}
+.tw-category-item > summary::-webkit-details-marker { display: none; }
+.tw-category-item > summary::before {
+    content: '▸'; display: inline-block; width: 10px; color: #888;
+    transition: transform 0.12s ease;
+}
+.tw-category-item[open] > summary::before { transform: rotate(90deg); }
+.tw-category-item .tw-category-summary-label { flex: 1 1 auto; }
+.tw-category-item .tw-category-summary-badge { font-size: 12px; line-height: 1; }
+.tw-category-item .tw-category-summary-badge.is-filled { color: #4ade80; }
+.tw-category-item .tw-category-summary-badge.is-empty { color: #666; }
+.tw-category-content {
+    width: 100%; min-height: 140px; resize: vertical;
+    margin-top: 8px;
+    background: #1a1a1a; color: #e0e0e0; border: 1px solid #3a3a3a;
+    border-radius: 6px; padding: 8px 10px;
+    font-family: inherit; font-size: 13px; line-height: 1.5;
+    box-sizing: border-box;
+}
+.tw-category-content::placeholder { color: #555; font-style: italic; }
+.tw-category-content:focus { outline: 2px solid #4ade80; outline-offset: -2px; }
 `;
         document.head.appendChild(style);
     }
@@ -8304,7 +8338,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             💡 Phase 1+2 분석에서 활성으로 분류된 카테고리의 본문이 Phase 3/4+5 프롬프트에 자동 주입됩니다.<br>
             본문이 비어 있는 슬롯은 무시됩니다. 카테고리 0(공통)은 항상 활성으로 취급됩니다.
         </div>
-        <div class="tw-category-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+        <div class="tw-category-list"></div>
     </div>
     <div class="tw-settings-content tw-settings-tab-sessions" style="display:none; flex-direction:column; gap:16px; overflow-y:auto; min-height:0; padding-right:6px;">
         <div class="tw-session-stats">
@@ -8450,15 +8484,16 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 const v = map[cat.id] || { name: cat.name, content: '' };
                 const filled = (v.content || '').trim().length > 0;
                 const open = (cat.id === 0 || filled) ? ' open' : '';
-                const badge = filled ? '<span style="color:#4caf50; margin-left:6px;">●</span>' : '<span style="color:#888; margin-left:6px;">○</span>';
+                const badgeCls = filled ? 'is-filled' : 'is-empty';
+                const badgeChar = filled ? '●' : '○';
                 return `
-                    <details class="tw-category-item" data-id="${cat.id}"${open} style="border:1px solid #3a3a3a; border-radius:4px; padding:6px 8px;">
-                        <summary style="cursor:pointer; user-select:none; font-weight:500;">
-                            <span>[${cat.id}] ${escapeHtml(cat.name)}</span>${badge}
+                    <details class="tw-category-item" data-id="${cat.id}"${open}>
+                        <summary>
+                            <span class="tw-category-summary-label">[${cat.id}] ${escapeHtml(cat.name)}</span>
+                            <span class="tw-category-summary-badge ${badgeCls}">${badgeChar}</span>
                         </summary>
                         <textarea class="tw-category-content" data-id="${cat.id}"
                             placeholder="이 카테고리의 세부 가이드라인을 입력하세요. 비워 두면 주입되지 않습니다."
-                            style="width:100%; min-height:120px; margin-top:6px; box-sizing:border-box; resize:vertical; font-family:inherit; font-size:12px;"
                         >${escapeHtml(v.content || '')}</textarea>
                     </details>
                 `;
@@ -8474,14 +8509,12 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     // 슬롯 채워짐/비어있음 표시 갱신 (요약 영역의 ●/○)
                     const det = ta.closest('details');
                     if (det) {
-                        const sum = det.querySelector('summary');
-                        if (sum) {
+                        const dot = det.querySelector('.tw-category-summary-badge');
+                        if (dot) {
                             const filled = (ta.value || '').trim().length > 0;
-                            const dot = sum.querySelector('span:last-child');
-                            if (dot) {
-                                dot.textContent = filled ? '●' : '○';
-                                dot.style.color = filled ? '#4caf50' : '#888';
-                            }
+                            dot.textContent = filled ? '●' : '○';
+                            dot.classList.toggle('is-filled', filled);
+                            dot.classList.toggle('is-empty', !filled);
                         }
                     }
                 };
