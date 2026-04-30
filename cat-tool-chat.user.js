@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.31
+// @version      0.7.32
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.31)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.32)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.31';
+    const SCRIPT_VERSION = '0.7.32';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -334,16 +334,21 @@
         return `len=${len} hash=${hex} head="${head}${ellipsis}"`;
     }
     // 사용자가 콘솔에서 즉시 토글 — window.tmsLog('verbose') / 'silent' 등
+    // v0.7.32 (#D6-P2-10): debug surface gate — localStorage.tms_workflow_debug_surface === 'on'일 때만
+    //   window에 노출. 일반 사용자에게는 숨겼다가 진단 필요할 때만 열어주는 패턴.
     try {
-        window.tmsLog = function (level) {
-            if (level && LOG_LEVEL_RANK[level] != null) {
-                try { localStorage.setItem('tms_workflow_log_level', level); } catch {}
-                LOG_RANK = LOG_LEVEL_RANK[level];
-                console.log(LOG_TAG, `log level → ${level}`);
-            } else {
-                console.log(LOG_TAG, `current level rank=${LOG_RANK}, choices: silent/error/warn/info/verbose`);
-            }
-        };
+        const _debugOn = (() => { try { return localStorage.getItem('tms_workflow_debug_surface') === 'on'; } catch { return false; } })();
+        if (_debugOn) {
+            window.tmsLog = function (level) {
+                if (level && LOG_LEVEL_RANK[level] != null) {
+                    try { localStorage.setItem('tms_workflow_log_level', level); } catch {}
+                    LOG_RANK = LOG_LEVEL_RANK[level];
+                    console.log(LOG_TAG, `log level → ${level}`);
+                } else {
+                    console.log(LOG_TAG, `current level rank=${LOG_RANK}, choices: silent/error/warn/info/verbose`);
+                }
+            };
+        }
     } catch {}
 
     // ========================================================================
@@ -1387,6 +1392,14 @@
 
         dwarn('활성 번역 textarea를 찾지 못함');
         return null;
+    }
+
+    // v0.7.32 (#D6-P2-9): strict 버전 — stringId에 정확히 속한 textarea만 허용.
+    //   active item / focused fallback은 쓰지 않는다. 채팅 apply / adopt 같은 쓰기 경로에서
+    //   사용자가 세그먼트를 바꾨 뒤 다른 칸에 자캊 쓰는 사고를 차단한다.
+    function findTranslationTextareaStrict(stringId) {
+        if (!stringId) return null;
+        return findTranslationTextareaForStringId(stringId);
     }
 
     // textarea에 값 주입 + Vue/React가 변경 감지하도록 이벤트 디스패치
@@ -2929,7 +2942,11 @@
         // GC: 최근 updatedAt 기준 BATCH_RUNS_LIMIT개만 보관. activeRunId는 무조건 포함.
         // v0.7.18 (#3): restore/import 경로에서는 opts.skipGc=true로 전체 보존.
         //   그래야 백업에 run이 20개 있어도 복원 시 최근 10개로 조용히 잘리지 않음.
+        // v0.7.32 (#D6-P2-11): GC로 삭제되는 run 관련 dangling 데이터도 같이 정리.
+        //   이전에는 GC는 runs[id]만 넘고 review override와 SESSIONS importedFromRunId가 남아
+        //   review tab에서 곳 없는 run을 가리키는 레코드가 쓰레기로 남았다.
         const ids = Object.keys(runs || {});
+        const deletedIds = [];
         if (!opts.skipGc && ids.length > BATCH_RUNS_LIMIT) {
             const activeId = getActiveBatchRunId();
             const sorted = ids
@@ -2938,10 +2955,21 @@
             const keep = new Set(sorted.slice(0, BATCH_RUNS_LIMIT).map(x => x.id));
             if (activeId) keep.add(activeId);
             for (const id of ids) {
-                if (!keep.has(id)) delete runs[id];
+                if (!keep.has(id)) {
+                    delete runs[id];
+                    deletedIds.push(id);
+                }
             }
         }
-        return lsSet(LS_KEYS.BATCH_RUNS, runs);
+        const ok = lsSet(LS_KEYS.BATCH_RUNS, runs);
+        if (ok && deletedIds.length) {
+            for (const id of deletedIds) {
+                try { clearOverridesForRun(id); } catch (e) { dwarn(`GC override cleanup 실패 ${id}`, e); }
+                try { nullifyDanglingImportedFromRunId(id); } catch (e) { dwarn(`GC importedFromRunId nullify 실패 ${id}`, e); }
+            }
+            try { logActivity('cleanup', `batchRuns GC: ${deletedIds.length}개 run 제거 및 dangling 참조 정리`); } catch (_) {}
+        }
+        return ok;
     }
 
     function getActiveBatchRunId() {
@@ -3028,6 +3056,9 @@
             const runs = loadBatchRuns();
             delete runs[runId];
             saveBatchRuns(runs);
+            // v0.7.32 (#D6-P2-11): 수동 초기화도 dangling override / session 참조 정리.
+            try { clearOverridesForRun(runId); } catch (e) { dwarn(`clearActiveBatchRun override cleanup 실패 ${runId}`, e); }
+            try { nullifyDanglingImportedFromRunId(runId); } catch (e) { dwarn(`clearActiveBatchRun importedFromRunId nullify 실패 ${runId}`, e); }
         }
         lsSet(LS_KEYS.ACTIVE_BATCH_RUN, null);
         batchRun = null;
@@ -7731,7 +7762,8 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 toast('현재 세그먼트 ID를 알 수 없습니다.', 'error');
                 return;
             }
-            const textarea = findTranslationTextarea(currentStringId);
+            // v0.7.32 (#D6-P2-9): apply 경로는 strict lookup — 활성 item / focused fallback 수용 안 함.
+            const textarea = findTranslationTextareaStrict(currentStringId);
             if (!textarea) {
                 toast('번역 입력창을 찾지 못했습니다. 세그먼트를 먼저 클릭하세요.', 'error');
                 if (navigator.clipboard?.writeText) {
@@ -7763,7 +7795,8 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         const translation = last.content;
 
         // 번역 입력 textarea 찾기
-        const textarea = findTranslationTextarea(currentStringId);
+        // v0.7.32 (#D6-P2-9): adopt 경로도 strict lookup으로 일점 수행.
+        const textarea = findTranslationTextareaStrict(currentStringId);
         if (!textarea) {
             // 원인: 사용자가 해당 세그먼트 UI를 열지 않은 상태
             toast('번역 입력창을 찾지 못했습니다. 세그먼트를 먼저 클릭하세요.', 'error');
@@ -8918,17 +8951,25 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
     }, true);
 
     // 진단용: window에 함수 노출
-    window.tmsWorkflow = {
-        open: () => showModal(),
-        close: () => hideModal(),
-        getCurrentStringId: () => getCurrentStringId(true),
-        getParams: () => getUrlParams(),
-        getSegment: async (id) => {
-            const sid = id || getCurrentStringId();
-            if (!sid) return null;
-            return await fetchSegmentDetail(sid);
-        },
-    };
+    // v0.7.32 (#D6-P2-10): debug surface gate — localStorage.tms_workflow_debug_surface === 'on'일 때만
+    //   getSegment / getCurrentStringId / getParams 등 상세 디버그 surface를 노출한다.
+    //   open / close / version은 관리용으로 항상 남겨 둔다.
+    {
+        const _debugOn = (() => { try { return localStorage.getItem('tms_workflow_debug_surface') === 'on'; } catch { return false; } })();
+        window.tmsWorkflow = {
+            open: () => showModal(),
+            close: () => hideModal(),
+        };
+        if (_debugOn) {
+            window.tmsWorkflow.getCurrentStringId = () => getCurrentStringId(true);
+            window.tmsWorkflow.getParams = () => getUrlParams();
+            window.tmsWorkflow.getSegment = async (id) => {
+                const sid = id || getCurrentStringId();
+                if (!sid) return null;
+                return await fetchSegmentDetail(sid);
+            };
+        }
+    }
 
     // node 테스트 환경에서만 내부 순수 함수를 노출 (브라우저에서는 영향 없음)
     if (typeof globalThis !== 'undefined' && globalThis.__TMS_TEST_HOOK__) {
