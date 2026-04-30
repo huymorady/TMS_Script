@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.42
+// @version      0.7.43
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.42)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.43)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.42';
+    const SCRIPT_VERSION = '0.7.43';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -81,6 +81,12 @@
         //   run.promptLog에 누적 저장한다 (phase당 최근 3건 + 총 1MB cap).
         //   기본 false. 용량 압박 시 즉시 OFF 해서 접고는 테스트 주기 용도.
         VERBOSE_PROMPT_LOG_ENABLED: 'tms_workflow_verbose_prompt_log_enabled_v1',
+        // v0.7.43: Phase별 프롬프트 슬롯 (3개). 구조: { phase12?:string, phase3?:string, phase45?:string }
+        //   각 슬롯 본문은 사용자 편집 가능하며 비어 있거나 미설정 시 기존
+        //   getWorkflowBasePrompt() (chat 프롬프트 목록 기반)로 폴백한다.
+        //   내부 키는 phase12 / phase3 / phase45 (run.phaseXX 데이터 호환), 표시명은
+        //   설정 탭에서 Phase 1 / Phase 2 / Phase 3.
+        BATCH_PHASE_PROMPTS: 'tms_workflow_batch_phase_prompts_v1',
     };
 
     // v0.7.7 (#10): 현재 스키마 버전. 신규 LS key/필드를 추가하거나 기존 구조를 변경할 때 +1.
@@ -2495,6 +2501,67 @@
     function saveVerbosePromptLogEnabled(enabled) {
         return lsSet(LS_KEYS.VERBOSE_PROMPT_LOG_ENABLED, !!enabled);
     }
+    // v0.7.43: Phase별 프롬프트 슬롯. 내부 키 set은 phase12/phase3/phase45로 고정.
+    //   - 각 슬롯이 비어있거나 미설정이면 getWorkflowBasePrompt() (chat 프롬프트 목록)으로 폴백.
+    //   - 향후 v0.7.44+에서 BATCH_PHASE_PROMPT_DEFAULTS에 시드 채울 예정.
+    const BATCH_PHASE_SLOT_KEYS = ['phase12', 'phase3', 'phase45'];
+    const BATCH_PHASE_SLOT_LABELS = {
+        phase12: 'Phase 1 — 분석',
+        phase3: 'Phase 2 — 번역',
+        phase45: 'Phase 3 — 검수',
+    };
+    const BATCH_PHASE_PROMPT_DEFAULTS = {
+        phase12: '',
+        phase3: '',
+        phase45: '',
+    };
+    function _normalizeBatchPhasePromptSlot(slot) {
+        return BATCH_PHASE_SLOT_KEYS.includes(slot) ? slot : null;
+    }
+    function loadBatchPhasePrompts() {
+        const v = lsGet(LS_KEYS.BATCH_PHASE_PROMPTS, {});
+        if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+        const out = {};
+        for (const k of BATCH_PHASE_SLOT_KEYS) {
+            if (typeof v[k] === 'string') out[k] = v[k];
+        }
+        return out;
+    }
+    function saveBatchPhasePrompts(map) {
+        const out = {};
+        for (const k of BATCH_PHASE_SLOT_KEYS) {
+            if (map && typeof map[k] === 'string') out[k] = map[k];
+        }
+        return lsSet(LS_KEYS.BATCH_PHASE_PROMPTS, out);
+    }
+    function getBatchPhasePrompt(slot) {
+        const k = _normalizeBatchPhasePromptSlot(slot);
+        if (!k) return '';
+        const map = loadBatchPhasePrompts();
+        if (typeof map[k] === 'string') return map[k];
+        return BATCH_PHASE_PROMPT_DEFAULTS[k] || '';
+    }
+    function setBatchPhasePrompt(slot, content) {
+        const k = _normalizeBatchPhasePromptSlot(slot);
+        if (!k) return false;
+        const map = loadBatchPhasePrompts();
+        map[k] = String(content == null ? '' : content);
+        return saveBatchPhasePrompts(map);
+    }
+    function resetBatchPhasePrompt(slot) {
+        const k = _normalizeBatchPhasePromptSlot(slot);
+        if (!k) return false;
+        const map = loadBatchPhasePrompts();
+        delete map[k];
+        return saveBatchPhasePrompts(map);
+    }
+    // phaseTag('1+2'/'3'/'4+5') → slot key.
+    function phaseTagToSlot(phaseTag) {
+        if (phaseTag === '1+2') return 'phase12';
+        if (phaseTag === '3') return 'phase3';
+        if (phaseTag === '4+5') return 'phase45';
+        return null;
+    }
     // phase당 최근 N건만 보관 + 총 크기 cap. 둘 다 넘으면 오래된 항목부터 prompt 본문을 [redacted]로 치환.
     const PROMPT_LOG_PER_PHASE_KEEP = 3;
     const PROMPT_LOG_TOTAL_BYTE_CAP = 1_000_000; // 1MB
@@ -3560,11 +3627,17 @@
         };
     }
 
-    function getWorkflowBasePrompt() {
+    function getWorkflowBasePrompt(phaseTag) {
+        // v0.7.43: Phase별 사용자 슬롯이 있으면 그 본문을 사용, 없으면 기존 chat 프롬프트로 폴백.
+        const slot = phaseTagToSlot(phaseTag);
+        if (slot) {
+            const slotBody = (getBatchPhasePrompt(slot) || '').trim();
+            if (slotBody) return slotBody;
+        }
         const activePrompt = getBatchActivePrompt();
         const content = activePrompt?.content || '';
         if (!content.trim()) {
-            throw new Error('배치 실행에는 v3.1 워크플로우 시스템 프롬프트가 필요합니다. 설정에서 프롬프트를 먼저 선택하세요.');
+            throw new Error('배치 실행에는 v3.1 워크플로우 시스템 프롬프트가 필요합니다. 설정에서 프롬프트를 먼저 선택하거나 Phase 프롬프트 슬롯을 채워주세요.');
         }
         return content.trim();
     }
@@ -3619,7 +3692,7 @@
             })()
             : [];
         return [
-            getWorkflowBasePrompt(),
+            getWorkflowBasePrompt(phaseTag),
             '---',
             '# 파일 정보',
             `- 프로젝트 ID: ${run.projectId}`,
@@ -5061,6 +5134,30 @@
 
 /* v0.7.39: 카테고리 가이드라인 탭 — 최종 후보 편집 모달과 동일한 카드 스타일 */
 .tw-category-list { display: flex; flex-direction: column; gap: 10px; }
+/* v0.7.43: Phase 프롬프트 섹션 */
+.tw-phase-prompts-section { display: flex; flex-direction: column; gap: 6px; }
+.tw-phase-prompts-list { display: flex; flex-direction: column; gap: 10px; }
+.tw-phase-prompt-item {
+    background: #252525; border: 1px solid #333; border-radius: 6px;
+    padding: 8px 10px; display: flex; flex-direction: column; gap: 6px;
+}
+.tw-phase-prompt-head {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    font-size: 12px; font-weight: 600; color: #4ade80;
+}
+.tw-phase-prompt-key { color: #888; font-weight: 400; font-size: 11px; }
+.tw-phase-prompt-len { color: #888; font-weight: 400; font-size: 11px; margin-left: auto; }
+.tw-phase-prompt-status { font-size: 11px; padding: 1px 6px; border-radius: 4px; }
+.tw-phase-prompt-status.is-custom { background: rgba(74,222,128,0.15); color: #4ade80; }
+.tw-phase-prompt-status.is-fallback { background: rgba(255,255,255,0.06); color: #888; }
+.tw-phase-prompt-content {
+    width: 100%; min-height: 120px; resize: vertical;
+    background: #1a1a1a; color: #e0e0e0; border: 1px solid #3a3a3a;
+    border-radius: 4px; padding: 6px 8px; font-family: inherit; font-size: 12px;
+}
+.tw-phase-prompt-content:focus { outline: 2px solid #4ade80; outline-offset: -2px; }
+.tw-phase-prompt-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.tw-phase-prompts-divider { height: 1px; background: #333; margin: 8px 0; }
 .tw-category-item {
     background: #252525; border: 1px solid #333; border-radius: 6px;
     padding: 8px 10px;
@@ -8531,6 +8628,17 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         </div>
     </div>
     <div class="tw-settings-content tw-settings-tab-categories" style="display:none; flex-direction:column; gap:10px; overflow-y:auto; min-height:0; padding-right:6px;">
+        <!-- v0.7.43: Phase 프롬프트 슬롯 (3개). 비어 있으면 기존 chat 프롬프트로 폴백. -->
+        <div class="tw-phase-prompts-section">
+            <div class="tw-stat-title">📝 Phase 프롬프트 (3 슬롯)</div>
+            <div class="tw-stat-hint" style="margin-bottom:6px;">
+                💡 각 Phase에 보낼 시스템 프롬프트 본문입니다. 슬롯이 비어 있으면 기존 시스템 프롬프트 탭의 활성 프롬프트로 폴백합니다.<br>
+                내부 데이터 키: <code>phase12 / phase3 / phase45</code> (run 데이터와 호환).
+            </div>
+            <div class="tw-phase-prompts-list"></div>
+        </div>
+        <div class="tw-phase-prompts-divider"></div>
+        <div class="tw-stat-title">🏷️ 카테고리 가이드라인 (22 슬롯)</div>
         <div class="tw-category-toolbar">
             <label class="tw-category-master-toggle" title="끄면 Phase 3/4+5 프롬프트에 카테고리 가이드라인 블록이 주입되지 않습니다.">
                 <input type="checkbox" class="tw-category-enable-toggle" checked>
@@ -8689,6 +8797,9 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 if (tab === 'categories' && typeof refreshCategoryGuidelines === 'function') {
                     refreshCategoryGuidelines();
                 }
+                if (tab === 'categories' && typeof refreshPhasePromptSlots === 'function') {
+                    refreshPhasePromptSlots();
+                }
             });
         });
 
@@ -8697,6 +8808,78 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         //   textarea blur 또는 입력 디바운스 시 LS 저장. 0번은 항상 펼친 상태.
         // v0.7.40: 상단 toolbar (전역 활성 토글 + 통계 chip + 모두 펼치기/접기 + 비어있는 슬롯 숨기기) +
         //   슬롯 summary에 글자 수 / ⚡활성 chip / 미리보기 추가 + 활성 슬롯 좌측 보더 강조.
+        // v0.7.43: Phase 프롬프트 슬롯 (3개) 렌더 + 편집/저장/기본값 복원.
+        //   같은 categoriesTab 안 상단 섹션에 배치.
+        function refreshPhasePromptSlots() {
+            if (!categoriesTab) return;
+            const listEl = $('.tw-phase-prompts-list', categoriesTab);
+            if (!listEl) return;
+            const stored = loadBatchPhasePrompts();
+            listEl.innerHTML = BATCH_PHASE_SLOT_KEYS.map(slot => {
+                const label = BATCH_PHASE_SLOT_LABELS[slot] || slot;
+                const isCustom = typeof stored[slot] === 'string';
+                const content = isCustom ? stored[slot] : (BATCH_PHASE_PROMPT_DEFAULTS[slot] || '');
+                const len = content.length;
+                const statusCls = isCustom ? 'is-custom' : 'is-fallback';
+                const statusText = isCustom ? '사용자 편집' : '기본값(폴백)';
+                return `
+                    <div class="tw-phase-prompt-item" data-slot="${slot}">
+                        <div class="tw-phase-prompt-head">
+                            <span>${escapeHtml(label)}</span>
+                            <span class="tw-phase-prompt-key">[${slot}]</span>
+                            <span class="tw-phase-prompt-status ${statusCls}">${statusText}</span>
+                            <span class="tw-phase-prompt-len">${len}자</span>
+                        </div>
+                        <textarea class="tw-phase-prompt-content" data-slot="${slot}"
+                            placeholder="이 Phase에 보낼 시스템 프롬프트 본문을 입력하세요. 비워두면 기존 시스템 프롬프트로 폴백합니다."
+                        >${escapeHtml(content)}</textarea>
+                        <div class="tw-phase-prompt-actions">
+                            <button type="button" class="tw-btn tw-btn-ghost tw-btn-phase-prompt-reset" data-slot="${slot}">↺ 기본값으로 복원</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            $$('.tw-phase-prompt-content', listEl).forEach(ta => {
+                let saveTimer = null;
+                const commit = () => {
+                    const slot = ta.dataset.slot;
+                    if (!BATCH_PHASE_SLOT_KEYS.includes(slot)) return;
+                    setBatchPhasePrompt(slot, ta.value);
+                    const item = ta.closest('.tw-phase-prompt-item');
+                    if (item) {
+                        const lenEl = item.querySelector('.tw-phase-prompt-len');
+                        if (lenEl) lenEl.textContent = `${ta.value.length}자`;
+                        const statusEl = item.querySelector('.tw-phase-prompt-status');
+                        if (statusEl) {
+                            statusEl.classList.remove('is-fallback');
+                            statusEl.classList.add('is-custom');
+                            statusEl.textContent = '사용자 편집';
+                        }
+                    }
+                };
+                ta.addEventListener('input', () => {
+                    if (saveTimer) clearTimeout(saveTimer);
+                    saveTimer = setTimeout(commit, 400);
+                });
+                ta.addEventListener('blur', () => {
+                    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+                    commit();
+                });
+            });
+            $$('.tw-btn-phase-prompt-reset', listEl).forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const slot = btn.dataset.slot;
+                    if (!BATCH_PHASE_SLOT_KEYS.includes(slot)) return;
+                    if (!confirm(`${BATCH_PHASE_SLOT_LABELS[slot]} 슬롯을 비우고 기본값(폴백)으로 되돌립니다. 진행할까요?`)) return;
+                    resetBatchPhasePrompt(slot);
+                    if (typeof logActivity === 'function') {
+                        logActivity('config', `Phase 프롬프트 슬롯 [${slot}] 기본값 복원`);
+                    }
+                    toast(`${BATCH_PHASE_SLOT_LABELS[slot]} 슬롯을 기본값으로 되돌렸습니다.`, 'info');
+                    refreshPhasePromptSlots();
+                });
+            });
+        }
         function refreshCategoryGuidelines() {
             if (!categoriesTab) return;
             const listEl = $('.tw-category-list', categoriesTab);
