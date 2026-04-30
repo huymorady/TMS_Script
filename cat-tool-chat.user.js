@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.19
+// @version      0.7.20
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.19)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.20)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.19';
+    const SCRIPT_VERSION = '0.7.20';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -3084,7 +3084,10 @@
             lastRaw = raw;
             let parsed = null;
             try {
-                parsed = parseWorkflowJson(raw);
+                // v0.7.20 (#A2): expectedPhase를 넘겨 다중 JSON 후보 중 phase 일치 후보 우선 선택.
+                //   v0.7.19 #1에서 parseWorkflowJson에 expectedPhase 우선 분기를 만들어놨는데
+                //   여기서 인자를 안 넘겨 기능이 사실상 무력화돼 있었다.
+                parsed = parseWorkflowJson(raw, expectedPhase);
                 lastParsed = parsed;
                 lastInspection = { ok: true, parsed };
             } catch (error) {
@@ -4867,9 +4870,15 @@
     }
 
     function isBatchBusy(status) {
-        // 실제 코드에서 set되는 busy 상태는 'collecting'뿐. phase_* 후보는 향후
-        // 확장을 위해 이름만 남겨둡고, 설정되는 곳이 추가될 때 함께 업데이트.
-        return status === 'collecting';
+        // v0.7.20 (#A1): phase running 상태도 busy로 처리.
+        //   기존엔 'collecting'만 busy로 봐서 Phase 실행 중에도 버튼이 안 막혀
+        //   같은 storageStringId에 prefix_prompt_tran 동시 쓰기 race 가능성이 있었음.
+        //   restoreActiveBatchRun의 stale 마킹도 같은 함수를 쓰므로 reload 후 stale
+        //   처리도 함께 정상화된다.
+        return status === 'collecting'
+            || status === 'phase12_running'
+            || status === 'phase3_running'
+            || status === 'phase45_running';
     }
 
     // 검증 객체에서 실패 사유를 짧은 토큰 배열로 추출. 간단 표시용.
@@ -6665,6 +6674,12 @@
 
     async function onRunBatchPhase(phaseTag) {
         const run = ensureBatchRun();
+        // v0.7.20 (#A1): 진입 시 한 번 더 방어. UI 비활성화가 어긋났더라도
+        //   동시 실행을 막아 storageStringId race를 차단.
+        if (run && isBatchBusy(run.status)) {
+            toast(`이미 실행 중입니다 (${run.status}). 완료 후 다시 시도하세요.`, 'error');
+            return;
+        }
         if (!run.segments?.length) {
             toast('먼저 현재 페이지를 수집하세요.', 'error');
             return;
@@ -8062,7 +8077,10 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     closeRunSessionsPopover();
                     try {
                         // 모달 닫기 (워크스페이스 탭 → 채팅 패널 보이게)
-                        const closeBtn = $('.tw-settings-close', overlay);
+                        // v0.7.20 (#A3): selector 오류 fix — 실제 클래스는 .tw-btn-settings-close.
+                        //   v0.7.11에서 popover 점프 도입 시 typo로 모달이 안 닫혀서
+                        //   채팅 탭 점프가 처음부터 시각적으로 작동 안 했음.
+                        const closeBtn = $('.tw-btn-settings-close', overlay);
                         if (closeBtn) closeBtn.click();
                         if (typeof setMainTab === 'function') setMainTab('chat');
                         try { currentStringId = sid; } catch {}
