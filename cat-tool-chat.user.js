@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.41
+// @version      0.7.42
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.41)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.42)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.41';
+    const SCRIPT_VERSION = '0.7.42';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -77,6 +77,10 @@
         // v0.7.40: 카테고리 가이드라인 주입 전역 활성화 스위치 (boolean, 기본 true).
         //   중/한 게임 번역 외 프로프트에서는 false로 두면 Phase 3/4+5 프롬프트에 카테고리 블록이 주입되지 않는다.
         CATEGORY_GUIDELINES_ENABLED: 'tms_workflow_category_guidelines_enabled_v1',
+        // v0.7.42: 테스트/디버깅 용. ON이면 phase 실행 시 LLM에 전달한 prompt 본문을
+        //   run.promptLog에 누적 저장한다 (phase당 최근 3건 + 총 1MB cap).
+        //   기본 false. 용량 압박 시 즉시 OFF 해서 접고는 테스트 주기 용도.
+        VERBOSE_PROMPT_LOG_ENABLED: 'tms_workflow_verbose_prompt_log_enabled_v1',
     };
 
     // v0.7.7 (#10): 현재 스키마 버전. 신규 LS key/필드를 추가하거나 기존 구조를 변경할 때 +1.
@@ -2155,6 +2159,8 @@
         const out = { ...run };
         // raw segments: 무겁고 서버에서 다시 받을 수 있음 — 백업 제외
         delete out.segments;
+        // v0.7.42: verbose prompt 로그는 디버깅 전용이므로 백업에서 제외.
+        delete out.promptLog;
         // phase raw text도 제외 (parsed 만 보존)
         for (const k of ['phase12', 'phase3', 'phase45']) {
             if (out[k] && typeof out[k] === 'object') {
@@ -2480,6 +2486,56 @@
     }
     function saveCategoryGuidelinesEnabled(enabled) {
         return lsSet(LS_KEYS.CATEGORY_GUIDELINES_ENABLED, !!enabled);
+    }
+    // v0.7.42: verbose prompt 로깅 토글 (테스트/디버깅 전용). default false.
+    //   ON 시 phase 실행마다 LLM에게 보낸 prompt 본문 + 메타를 run.promptLog 에 push.
+    function loadVerbosePromptLogEnabled() {
+        return !!lsGet(LS_KEYS.VERBOSE_PROMPT_LOG_ENABLED, false);
+    }
+    function saveVerbosePromptLogEnabled(enabled) {
+        return lsSet(LS_KEYS.VERBOSE_PROMPT_LOG_ENABLED, !!enabled);
+    }
+    // phase당 최근 N건만 보관 + 총 크기 cap. 둘 다 넘으면 오래된 항목부터 prompt 본문을 [redacted]로 치환.
+    const PROMPT_LOG_PER_PHASE_KEEP = 3;
+    const PROMPT_LOG_TOTAL_BYTE_CAP = 1_000_000; // 1MB
+    function _gcPromptLog(promptLog) {
+        if (!Array.isArray(promptLog) || !promptLog.length) return promptLog;
+        // 1) phase별 최근 N건 초과는 prompt 본문 redact (메타는 보존).
+        const byPhase = {};
+        for (let i = promptLog.length - 1; i >= 0; i--) {
+            const e = promptLog[i];
+            const k = e.phase || 'unknown';
+            (byPhase[k] ||= []).push(i);
+        }
+        for (const idxs of Object.values(byPhase)) {
+            // idxs는 최신→오래된 순. KEEP 이후를 redact.
+            for (let j = PROMPT_LOG_PER_PHASE_KEEP; j < idxs.length; j++) {
+                const e = promptLog[idxs[j]];
+                if (e && typeof e.prompt === 'string') {
+                    e.promptRedacted = true;
+                    e.promptLength = e.prompt.length;
+                    e.prompt = `[redacted: phase ${e.phase}당 최근 ${PROMPT_LOG_PER_PHASE_KEEP}건만 본문 보존]`;
+                }
+            }
+        }
+        // 2) 총 byte cap 초과면 가장 오래된 항목부터 redact.
+        let totalBytes = promptLog.reduce((s, e) => s + (typeof e.prompt === 'string' ? e.prompt.length : 0), 0);
+        for (let i = 0; i < promptLog.length && totalBytes > PROMPT_LOG_TOTAL_BYTE_CAP; i++) {
+            const e = promptLog[i];
+            if (e && typeof e.prompt === 'string' && !e.promptRedacted) {
+                totalBytes -= e.prompt.length;
+                e.promptRedacted = true;
+                e.promptLength = e.prompt.length;
+                e.prompt = `[redacted: 전체 prompt log가 ${PROMPT_LOG_TOTAL_BYTE_CAP}byte cap 초과]`;
+            }
+        }
+        return promptLog;
+    }
+    function appendPromptLog(run, entry) {
+        if (!run) return;
+        if (!Array.isArray(run.promptLog)) run.promptLog = [];
+        run.promptLog.push(entry);
+        _gcPromptLog(run.promptLog);
     }
     // v0.7.38 (#D12): Phase 1+2 compact 결과의 cats 배열을 정규화.
     //   숫자 또는 {id:number}만 받고 카탈로그에 있는 것만 유지 + 중복 제거 + 0번은 항상 포함.
@@ -3870,6 +3926,7 @@
                 <div class="tw-batch-meta tw-muted">현재 페이지를 수집한 뒤 Phase를 순서대로 실행합니다.</div>
             </div>
             <div class="tw-batch-header-right">
+                <button class="tw-btn tw-btn-ghost tw-btn-toggle-prompt-log" title="ON이면 phase 실행마다 LLM에 전달한 prompt 본문을 run.promptLog에 누적해 로그 탭에서 확인할 수 있고, OFF는 메타만 남김 (테스트/디버깅 전용, LS 용량 주의)" data-prompt-log="0">📅 prompt log OFF</button>
                 <button class="tw-btn tw-btn-ghost tw-btn-toggle-compact" title="Phase stepper와 수집/검증 카드를 접어서 표를 더 빨리 보여줍니다 (localStorage 저장)" data-compact="0">📐 컴팩트</button>
                 <div class="tw-batch-status">대기 중</div>
             </div>
@@ -5236,6 +5293,27 @@
                 lsSet(LS_KEYS.COMPACT_MODE, next ? '1' : '0');
             });
         }
+        // v0.7.42: prompt log 토글 (테스트/디버깅 전용)
+        const promptLogBtn = $('.tw-btn-toggle-prompt-log', el);
+        if (promptLogBtn) {
+            const applyPromptLog = (on) => {
+                promptLogBtn.dataset.promptLog = on ? '1' : '0';
+                promptLogBtn.textContent = on ? '📅 prompt log ON' : '📅 prompt log OFF';
+                promptLogBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+            };
+            applyPromptLog(loadVerbosePromptLogEnabled());
+            promptLogBtn.addEventListener('click', () => {
+                const next = promptLogBtn.dataset.promptLog !== '1';
+                saveVerbosePromptLogEnabled(next);
+                applyPromptLog(next);
+                if (next) {
+                    toast('📅 prompt log ON — 다음 phase 실행부터 LLM 입력이 로그 탭에 기록됩니다. (LS 평문 저장, 테스트 후 OFF 권장)', 'info', 6000);
+                } else {
+                    toast('prompt log OFF — 기존 항목은 보존되며 새 phase는 메타만 남깁니다.', 'info', 4000);
+                }
+                renderLogOutput();
+            });
+        }
         $('.tw-btn-log-copy', el).addEventListener('click', onCopyLogOutput);
         $('.tw-btn-review-apply-selected', el).addEventListener('click', () => applyBatchTranslationsByIds(getSelectedReviewIds()));
         $('.tw-btn-review-apply-all', el).addEventListener('click', () => applyBatchTranslationsByIds(getReviewTranslationIds()));
@@ -6270,6 +6348,20 @@
         if (run.phase12?.raw) jsonBlocks.push(`\n\n=== Phase 1+2 raw ===\n${run.phase12.raw}`);
         if (run.phase3?.raw) jsonBlocks.push(`\n\n=== Phase 3 raw ===\n${run.phase3.raw}`);
         if (run.phase45?.raw) jsonBlocks.push(`\n\n=== Phase 4+5 raw ===\n${run.phase45.raw}`);
+        // v0.7.42: verbose prompt log — 시간순으로 LLM에 전달한 prompt 본문(또는 redact 안내)을 dump.
+        const promptLog = Array.isArray(run.promptLog) ? run.promptLog : [];
+        if (promptLog.length) {
+            const totalBytes = promptLog.reduce((s, e) => s + (typeof e.prompt === 'string' ? e.prompt.length : 0), 0);
+            jsonBlocks.push(`\n\n=== Prompt log (${promptLog.length}건, 본문 합 ${totalBytes}자) ===`);
+            for (const e of promptLog) {
+                const t = e.at ? new Date(e.at).toLocaleTimeString('ko-KR', { hour12: false }) : '';
+                const head = `--- Phase ${e.phase} · ${t} · model=${e.model || '-'} · attemptId=${e.attemptId || '-'} · len=${e.promptLength ?? (e.prompt || '').length}`
+                    + (Array.isArray(e.activeCategoryIds) && e.activeCategoryIds.length ? ` · cats=[${e.activeCategoryIds.join(',')}]` : '')
+                    + (e.promptRedacted ? ' · [redacted]' : '')
+                    + ' ---';
+                jsonBlocks.push(`\n\n${head}\n${e.prompt || ''}`);
+            }
+        }
         const totalLogs = (run.logs || []).length;
         const filterTag = (logView.level !== 'all' || logView.query)
             ? `[필터: 레벨=${logView.level}${logView.query ? `, q="${logView.query}"` : ''} → ${logLines.length}/${totalLogs}건]\n\n`
@@ -7696,6 +7788,22 @@
             const attemptId = makeAttemptId();
             const prompt = buildPromptForPhase(run, phaseTag, attemptId);
             appendBatchLog(`Phase ${phaseTag} 실행 시작, prompt length=${prompt.length}, attemptId=${attemptId}`);
+            // v0.7.42: verbose prompt 로깅 ON일 때만 LLM에 전달한 prompt 본문을 run.promptLog 에 누적.
+            //   용량 cap과 phase당 건수 cap은 _gcPromptLog 가 처리.
+            try {
+                if (loadVerbosePromptLogEnabled()) {
+                    const activeIds = Array.isArray(run.activeCategoryIds) ? [...run.activeCategoryIds] : [];
+                    appendPromptLog(run, {
+                        at: new Date().toISOString(),
+                        phase: phaseTag,
+                        attemptId,
+                        model: run.model || '',
+                        promptLength: prompt.length,
+                        prompt,
+                        activeCategoryIds: activeIds,
+                    });
+                }
+            } catch (e) { dwarn('promptLog 기록 실패', e); }
 
             // v0.7.28 (#D2-P0-2): stale result 오판 차단을 위해 실행 직전 storage cell의
             //   실제 raw를 snapshot으로 잡는다. 기존 in-memory `run.phase12?.raw` 기반은
