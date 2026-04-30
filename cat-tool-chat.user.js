@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.33
+// @version      0.7.34
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.33)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.34)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -33,10 +33,10 @@
     //   §15 Batch workflow state + prompt builders             ............ ~2933
     //   §16 모달 UI (HTML 템플릿 + CSS)                        ............ ~3515
     //   §17 이벤트 핸들러 (배치/리뷰/세션/워크스페이스)        ............ ~4801
-    //   §18 모달 Show/Hide + 세그먼트 자동 감지                ............ ~7316
-    //   §19 채팅 흐름                                          ............ ~7509
-    //   §20 시스템 프롬프트/설정 패널 (모달 우측)              ............ ~7896
-    //   §21 단축키 등록 (Alt+Z) + 디버그 export                ............ ~8972
+    //   §18 모달 Show/Hide + 세그먼트 자동 감지                ............ ~7380
+    //   §19 채팅 흐름                                          ............ ~7573
+    //   §20 시스템 프롬프트/설정 패널 (모달 우측)              ............ ~7960
+    //   §21 단축키 등록 (Alt+Z) + 디버그 export                ............ ~9036
     // ========================================================================
     // 버전 주석 정책 (v0.7.15~):
     //   - v0.7.x : 변경 맥락이 살아있을 동안 inline 유지
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.33';
+    const SCRIPT_VERSION = '0.7.34';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -3034,7 +3034,13 @@
             try { toast('⚠ batch run 저장 실패 — LS 용량 증가로 인한 가능성. 워크스페이스 탭에서 오래된 run 정리를 시도하세요.', 'error'); } catch (_) {}
             return;
         }
-        setActiveBatchRunId(run.runId);
+        // v0.7.34 (#D8-P1-6): active run hijack 방지.
+        //   다른 탭/사용자가 별도 run을 active로 둔 상태에서 background 완료가
+        //   발생해도 active를 흔들지 않는다. active가 비었거나 자기 자신이면 reaffirm.
+        const _activeNow = getActiveBatchRunId();
+        if (!_activeNow || _activeNow === run.runId) {
+            setActiveBatchRunId(run.runId);
+        }
         // v0.7.7 (#12): phase45 완료 전이(신규/재시도)에만 backup trigger
         if (run.status === 'phase45_ready' && prevStatus !== 'phase45_ready') {
             try { triggerBackupAsync('run-complete'); } catch (e) { dwarn('run-complete backup 실패', e); }
@@ -5269,17 +5275,70 @@
     // v0.7.29 (#D3-P1-3): batch 작업 전역 mutex.
     //   confirm 구간, collect/reset/active 전환 중 race를 막는다. status 기반
     //   isBatchBusy는 confirm 이후에만 set되므로, 그 이전 구간에는 별도 lock 필요.
-    let _batchOpLock = null;
+    // v0.7.34 (#D8-P1-1): cross-tab lease.
+    //   기존 _batchOpLock은 같은 IIFE 내 메모리 변수라 다른 탭/창에서 동시에
+    //   onRunBatchPhase / onBatchCollect를 누르면 둘 다 통과돼 storage cell race가
+    //   재발할 수 있었다. localStorage 기반 lease + heartbeat로 cross-tab 직렬화.
+    //   TTL을 넘긴 stale lease는 takeover 허용해 죽은 탭이 영구히 lock을 잡지 않게 한다.
+    const LS_KEY_BATCH_LEASE = 'tms_workflow_batch_op_lease_v1';
+    const BATCH_LEASE_TTL_MS = 15000;
+    const BATCH_LEASE_HEARTBEAT_MS = 5000;
+    const _tabId = `tab_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    let _batchOpLock = null; // 같은 탭 re-entry 빠른 차단용 in-memory 미러
+
+    function _readBatchLease() {
+        try {
+            const raw = localStorage.getItem(LS_KEY_BATCH_LEASE);
+            if (!raw) return null;
+            const lease = JSON.parse(raw);
+            return (lease && typeof lease === 'object') ? lease : null;
+        } catch { return null; }
+    }
+    function _writeBatchLease(lease) {
+        try { localStorage.setItem(LS_KEY_BATCH_LEASE, JSON.stringify(lease)); return true; }
+        catch { return false; }
+    }
+    function _clearBatchLease(expectedTabId) {
+        const cur = _readBatchLease();
+        if (cur && cur.tabId !== expectedTabId) return; // 다른 탭이 takeover한 상태면 건드리지 않는다
+        try { localStorage.removeItem(LS_KEY_BATCH_LEASE); } catch {}
+    }
+    function _isLeaseStale(lease) {
+        if (!lease) return true;
+        const last = lease.heartbeat || lease.at || 0;
+        return Date.now() - last > BATCH_LEASE_TTL_MS;
+    }
+
     async function withBatchLock(kind, fn) {
-        if (_batchOpLock) {
-            const ageSec = Math.floor((Date.now() - _batchOpLock.at) / 1000);
-            toast(`이미 batch 작업 중: ${_batchOpLock.kind} (${ageSec}s)`, 'warn');
+        const cur = _readBatchLease();
+        if (cur && !_isLeaseStale(cur)) {
+            const ageSec = Math.floor((Date.now() - (cur.at || Date.now())) / 1000);
+            const where = cur.tabId === _tabId ? '이 탭' : '다른 탭';
+            toast(`이미 batch 작업 중 (${where}): ${cur.kind} (${ageSec}s)`, 'warn');
             return;
         }
-        _batchOpLock = { kind, at: Date.now() };
+        const now = Date.now();
+        const lease = { kind, tabId: _tabId, at: now, heartbeat: now };
+        if (!_writeBatchLease(lease)) {
+            toast('batch lock 획득 실패 (LS write 실패)', 'error');
+            return;
+        }
+        _batchOpLock = { kind, at: now };
+        const heartbeatTimer = setInterval(() => {
+            const c = _readBatchLease();
+            if (!c || c.tabId !== _tabId) {
+                // 다른 탭이 takeover (TTL 초과로 우리 lease가 stale 판정 후 덮어쓰임)
+                clearInterval(heartbeatTimer);
+                return;
+            }
+            c.heartbeat = Date.now();
+            _writeBatchLease(c);
+        }, BATCH_LEASE_HEARTBEAT_MS);
         try {
             return await fn();
         } finally {
+            clearInterval(heartbeatTimer);
+            _clearBatchLease(_tabId);
             _batchOpLock = null;
         }
     }
@@ -6157,22 +6216,29 @@
         }).join('');
         listEl.innerHTML = head + body;
     }
+    // v0.7.34 (#D8-P1-6): active 전환도 batch lock 안에서. 다른 탭에서 phase 실행 중인데
+    //   여기서 active를 다른 run으로 바꾸면 phase 결과가 새 active run에 잘못 반영될 수 있다.
     function onActivateRun(runId) {
-        if (!runId) return;
-        const runs = loadBatchRuns();
-        if (!runs[runId]) { toast('run을 찾을 수 없습니다.', 'error'); return; }
-        // v0.7.2: 새로 활성화하는 run을 비교 대상으로 두면 안 되므로 자기 비교 충돌 시 비교 종료
-        if (reviewView.compareMode && reviewView.compareRunId === runId) {
-            reviewView.compareMode = false;
-            reviewView.compareRunId = null;
-        }
-        setActiveBatchRunId(runId);
-        syncBatchRunFromLs();
-        renderBatchRun();
-        renderHistoryPanel();
-        toast(`run ${runId} 활성화`, 'success');
+        return withBatchLock(`activate ${runId}`, async () => {
+            if (!runId) return;
+            const runs = loadBatchRuns();
+            if (!runs[runId]) { toast('run을 찾을 수 없습니다.', 'error'); return; }
+            // v0.7.2: 새로 활성화하는 run을 비교 대상으로 두면 안 되므로 자기 비교 충돌 시 비교 종료
+            if (reviewView.compareMode && reviewView.compareRunId === runId) {
+                reviewView.compareMode = false;
+                reviewView.compareRunId = null;
+            }
+            setActiveBatchRunId(runId);
+            syncBatchRunFromLs();
+            renderBatchRun();
+            renderHistoryPanel();
+            toast(`run ${runId} 활성화`, 'success');
+        });
     }
+    // v0.7.34 (#D8-P1-6): 삭제도 batch lock 안에서. phase 실행 중인 run을 다른 탭에서 지우면
+    //   storePhaseResult가 사라진 run에 쓰려다 race가 발생.
     async function onDeleteRun(runId) {
+        return withBatchLock(`delete ${runId}`, async () => {
         if (!runId) return;
         const isActive = runId === getActiveBatchRunId();
         const msg = (isActive ? '⚠ 현재 활성 run을 삭제합니다.\n\n' : '')
@@ -6200,6 +6266,7 @@
         }
         renderHistoryPanel();
         toast(`run ${runId} 삭제됨`, 'success');
+        });
     }
     // v0.7.2: 라벨 변경 — runId는 유지하고 사용자 친화적 이름만 추가/수정
     function onRenameRun(runId) {
@@ -7265,7 +7332,9 @@
         }); // withBatchLock
     }
 
+    // v0.7.34 (#D8-P1-6): refetch도 batch lock 안에서. phase 실행 / 다른 탭 refetch와 storage cell race 방지.
     async function onBatchRefetchResult() {
+        return withBatchLock('refetch', async () => {
         const run = ensureBatchRun();
         if (!run.storageStringId || !run.lastExpectedPhase) {
             toast('다시 읽을 Phase 결과가 없습니다.', 'error');
@@ -7310,6 +7379,7 @@
             renderBatchRun();
             toast(error.message, 'error', 5000);
         }
+        }); // withBatchLock
     }
 
     // ========================================================================
