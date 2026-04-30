@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.23
+// @version      0.7.24
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.23)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.24)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.23';
+    const SCRIPT_VERSION = '0.7.24';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -437,6 +437,65 @@
             cancelBtn.addEventListener('click', () => cleanup(false));
             okBtn.addEventListener('click', () => cleanup(true));
             overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(false); });
+            setTimeout(() => okBtn.focus(), 0);
+        });
+    }
+
+    // v0.7.24 (#C3-P1-14): 부분 복원 범위 선택 다이얼로그.
+    //   resolve {sessions, overrides, runs} | null (취소).
+    //   counts 파라미터 (선택): { sessions, runs, overrides } 표시용.
+    function twChooseRestoreScope({ slot, counts = null } = {}) {
+        return new Promise((resolve) => {
+            const overlay = document.createElement('div');
+            overlay.className = 'tw-confirm-overlay';
+            const dialog = document.createElement('div');
+            dialog.className = 'tw-confirm-dialog tw-confirm-danger';
+            const titleEl = document.createElement('div');
+            titleEl.className = 'tw-confirm-title';
+            titleEl.textContent = `slot ${slot} 부분 복원`;
+            const msgEl = document.createElement('div');
+            msgEl.className = 'tw-confirm-message';
+            const cs = counts ? ` (세션 ${counts.sessions ?? '?'} · run ${counts.runs ?? '?'} · override ${counts.overrides ?? '?'})` : '';
+            msgEl.innerHTML = `복원할 항목을 선택하세요${escapeHtml(cs)}.<br><br>
+                <label style="display:block;margin:4px 0;"><input type="checkbox" class="tw-rs-sessions" checked> 세션 (sessions)</label>
+                <label style="display:block;margin:4px 0;"><input type="checkbox" class="tw-rs-runs" checked> Batch Run (batchRuns)</label>
+                <label style="display:block;margin:4px 0;"><input type="checkbox" class="tw-rs-overrides" checked> Override (reviewOverrides)</label>
+                <div style="margin-top:8px;color:var(--tw-muted);font-size:11px;">선택한 항목만 LS에 덮어쓰며, 비선택 항목은 그대로 유지됩니다.</div>`;
+            const btns = document.createElement('div');
+            btns.className = 'tw-confirm-buttons';
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'tw-btn tw-btn-ghost tw-confirm-cancel';
+            cancelBtn.textContent = '취소';
+            const okBtn = document.createElement('button');
+            okBtn.className = 'tw-btn tw-btn-danger tw-confirm-ok';
+            okBtn.textContent = '복원';
+            btns.append(cancelBtn, okBtn);
+            dialog.append(titleEl, msgEl, btns);
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+            const cleanup = (val) => {
+                document.removeEventListener('keydown', onKey, true);
+                overlay.remove();
+                resolve(val);
+            };
+            const onKey = (e) => {
+                if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); cleanup(null); }
+            };
+            document.addEventListener('keydown', onKey, true);
+            cancelBtn.addEventListener('click', () => cleanup(null));
+            okBtn.addEventListener('click', () => {
+                const scope = {
+                    sessions: !!dialog.querySelector('.tw-rs-sessions')?.checked,
+                    runs: !!dialog.querySelector('.tw-rs-runs')?.checked,
+                    overrides: !!dialog.querySelector('.tw-rs-overrides')?.checked,
+                };
+                if (!scope.sessions && !scope.runs && !scope.overrides) {
+                    try { toast('복원할 항목을 하나 이상 선택하세요.', 'warn'); } catch {}
+                    return;
+                }
+                cleanup(scope);
+            });
+            overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(null); });
             setTimeout(() => okBtn.focus(), 0);
         });
     }
@@ -1956,7 +2015,16 @@
 
     // v0.7.9: 특정 슬롯에서 강제 복원 (수동 트리거). 호출부에서 confirm 책임.
     // mode: 'overwrite' (기본 — LS 통째 교체) | 'merge' (슬롯이 가진 키만 덮어씀)
-    async function restoreFromBackupSlot(slot, mode = 'overwrite') {
+    // v0.7.24 (#C3-P1-14): scope 인자로 부분 복원 지원. 기본값은 전체 true (기존 동작 호환).
+    async function restoreFromBackupSlot(slot, mode = 'overwrite', scope = { sessions: true, overrides: true, runs: true }) {
+        const sc = {
+            sessions: scope?.sessions !== false,
+            overrides: scope?.overrides !== false,
+            runs: scope?.runs !== false,
+        };
+        if (!sc.sessions && !sc.overrides && !sc.runs) {
+            throw new Error('복원할 항목을 하나 이상 선택하세요.');
+        }
         const all = await readAllBackupSlots();
         const snap = all.find(s => s && s.slot === slot);
         if (!snap) throw new Error(`slot ${slot} 비어 있음`);
@@ -1968,34 +2036,36 @@
         //   merge 모드에서 snap.runs가 없으면 batchRuns step을 건너뛴다.
         let runsOk = true;
         if (mode === 'overwrite') {
-            runsOk = saveBatchRuns(restoredRuns, { skipGc: true });
-            if (!runsOk) {
-                try { logActivity('error', `IDB 복원(overwrite): batch run 저장 실패 — sessions/overrides 복원 중단 slot=${slot}`, { runs: Object.keys(restoredRuns).length }); } catch (_) {}
-                throw new Error('batch run 저장 실패 — sessions/overrides는 복원하지 않았습니다. 오래된 run 정리 후 다시 시도하세요.');
+            if (sc.runs) {
+                runsOk = saveBatchRuns(restoredRuns, { skipGc: true });
+                if (!runsOk) {
+                    try { logActivity('error', `IDB 복원(overwrite): batch run 저장 실패 — sessions/overrides 복원 중단 slot=${slot}`, { runs: Object.keys(restoredRuns).length }); } catch (_) {}
+                    throw new Error('batch run 저장 실패 — sessions/overrides는 복원하지 않았습니다. 오래된 run 정리 후 다시 시도하세요.');
+                }
             }
-            const sOk = saveSessions(snap.sessions || {});
-            const oOk = saveReviewOverrides(snap.overrides || {});
+            const sOk = sc.sessions ? saveSessions(snap.sessions || {}) : true;
+            const oOk = sc.overrides ? saveReviewOverrides(snap.overrides || {}) : true;
             if (!sOk || !oOk) {
                 try { logActivity('error', `IDB 복원(overwrite): sessions/overrides 저장 실패 slot=${slot}`, { sOk, oOk }); } catch (_) {}
                 throw new Error('sessions/overrides 저장 실패 — batch run은 복원되었으나 나머지 독립 복원 실패.');
             }
         } else {
             // merge: 슬롯이 가진 키만 덮어씀
-            if (snap.runs) {
+            if (sc.runs && snap.runs) {
                 runsOk = saveBatchRuns({ ...loadBatchRuns(), ...restoredRuns }, { skipGc: true });
                 if (!runsOk) {
                     try { logActivity('error', `IDB 복원(merge): batch run 저장 실패 — sessions/overrides merge 중단 slot=${slot}`, { runs: Object.keys(restoredRuns).length }); } catch (_) {}
                     throw new Error('batch run 저장 실패 — sessions/overrides는 merge하지 않았습니다. 오래된 run 정리 후 다시 시도하세요.');
                 }
             }
-            if (snap.sessions) {
+            if (sc.sessions && snap.sessions) {
                 const ok = saveSessions({ ...loadSessions(), ...snap.sessions });
                 if (!ok) {
                     try { logActivity('error', `IDB 복원(merge): sessions 저장 실패 slot=${slot}`); } catch (_) {}
                     throw new Error('sessions 저장 실패 — batch run은 merge되었으나 sessions 실패.');
                 }
             }
-            if (snap.overrides) {
+            if (sc.overrides && snap.overrides) {
                 const cur = loadReviewOverrides();
                 const merged = { ...cur };
                 for (const [rid, b] of Object.entries(snap.overrides)) {
@@ -2009,9 +2079,10 @@
             }
         }
         return {
-            sessions: Object.keys(snap.sessions || {}).length,
-            overrides: Object.values(snap.overrides || {}).reduce((s, b) => s + Object.keys(b || {}).length, 0),
-            runs: Object.keys(snap.runs || {}).length,
+            sessions: sc.sessions ? Object.keys(snap.sessions || {}).length : 0,
+            overrides: sc.overrides ? Object.values(snap.overrides || {}).reduce((s, b) => s + Object.keys(b || {}).length, 0) : 0,
+            runs: sc.runs ? Object.keys(snap.runs || {}).length : 0,
+            scope: sc,
         };
     }
 
@@ -3724,6 +3795,11 @@
     background: rgba(96,165,250,0.18); color: #60a5fa; border: 1px solid rgba(96,165,250,0.4);
     padding: 1px 6px; border-radius: 4px; font-size: 10px; white-space: nowrap; cursor: help;
 }
+/* v0.7.24 (#C3-P0-4): currentStringId ≠ run.storageStringId 일 때 쓰기 대상 배지 */
+.tw-batch-run-header .tw-run-storage-mismatch {
+    background: rgba(244,114,182,0.18); color: #f472b6; border: 1px solid rgba(244,114,182,0.4);
+    padding: 1px 6px; border-radius: 4px; font-size: 10px; white-space: nowrap; cursor: help;
+}
 /* Phase stepper — 좁은 사이드바(290px)에서도 깨지지 않게 세로 스택 */
 .tw-batch-stepper {
     display: flex; align-items: stretch; gap: 0; flex-wrap: nowrap;
@@ -5202,12 +5278,24 @@
             const ra = run.restoredAt ? String(run.restoredAt).slice(0, 19).replace('T', ' ') : '';
             restoredBadge = `<span class="tw-run-restored-badge" title="이 run은 IDB 백업에서 복원되었습니다 (${escapeHtml(ra)}). segments raw가 없어 Phase 재실행은 불가하며, 결과 검토/적용만 가능합니다.\n재실행이 필요하면 같은 file/lang에서 새로 수집을 시작하세요.">📦 백업 복원 · 재실행 불가</span>`;
         }
+        // v0.7.24 (#C3-P0-4): currentStringId가 run.storageStringId와 다르면 경고 칩.
+        //   Phase 결과가 항상 storageStringId 세그먼트의 번역 칸에 써지므로
+        //   사용자가 "현재 세그먼트 = 쓰기 대상"으로 오해하는 걸 막는다.
+        let storageBadge = '';
+        try {
+            const ssid = run.storageStringId ? String(run.storageStringId) : '';
+            const csid = currentStringId ? String(currentStringId) : '';
+            if (ssid && csid && normalizeId(ssid) !== normalizeId(csid)) {
+                storageBadge = `<span class="tw-run-storage-mismatch" title="Phase 재실행 결과는 storageStringId=${escapeHtml(ssid)} 세그먼트의 번역 칸에 써집니다. 현재 보고 있는 세그먼트(${escapeHtml(csid)})가 아닙니다.">📝 쓰기 대상: ${escapeHtml(ssid)}</span>`;
+            }
+        } catch (_) { /* normalizeId 실패 — 배지 생략 */ }
         el.innerHTML = `
             <span class="tw-batch-run-id" title="runId: ${escapeHtml(String(run.runId || ''))}${run.label ? `\n라벨: ${escapeHtml(String(run.label))}` : ''}">🏃 ${escapeHtml(run.label || runIdShort)}</span>
             <span class="tw-batch-run-meta">project <b>${escapeHtml(String(run.projectId || '?'))}</b> / file <b>${escapeHtml(String(run.fileId || '?'))}</b> / lang <b>${escapeHtml(String(run.languageId || '?'))}</b></span>
             <span class="tw-batch-run-meta">override <b>${overrides}</b></span>
             ${pageBadge}
             ${restoredBadge}
+            ${storageBadge}
             <span class="tw-batch-run-stamp">${escapeHtml(stamp)}</span>
         `;
     }
@@ -7922,6 +8010,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                         <div class="tw-ws-actions">
                             <button type="button" class="tw-btn tw-btn-ghost tw-btn-ws-slot-download" data-slot="${slot}" title="JSON 다운로드">📤</button>
                             <button type="button" class="tw-btn tw-btn-danger tw-btn-ws-slot-restore" data-slot="${slot}" title="이 슬롯으로 LS 통째 덮어쓰기">♻ 복원</button>
+                            <button type="button" class="tw-btn tw-btn-danger tw-btn-ws-slot-restore-partial" data-slot="${slot}" title="복원 항목 선택 후 부분 복원">♻ 선택</button>
                         </div>
                     </td>
                 </tr>`;
@@ -8084,7 +8173,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     return;
                 }
                 const rs = e.target.closest('.tw-btn-ws-slot-restore');
-                if (rs) {
+                if (rs && !e.target.closest('.tw-btn-ws-slot-restore-partial')) {
                     const slot = Number(rs.getAttribute('data-slot'));
                     const ok = await twConfirm({
                         title: 'IDB 슬롯 복원',
@@ -8102,6 +8191,35 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                         // 활성 run 메모리 동기화
                         try { syncBatchRunFromLs(); renderBatchRun(); } catch {}
                     } catch (err) { toast(`복원 실패: ${err.message}`, 'error'); }
+                    return;
+                }
+                // v0.7.24 (#C3-P1-14): 부분 복원 — 범위 선택 다이얼로그 후 제한된 scope만 덮어씀.
+                const rsp = e.target.closest('.tw-btn-ws-slot-restore-partial');
+                if (rsp) {
+                    const slot = Number(rsp.getAttribute('data-slot'));
+                    let counts = null;
+                    try {
+                        const all = await readAllBackupSlots();
+                        const s = all.find(x => x && x.slot === slot);
+                        if (!s) { toast(`slot ${slot} 비어 있음`, 'warn'); return; }
+                        counts = {
+                            sessions: Object.keys(s.sessions || {}).length,
+                            runs: Object.keys(s.runs || {}).length,
+                            overrides: Object.values(s.overrides || {}).reduce((acc, b) => acc + Object.keys(b || {}).length, 0),
+                        };
+                    } catch (_) { /* counts 없이도 다이얼로그는 열 수 있음 */ }
+                    const scope = await twChooseRestoreScope({ slot, counts });
+                    if (!scope) return;
+                    try {
+                        triggerBackupAsync('pre-restore');
+                        await new Promise(r => setTimeout(r, 200));
+                        const r = await restoreFromBackupSlot(slot, 'overwrite', scope);
+                        const picked = [scope.sessions && '세션', scope.runs && 'run', scope.overrides && 'override'].filter(Boolean).join(' / ');
+                        logActivity('restore', `IDB 슬롯 부분 복원`, { slot, picked, sessions: r.sessions, runs: r.runs, overrides: r.overrides });
+                        toast(`부분 복원 완료(${picked}): 세션 ${r.sessions} / run ${r.runs} / override ${r.overrides}`, 'success');
+                        refreshWorkspaceUi();
+                        try { syncBatchRunFromLs(); renderBatchRun(); } catch {}
+                    } catch (err) { toast(`부분 복원 실패: ${err.message}`, 'error'); }
                     return;
                 }
             });
