@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.45
+// @version      0.7.46
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.45)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.46)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.45';
+    const SCRIPT_VERSION = '0.7.46';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -2690,25 +2690,58 @@
     }
     // v0.7.38 (#D12): Phase 3/4+5 프롬프트에 끼울 카테고리 가이드라인 블록 빌드.
     //   activeIds 중 content가 채워진 것만 포함. 모두 비어있으면 빈 문자열.
-    //   v0.7.40: 전역 스위치가 false면 조기 반환 (다른 워크플로우에서 주입 완전 차단).
-    function buildActiveCategoryGuidelinesBlock(activeIds) {
+    //   v0.7.40: 전역 스위치가 false면 조기 반환.
+    //   v0.7.46: opts.checklistOnly=true면 각 카테고리 본문에서 "### ✅ ... 체크리스트" 섹션만 추출 (Phase 4+5 검수용).
+    function buildActiveCategoryGuidelinesBlock(activeIds, opts) {
         if (!loadCategoryGuidelinesEnabled()) return '';
+        const checklistOnly = !!(opts && opts.checklistOnly);
         const ids = Array.isArray(activeIds) ? activeIds : [];
         const map = loadCategoryGuidelines();
         const sections = [];
         for (const id of ids) {
-            const content = (map[id]?.content || '').trim();
-            if (!content) continue;
+            const rawContent = (map[id]?.content || '').trim();
+            if (!rawContent) continue;
+            const content = checklistOnly ? extractCategoryChecklist(rawContent) : rawContent;
+            if (!content.trim()) continue;
             sections.push(`## [카테고리 ${id}] ${getCategoryName(id)}\n${content}`);
         }
         if (!sections.length) return '';
+        const header = checklistOnly
+            ? [
+                '# 활성 카테고리별 검수 체크리스트',
+                '아래 항목은 활성 카테고리 가이드라인의 "✅ 최종 점검 체크리스트"만 추출한 것입니다.',
+                '검수 시 각 bullet을 위반 여부 판정에 활용하세요.',
+            ]
+            : [
+                '# 활성 카테고리별 세부 가이드라인',
+                '아래 가이드라인은 Phase 1+2 분석에서 활성화된 카테고리에 해당합니다.',
+                '번역/검수 시 시스템 프롬프트와 함께 반드시 준수하세요.',
+            ];
         return [
-            '# 활성 카테고리별 세부 가이드라인',
-            '아래 가이드라인은 Phase 1+2 분석에서 활성화된 카테고리에 해당합니다.',
-            '번역/검수 시 시스템 프롬프트와 함께 반드시 준수하세요.',
+            ...header,
             '',
             ...sections,
         ].join('\n\n');
+    }
+
+    // v0.7.46: 카테고리 본문에서 "### ✅ ... 체크리스트" 섹션만 추출.
+    //   모든 카테고리 가이드라인이 동일한 구조를 따르므로 (### ✅ ... ~ 다음 ### 또는 "---" 또는 EOF) 안전하게 추출 가능.
+    //   섹션을 찾지 못하면 원본 그대로 반환 (안전 폴백).
+    function extractCategoryChecklist(content) {
+        if (typeof content !== 'string' || !content) return '';
+        const lines = content.split(/\r?\n/);
+        let startIdx = -1;
+        for (let i = 0; i < lines.length; i++) {
+            // "### ✅ " 시작 또는 "### ✅ ... 체크리스트" 패턴을 허용.
+            if (/^###\s+✅/.test(lines[i])) { startIdx = i; break; }
+        }
+        if (startIdx < 0) return content; // 섹션 미발견 → 원본 폴백.
+        let endIdx = lines.length;
+        for (let j = startIdx + 1; j < lines.length; j++) {
+            const ln = lines[j];
+            if (/^###?\s+/.test(ln) || /^---\s*$/.test(ln)) { endIdx = j; break; }
+        }
+        return lines.slice(startIdx, endIdx).join('\n').trim();
     }
 
     // ----- 활성 프롬프트 ID: 채팅/배치 분리 (v0.4.0+) -----
@@ -3699,22 +3732,20 @@
     }
 
     function getWorkflowBasePrompt(phaseTag) {
-        // v0.7.43: Phase별 사용자 슬롯이 있으면 그 본문을 사용, 없으면 기존 chat 프롬프트로 폴백.
+        // v0.7.43: Phase별 사용자 슬롯이 있으면 그 본문을 사용.
         // v0.7.44: 슬롯 본문(또는 디폴트 시드) 위에 BATCH_PHASE_FRAME을 항상 prepend.
-        //   레거시 폴백(chat 프롬프트) 경로에서는 frame을 끼우지 않는다 — 폴백 본문이 이미 자체 frame을 포함한 monolith라고 가정.
+        // v0.7.46: legacy chat active prompt 폴백 로직 제거. 22개 카테고리 가이드라인급 디폴트 시드가
+        //   코드에 상주하므로 슬롯이 비어도 디폴트가 감당. 둘 다 비어 있는 상황은 설계상 발생 불가.
         const slot = phaseTagToSlot(phaseTag);
-        if (slot) {
-            const slotBody = (getBatchPhasePrompt(slot) || '').trim();
-            if (slotBody) {
-                return `${BATCH_PHASE_FRAME}\n\n${slotBody}`;
-            }
+        if (!slot) {
+            throw new Error(`getWorkflowBasePrompt: 알 수 없는 phaseTag "${phaseTag}". '1+2'/'3'/'4+5' 중 하나여야 합니다.`);
         }
-        const activePrompt = getBatchActivePrompt();
-        const content = activePrompt?.content || '';
-        if (!content.trim()) {
-            throw new Error('배치 실행에는 v3.1 워크플로우 시스템 프롬프트가 필요합니다. 설정에서 프롬프트를 먼저 선택하거나 Phase 프롬프트 슬롯을 채워주세요.');
+        const stored = (getBatchPhasePrompt(slot) || '').trim();
+        const body = stored || (BATCH_PHASE_PROMPT_DEFAULTS[slot] || '').trim();
+        if (!body) {
+            throw new Error(`Phase 프롬프트 슬롯 [${slot}] 본문과 디폴트 시드가 모두 비어 있습니다. 설정 탭에서 프롬프트를 채워주세요.`);
         }
-        return content.trim();
+        return `${BATCH_PHASE_FRAME}\n\n${body}`;
     }
 
     function formatBatchSegmentList(run) {
@@ -3758,9 +3789,11 @@
         // v0.7.38 (#D12): Phase 3/4+5에 한해 활성 카테고리 가이드라인을 주입.
         //   Phase 1+2는 카테고리 자체를 결정하는 단계라 주입하지 않는다.
         //   activeCategoryIds가 비어있거나 모든 슬롯이 비면 빈 문자열 → 블록 생략.
+        //   v0.7.46: Phase 4+5(검수)에서는 추소의 체크리스트만 추출해 토큰 절감 (Phase 3 번역은 전체 본문 유지).
         const categoryBlocks = (phaseTag === '3' || phaseTag === '4+5')
             ? (function () {
-                const block = buildActiveCategoryGuidelinesBlock(run.activeCategoryIds || []);
+                const checklistOnly = (phaseTag === '4+5');
+                const block = buildActiveCategoryGuidelinesBlock(run.activeCategoryIds || [], { checklistOnly });
                 return block ? ['---', block] : [];
             })()
             : [];
@@ -5307,24 +5340,21 @@
 .tw-category-item.is-active { border-left: 3px solid #4ade80; padding-left: 7px; }
 .tw-category-item.is-hidden { display: none; }
 .tw-category-item > summary { gap: 8px; }
-.tw-category-summary-label { flex: 0 0 auto; }
+/* v0.7.46: 레이아웃 — label은 좌측 우세 + 우측으로 손을 뻗고, active/len/badge는 우측 정렬. */
+.tw-category-summary-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tw-category-summary-active {
+    flex: 0 0 auto;
     font-size: 10px; font-weight: 700; color: #052e16;
     background: #4ade80; padding: 1px 6px; border-radius: 8px;
     text-transform: none; letter-spacing: 0;
 }
 .tw-category-summary-len {
+    flex: 0 0 auto;
     font-size: 10px; color: #888; font-weight: 400;
     text-transform: none; letter-spacing: 0;
 }
-.tw-category-summary-preview {
-    flex: 1 1 auto; min-width: 0;
-    font-size: 11px; font-weight: 400; color: #777;
-    text-transform: none; letter-spacing: 0;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    text-align: right;
-}
-.tw-category-item[open] .tw-category-summary-preview { display: none; }
+/* v0.7.46: 접기 상태 미리보기 텍스트 제거. 클래스는 잘아남아 있을 수 있으며 녹다운드. */
+.tw-category-summary-preview { display: none !important; }
 `;
         document.head.appendChild(style);
     }
@@ -8975,8 +9005,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                         body = getWorkflowBasePrompt(_slotToPhaseTag[slot]) || '';
                         const stored = loadBatchPhasePrompts();
                         if (typeof stored[slot] === 'string' && stored[slot].trim()) source = '사용자 슬롯 + Frame';
-                        else if ((BATCH_PHASE_PROMPT_DEFAULTS[slot] || '').trim()) source = '디폴트 시드 + Frame';
-                        else source = 'chat 활성 프롬프트 (legacy 폴백)';
+                        else source = '디폴트 시드 + Frame';
                     } catch (err) {
                         body = `[미리보기 실패] ${err && err.message || err}`;
                         source = 'error';
@@ -9058,8 +9087,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 const badgeCls = filled ? 'is-filled' : 'is-empty';
                 const badgeChar = filled ? '●' : '○';
                 const len = content.length;
-                const previewSrc = content.replace(/\s+/g, ' ').trim();
-                const preview = previewSrc.length > 60 ? previewSrc.slice(0, 60) + '…' : previewSrc;
                 const itemCls = [
                     'tw-category-item',
                     isActive ? 'is-active' : '',
@@ -9073,7 +9100,6 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                             ${isActive ? '<span class="tw-category-summary-active" title="현재 run에서 활성">⚡활성</span>' : ''}
                             <span class="tw-category-summary-len">${len}자</span>
                             <span class="tw-category-summary-badge ${badgeCls}">${badgeChar}</span>
-                            ${preview ? `<span class="tw-category-summary-preview">${escapeHtml(preview)}</span>` : ''}
                         </summary>
                         <textarea class="tw-category-content" data-id="${cat.id}"
                             placeholder="이 카테고리의 세부 가이드라인을 입력하세요. 비워 두면 주입되지 않습니다."
@@ -9107,19 +9133,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                         }
                         const lenEl = det.querySelector('.tw-category-summary-len');
                         if (lenEl) lenEl.textContent = `${ta.value.length}자`;
-                        const prevEl = det.querySelector('.tw-category-summary-preview');
-                        const previewSrc = (ta.value || '').replace(/\s+/g, ' ').trim();
-                        const preview = previewSrc.length > 60 ? previewSrc.slice(0, 60) + '…' : previewSrc;
-                        if (prevEl) prevEl.textContent = preview;
-                        else if (preview) {
-                            const sumEl = det.querySelector('summary');
-                            if (sumEl) {
-                                const span = document.createElement('span');
-                                span.className = 'tw-category-summary-preview';
-                                span.textContent = preview;
-                                sumEl.appendChild(span);
-                            }
-                        }
+                        // v0.7.46: 미리보기 텍스트 갱신 로직 제거 — 접기 상태 preview는 파이프라인에서 완전히 제거됨.
                         det.classList.toggle('is-empty', !filled);
                         const id2 = Number(ta.dataset.id);
                         const hideOn = !!(hideEmptyToggle && hideEmptyToggle.checked);
