@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.28
+// @version      0.7.29
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.28)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.29)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.28';
+    const SCRIPT_VERSION = '0.7.29';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -5119,6 +5119,24 @@
             || status === 'phase45_running';
     }
 
+    // v0.7.29 (#D3-P1-3): batch 작업 전역 mutex.
+    //   confirm 구간, collect/reset/active 전환 중 race를 막는다. status 기반
+    //   isBatchBusy는 confirm 이후에만 set되므로, 그 이전 구간에는 별도 lock 필요.
+    let _batchOpLock = null;
+    async function withBatchLock(kind, fn) {
+        if (_batchOpLock) {
+            const ageSec = Math.floor((Date.now() - _batchOpLock.at) / 1000);
+            toast(`이미 batch 작업 중: ${_batchOpLock.kind} (${ageSec}s)`, 'warn');
+            return;
+        }
+        _batchOpLock = { kind, at: Date.now() };
+        try {
+            return await fn();
+        } finally {
+            _batchOpLock = null;
+        }
+    }
+
     // 검증 객체에서 실패 사유를 짧은 토큰 배열로 추출. 간단 표시용.
     function summarizeValidationIssues(validation) {
         if (!validation) return [];
@@ -5617,7 +5635,12 @@
     }
 
     async function onBatchReset() {
+        return withBatchLock('reset', async () => {
         const run = batchRun || restoreActiveBatchRun();
+        if (run && isBatchBusy(run.status)) {
+            toast(`실행 중인 batch run (${run.status})은 완료 후 초기화해주세요.`, 'error');
+            return;
+        }
         if (run) {
             const ok = await twConfirm({
                 title: '배치 실행 기록 초기화',
@@ -5628,6 +5651,7 @@
         }
         clearActiveBatchRun();
         toast('배치 실행 기록을 초기화했습니다.', 'success');
+        }); // withBatchLock
     }
 
     function renderLogOutput() {
@@ -6819,6 +6843,13 @@
     }
 
     async function onBatchCollect() {
+        return withBatchLock('collect', async () => {
+        // v0.7.29 (#D3-P1-3): 기존 실행 중 run을 메모리에서 갈아엎지 않도록 자체 방어.
+        const existing = batchRun || restoreActiveBatchRun();
+        if (existing && isBatchBusy(existing.status)) {
+            toast(`이미 실행 중인 batch run이 있습니다 (${existing.status}). 완료 후 수집하세요.`, 'error');
+            return;
+        }
         batchRun = createBatchRunBase();
         try {
             setBatchStatus('collecting');
@@ -6864,6 +6895,7 @@
             renderBatchRun();
             toast(error.message, 'error');
         }
+        }); // withBatchLock
     }
 
     function getPreviousRawForPhase(run, phaseTag) {
@@ -6936,6 +6968,7 @@
     }
 
     async function onRunBatchPhase(phaseTag) {
+        return withBatchLock(`phase ${phaseTag}`, async () => {
         const run = ensureBatchRun();
         // v0.7.20 (#A1): 진입 시 한 번 더 방어. UI 비활성화가 어긋났더라도
         //   동시 실행을 막아 storageStringId race를 차단.
@@ -7055,6 +7088,7 @@
             renderBatchRun();
             toast(error.message, 'error', 5000);
         }
+        }); // withBatchLock
     }
 
     async function onBatchRefetchResult() {
@@ -7197,7 +7231,11 @@
     async function loadSegmentInfo(stringId) {
         // v0.7.22 (#C1-P1-7): 빠른 세그먼트 전환 시 동시 로드 race 방지.
         //   token + stringId 둘 다 검증해야 같은 세그먼트로 빠르게 다시 들어왔을 때도 안전.
+        // v0.7.29 (#D3-P1-7): 진입 시 currentSegment를 즉시 비워 이전 세그먼트가 잘못 남는 걸 막는다.
+        //   이전에는 fetchSegmentDetail 실패 시 currentSegment가 이전 값으로 유지되어
+        //   onSend에서 (새 stringId + 이전 segment) 조합 snapshot이 생길 수 있었다.
         const token = ++loadSegmentInfo._token;
+        currentSegment = null;
         const infoEl = $('.tw-seg-info', modalEl);
         const contentEl = $('.tw-context-content', modalEl);
         infoEl.textContent = `#${stringId} 정보 로딩 중…`;
@@ -7391,8 +7429,14 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         //   currentStringId/currentSegment는 watcher(L6684)가 0.5s마다 갱신하므로
         //   await 경계를 넘으면 다른 세그먼트의 결과가 원래 세그먼트로 잘못 저장될 수 있다.
         //   이후 모든 in-flight 참조는 request* 만 사용한다.
+        // v0.7.29 (#D3-P1-7): currentSegment의 속 아이디와 currentStringId가 일치하는지 재확인.
         const requestStringId = currentStringId;
         const requestSegment = currentSegment;
+        const segId = normalizeId(requestSegment?.id || requestSegment?.string_id);
+        if (segId && segId !== normalizeId(requestStringId)) {
+            toast('세그먼트 정보와 stringId가 일치하지 않습니다. 잠시 후 다시 시도하세요.', 'error');
+            return;
+        }
 
         const sendBtn = $('.tw-btn-send', modalEl);
         sendBtn.disabled = true;
