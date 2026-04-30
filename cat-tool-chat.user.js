@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.35
+// @version      0.7.36
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.35)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.36)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -31,12 +31,12 @@
     //   §13 batch → chat 시드 (importBatchResultToChat)        ............ ~2775
     //   §14 컨텍스트 수집 / 프롬프트 조립 (§14a/§14b)         ............ ~2860
     //   §15 Batch workflow state + prompt builders             ............ ~2933
-    //   §16 모달 UI (HTML 템플릿 + CSS)                        ............ ~3568
-    //   §17 이벤트 핸들러 (배치/리뷰/세션/워크스페이스)        ............ ~4854
-    //   §18 모달 Show/Hide + 세그먼트 자동 감지                ............ ~7433
-    //   §19 채팅 흐름                                          ............ ~7626
-    //   §20 시스템 프롬프트/설정 패널 (모달 우측)              ............ ~8013
-    //   §21 단축키 등록 (Alt+Z) + 디버그 export                ............ ~9111
+    //   §16 모달 UI (HTML 템플릿 + CSS)                        ............ ~3604
+    //   §17 이벤트 핸들러 (배치/리뷰/세션/워크스페이스)        ............ ~4890
+    //   §18 모달 Show/Hide + 세그먼트 자동 감지                ............ ~7474
+    //   §19 채팅 흐름                                          ............ ~7667
+    //   §20 시스템 프롬프트/설정 패널 (모달 우측)              ............ ~8054
+    //   §21 단축키 등록 (Alt+Z) + 디버그 export                ............ ~9152
     // ========================================================================
     // 버전 주석 정책 (v0.7.15~):
     //   - v0.7.x : 변경 맥락이 살아있을 동안 inline 유지
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.35';
+    const SCRIPT_VERSION = '0.7.36';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -404,9 +404,12 @@
     // v0.7.26 (#C5-P1-18): debug surface opt-out 게이트.
     //   localStorage.tms_workflow_debug_surface === 'off' 인 경우 window.tmsActivity 노출 생략.
     //   tmsLog/tmsWorkflow.open 같은 stable surface는 영향 없음 (사용자 docs 호환).
+    // v0.7.36 (#D10-P2): opt-out → opt-in 으로 전환. 기본값에서 디버그 surface를 노출하면
+    //   page script와의 prototype pollution 가능성을 키운다. 명시적으로 'on'을 설정한
+    //   세션에서만 window.tmsActivity가 붙는다.
     try {
         const debugSurface = (() => { try { return localStorage.getItem('tms_workflow_debug_surface'); } catch { return null; } })();
-        if (debugSurface !== 'off') {
+        if (debugSurface === 'on') {
             window.tmsActivity = { get: getActivityLog, clear: clearActivityLog, log: logActivity };
         }
     } catch {}
@@ -1048,9 +1051,11 @@
             }
 
             // placeholder order
-            const srcPh = extractPlaceholders(src);
+            // v0.7.36 (#D10-P2): extractPlaceholders는 Set이라 `%s %s` 같은 중복 토큰의 순서가 사라진다.
+            //   순서 검사에는 listPlaceholders(중복 보존)을 써야 D5 검증과 일관된다.
+            const srcPh = listPlaceholders(src);
             if (srcPh.length >= 2) {
-                const finalPh = extractPlaceholders(finalText);
+                const finalPh = listPlaceholders(finalText);
                 const srcSeq = srcPh.filter(p => finalPh.includes(p));
                 const finalSeq = finalPh.filter(p => srcPh.includes(p));
                 const minLen = Math.min(srcSeq.length, finalSeq.length);
@@ -1318,12 +1323,26 @@
     }
 
     function buildBatchTbSummary(segments) {
+        // v0.7.36 (#D10-P2): D5 검증과 정합 — 같은 source의 다중 target을 모두 보존.
+        //   기존 Map<src, target>는 last-write-wins라 두 번째 target만 살아남고, 이후
+        //   validateParsedPhase의 _addTb가 단일 entry만 받아 alternate 표기가 누락됐다.
+        //   Map<src, target[]>로 누적한 뒤, formatBatchTbSummary가 그대로 쓸 수 있게
+        //   같은 source당 (source, target) 행을 여러 개 펼쳐서 반환한다.
         const merged = new Map();
-        for (const [source, target] of extractBatchApiTerms(segments)) merged.set(source, target);
-        for (const [source, target] of extractVisibleTbTerms()) merged.set(source, target);
+        function _push(source, target) {
+            if (!source || !target) return;
+            const arr = merged.get(source);
+            if (arr) {
+                if (!arr.includes(target)) arr.push(target);
+            } else {
+                merged.set(source, [target]);
+            }
+        }
+        for (const [source, target] of extractBatchApiTerms(segments)) _push(source, target);
+        for (const [source, target] of extractVisibleTbTerms()) _push(source, target);
         return Array.from(merged.entries())
             .sort((a, b) => a[0].localeCompare(b[0], 'zh-Hans'))
-            .map(([source, target]) => ({ source, target }));
+            .flatMap(([source, targets]) => targets.map(target => ({ source, target })));
     }
 
     function formatBatchTbSummary(tbSummary) {
@@ -1876,6 +1895,25 @@
         //   기존엔 prompts 단계에서 redacted/형식 오류를 throw했는데, 그 시점엔 이미 sessions가 저장되어
         //   _rollbackImport 호출 없이 부분 적용 상태로 남을 수 있었다. 저장 이전에 괄아서 검증한다.
         let _validatedPromptList = null;
+        // v0.7.36 (#D10-P2): 페이로드 타입 검증을 prompts 검증과 같은 단계에서 같이 처리.
+        //   sessions/overrides/batchRuns는 plain object, prompts는 array여야 한다.
+        //   잘못된 타입(문자열·배열 혼동·null)이 그대로 LS에 들어가면 이후 load 함수의
+        //   defensive 가드 fallback에 의존하게 되어 백업 시점의 원본 데이터를 잃을 수 있다.
+        function _isPlainObject(v) {
+            return !!v && typeof v === 'object' && !Array.isArray(v);
+        }
+        if (restoreSessions && hasSessions && !_isPlainObject(data.sessions)) {
+            throw new Error('sessions 페이로드가 객체 형태가 아닙니다 (import 중단).');
+        }
+        if (restoreOverrides && hasOverrides && !_isPlainObject(data.overrides)) {
+            throw new Error('overrides 페이로드가 객체 형태가 아닙니다 (import 중단).');
+        }
+        if (restoreBatchRuns && hasBatchRuns && !_isPlainObject(data.batchRuns)) {
+            throw new Error('batchRuns 페이로드가 객체 형태가 아닙니다 (import 중단).');
+        }
+        if (restorePrompts && hasPrompts && !Array.isArray(data.prompts)) {
+            throw new Error('prompts 페이로드가 배열 형태가 아닙니다 (import 중단).');
+        }
         if (restorePrompts && hasPrompts) {
             if (data.promptsRedacted) {
                 throw new Error('이 백업의 프롬프트 내용은 redacted 상태라 복원할 수 없습니다. 원문 포함 백업을 사용하세요 (export 시 redactPromptContent: false).');
@@ -2563,6 +2601,21 @@
             saveAppliedFromBatch(map);
         }
     }
+    // v0.7.36 (#D10-P2): runId가 사라지면(GC/삭제) 해당 run으로 적용된 applied 기록도
+    //   같이 정리한다. 남겨두면 staleness 검사가 사라진 run을 참조하려다 false alarm.
+    function clearAppliedFromBatchByRunId(runId) {
+        if (!runId) return 0;
+        const map = loadAppliedFromBatch();
+        let removed = 0;
+        for (const key of Object.keys(map)) {
+            if (map[key] && map[key].runId === runId) {
+                delete map[key];
+                removed += 1;
+            }
+        }
+        if (removed > 0) saveAppliedFromBatch(map);
+        return removed;
+    }
     function getAppliedFromBatch(stringId) {
         const map = loadAppliedFromBatch();
         return map[normalizeId(stringId)] || null;
@@ -3013,6 +3066,8 @@
             for (const id of deletedIds) {
                 try { clearOverridesForRun(id); } catch (e) { dwarn(`GC override cleanup 실패 ${id}`, e); }
                 try { nullifyDanglingImportedFromRunId(id); } catch (e) { dwarn(`GC importedFromRunId nullify 실패 ${id}`, e); }
+                // v0.7.36 (#D10-P2): GC된 run으로 적용된 applied 기록도 같이 정리.
+                try { clearAppliedFromBatchByRunId(id); } catch (e) { dwarn(`GC appliedFromBatch cleanup 실패 ${id}`, e); }
             }
             try { logActivity('cleanup', `batchRuns GC: ${deletedIds.length}개 run 제거 및 dangling 참조 정리`); } catch (_) {}
         }
@@ -6300,6 +6355,11 @@
             const danglingCount = nullifyDanglingImportedFromRunId(runId);
             if (danglingCount > 0) dverbose(`run ${runId} 삭제: dangling importedFromRunId ${danglingCount}건 nullify`);
         } catch (e) { dwarn('dangling importedFromRunId nullify 실패', e); }
+        // v0.7.36 (#D10-P2): 삭제된 run으로 적용된 applied 기록도 같이 정리 (review staleness false alarm 방지).
+        try {
+            const appliedRemoved = clearAppliedFromBatchByRunId(runId);
+            if (appliedRemoved > 0) dverbose(`run ${runId} 삭제: applied-from-batch ${appliedRemoved}건 정리`);
+        } catch (e) { dwarn('applied-from-batch cleanup 실패', e); }
         if (isActive) {
             lsSet(LS_KEYS.ACTIVE_BATCH_RUN, null);
             batchRun = null;
@@ -9201,7 +9261,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
     }
 
     console.log('%c[TMS Workflow v' + SCRIPT_VERSION + '] 로드됨. Alt+Z로 모달 오픈 · 워크스페이스 탭에 📜 Activity / 🚨 위험 영역 카드 포함', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px;font-weight:600');
-    console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / window.tmsActivity.get() / window.tmsLog("verbose")', 'color:#888');
+    console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / window.tmsLog("verbose") · window.tmsActivity는 localStorage.tms_workflow_debug_surface=on 시 노출lStorage.tms_workflow_debug_surface=on 시 노출', 'color:#888');
     // v0.7.12: 활성 인스턴스가 정확히 어떤 버전인지 확인할 수 있도록 window 노출
     try { window.tmsWorkflow = window.tmsWorkflow || {}; window.tmsWorkflow.version = SCRIPT_VERSION; } catch (_) {}
 })();
