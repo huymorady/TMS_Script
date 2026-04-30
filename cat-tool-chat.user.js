@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.39
+// @version      0.7.40
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.39)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.40)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.39';
+    const SCRIPT_VERSION = '0.7.40';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -74,6 +74,9 @@
         //   구조: { [id:number]: { name:string, content:string } }. id 0–21 (V3.1 프롬프트 명세).
         //   프로젝트 파일별로 동기화되지 않는 전역 설정.
         CATEGORY_GUIDELINES: 'tms_workflow_category_guidelines_v1',
+        // v0.7.40: 카테고리 가이드라인 주입 전역 활성화 스위치 (boolean, 기본 true).
+        //   중/한 게임 번역 외 프로프트에서는 false로 두면 Phase 3/4+5 프롬프트에 카테고리 블록이 주입되지 않는다.
+        CATEGORY_GUIDELINES_ENABLED: 'tms_workflow_category_guidelines_enabled_v1',
     };
 
     // v0.7.7 (#10): 현재 스키마 버전. 신규 LS key/필드를 추가하거나 기존 구조를 변경할 때 +1.
@@ -2446,6 +2449,14 @@
         const v = map[id];
         return (v && typeof v.content === 'string') ? v.content : '';
     }
+    // v0.7.40: 카테고리 가이드라인 전역 주입 스위치. 저장되지 않았으면 true로 간주.
+    function loadCategoryGuidelinesEnabled() {
+        const v = lsGet(LS_KEYS.CATEGORY_GUIDELINES_ENABLED, true);
+        return v !== false;
+    }
+    function saveCategoryGuidelinesEnabled(enabled) {
+        return lsSet(LS_KEYS.CATEGORY_GUIDELINES_ENABLED, !!enabled);
+    }
     // v0.7.38 (#D12): Phase 1+2 compact 결과의 cats 배열을 정규화.
     //   숫자 또는 {id:number}만 받고 카탈로그에 있는 것만 유지 + 중복 제거 + 0번은 항상 포함.
     //   0번 슬롯이 비어있어도 활성 표시는 한다 (사용자가 채워두면 자동 주입).
@@ -2461,7 +2472,9 @@
     }
     // v0.7.38 (#D12): Phase 3/4+5 프롬프트에 끼울 카테고리 가이드라인 블록 빌드.
     //   activeIds 중 content가 채워진 것만 포함. 모두 비어있으면 빈 문자열.
+    //   v0.7.40: 전역 스위치가 false면 조기 반환 (다른 워크플로우에서 주입 완전 차단).
     function buildActiveCategoryGuidelinesBlock(activeIds) {
+        if (!loadCategoryGuidelinesEnabled()) return '';
         const ids = Array.isArray(activeIds) ? activeIds : [];
         const map = loadCategoryGuidelines();
         const sections = [];
@@ -4998,6 +5011,58 @@
 }
 .tw-category-content::placeholder { color: #555; font-style: italic; }
 .tw-category-content:focus { outline: 2px solid #4ade80; outline-offset: -2px; }
+
+/* v0.7.40: 카테고리 가이드라인 탭 toolbar + summary 보강 */
+.tw-category-toolbar {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    background: #1f1f1f; border: 1px solid #333; border-radius: 6px;
+    padding: 8px 12px;
+}
+.tw-category-master-toggle {
+    display: inline-flex; align-items: center; gap: 6px;
+    cursor: pointer; user-select: none;
+    font-size: 12px; font-weight: 600; color: #4ade80;
+    padding-right: 12px; border-right: 1px solid #333;
+}
+.tw-category-master-toggle input[type="checkbox"] { cursor: pointer; }
+.tw-settings-tab-categories.is-disabled .tw-category-enable-text { color: #888; }
+.tw-settings-tab-categories.is-disabled .tw-category-list { opacity: 0.55; }
+.tw-category-stats { display: inline-flex; gap: 6px; align-items: center; }
+.tw-category-actions { display: inline-flex; gap: 6px; align-items: center; margin-left: auto; flex-wrap: wrap; }
+.tw-category-actions .tw-btn { font-size: 11px; padding: 3px 8px; }
+.tw-category-hide-empty-label {
+    display: inline-flex; align-items: center; gap: 4px;
+    cursor: pointer; user-select: none; font-size: 11px; color: #aaa;
+}
+.tw-category-disabled-banner {
+    background: rgba(248,113,113,0.08);
+    border-left: 3px solid #f87171;
+    padding: 6px 10px; border-radius: 4px;
+    color: #f3a3a3 !important;
+}
+.tw-category-disabled-banner b { color: #fca5a5; }
+
+.tw-category-item.is-active { border-left: 3px solid #4ade80; padding-left: 7px; }
+.tw-category-item.is-hidden { display: none; }
+.tw-category-item > summary { gap: 8px; }
+.tw-category-summary-label { flex: 0 0 auto; }
+.tw-category-summary-active {
+    font-size: 10px; font-weight: 700; color: #052e16;
+    background: #4ade80; padding: 1px 6px; border-radius: 8px;
+    text-transform: none; letter-spacing: 0;
+}
+.tw-category-summary-len {
+    font-size: 10px; color: #888; font-weight: 400;
+    text-transform: none; letter-spacing: 0;
+}
+.tw-category-summary-preview {
+    flex: 1 1 auto; min-width: 0;
+    font-size: 11px; font-weight: 400; color: #777;
+    text-transform: none; letter-spacing: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    text-align: right;
+}
+.tw-category-item[open] .tw-category-summary-preview { display: none; }
 `;
         document.head.appendChild(style);
     }
@@ -8333,7 +8398,28 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
             </div>
         </div>
     </div>
-    <div class="tw-settings-content tw-settings-tab-categories" style="display:none; flex-direction:column; gap:8px; overflow-y:auto; min-height:0; padding-right:6px;">
+    <div class="tw-settings-content tw-settings-tab-categories" style="display:none; flex-direction:column; gap:10px; overflow-y:auto; min-height:0; padding-right:6px;">
+        <div class="tw-category-toolbar">
+            <label class="tw-category-master-toggle" title="끄면 Phase 3/4+5 프롬프트에 카테고리 가이드라인 블록이 주입되지 않습니다.">
+                <input type="checkbox" class="tw-category-enable-toggle" checked>
+                <span class="tw-category-enable-text">⚡ 카테고리 가이드라인 주입 활성</span>
+            </label>
+            <div class="tw-category-stats">
+                <span class="tw-summary-chip tw-summary-chip-info tw-category-chip-filled">채워짐 0/22</span>
+                <span class="tw-summary-chip tw-summary-chip-ok tw-category-chip-active">활성 0</span>
+            </div>
+            <div class="tw-category-actions">
+                <label class="tw-category-hide-empty-label" title="본문이 비어 있는 슬롯을 숨겨 시야를 정리합니다.">
+                    <input type="checkbox" class="tw-category-hide-empty-toggle">
+                    <span>비어있는 슬롯 숨기기</span>
+                </label>
+                <button type="button" class="tw-btn tw-btn-ghost tw-btn-category-expand-all" title="모든 슬롯 펼치기">🔽 모두 펼치기</button>
+                <button type="button" class="tw-btn tw-btn-ghost tw-btn-category-collapse-all" title="모든 슬롯 접기">🔼 모두 접기</button>
+            </div>
+        </div>
+        <div class="tw-stat-hint tw-category-disabled-banner" style="display:none;">
+            ⚠ 카테고리 가이드라인 주입이 <b>꺼져 있습니다</b>. Phase 3/4+5 프롬프트에 본문이 추가되지 않습니다.
+        </div>
         <div class="tw-stat-hint" style="margin-bottom:4px;">
             💡 Phase 1+2 분석에서 활성으로 분류된 카테고리의 본문이 Phase 3/4+5 프롬프트에 자동 주입됩니다.<br>
             본문이 비어 있는 슬롯은 무시됩니다. 카테고리 0(공통)은 항상 활성으로 취급됩니다.
@@ -8475,26 +8561,73 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         // v0.7.38 (#D12): 카테고리 가이드라인 탭 렌더 + 저장.
         //   22개 슬롯을 collapsible <details>로 그려 페이지 길이를 통제.
         //   textarea blur 또는 입력 디바운스 시 LS 저장. 0번은 항상 펼친 상태.
+        // v0.7.40: 상단 toolbar (전역 활성 토글 + 통계 chip + 모두 펼치기/접기 + 비어있는 슬롯 숨기기) +
+        //   슬롯 summary에 글자 수 / ⚡활성 chip / 미리보기 추가 + 활성 슬롯 좌측 보더 강조.
         function refreshCategoryGuidelines() {
             if (!categoriesTab) return;
             const listEl = $('.tw-category-list', categoriesTab);
             if (!listEl) return;
             const map = loadCategoryGuidelines();
+            const enabled = loadCategoryGuidelinesEnabled();
+            const run = (typeof batchRun !== 'undefined' && batchRun) || null;
+            const activeIdSet = new Set(Array.isArray(run?.activeCategoryIds) ? run.activeCategoryIds : []);
+            activeIdSet.add(0); // 0번은 항상 활성 취급
+
+            // ---- 상단 toolbar 상태 동기화 ----
+            categoriesTab.classList.toggle('is-disabled', !enabled);
+            const enableToggle = $('.tw-category-enable-toggle', categoriesTab);
+            if (enableToggle && enableToggle.checked !== enabled) enableToggle.checked = enabled;
+            const enableText = $('.tw-category-enable-text', categoriesTab);
+            if (enableText) enableText.textContent = enabled ? '⚡ 카테고리 가이드라인 주입 활성' : '⚡ 카테고리 가이드라인 주입 비활성';
+            const banner = $('.tw-category-disabled-banner', categoriesTab);
+            if (banner) banner.style.display = enabled ? 'none' : '';
+
+            const filledCount = CATEGORY_CATALOG.reduce((acc, cat) => {
+                const c = (map[cat.id]?.content || '').trim();
+                return acc + (c ? 1 : 0);
+            }, 0);
+            const filledChip = $('.tw-category-chip-filled', categoriesTab);
+            if (filledChip) filledChip.textContent = `채워짐 ${filledCount}/${CATEGORY_CATALOG.length}`;
+            const activeChip = $('.tw-category-chip-active', categoriesTab);
+            if (activeChip) {
+                const n = activeIdSet.size;
+                activeChip.textContent = run?.runId ? `활성 ${n} (현재 run)` : `활성 ${n} (run 없음)`;
+                activeChip.classList.toggle('tw-summary-chip-muted', !run?.runId);
+            }
+
+            const hideEmptyToggle = $('.tw-category-hide-empty-toggle', categoriesTab);
+            const hideEmpty = !!(hideEmptyToggle && hideEmptyToggle.checked);
+
+            // ---- 슬롯 렌더 ----
             listEl.innerHTML = CATEGORY_CATALOG.map(cat => {
                 const v = map[cat.id] || { name: cat.name, content: '' };
-                const filled = (v.content || '').trim().length > 0;
+                const content = v.content || '';
+                const filled = content.trim().length > 0;
+                const isActive = activeIdSet.has(cat.id);
                 const open = (cat.id === 0 || filled) ? ' open' : '';
                 const badgeCls = filled ? 'is-filled' : 'is-empty';
                 const badgeChar = filled ? '●' : '○';
+                const len = content.length;
+                const previewSrc = content.replace(/\s+/g, ' ').trim();
+                const preview = previewSrc.length > 60 ? previewSrc.slice(0, 60) + '…' : previewSrc;
+                const itemCls = [
+                    'tw-category-item',
+                    isActive ? 'is-active' : '',
+                    !filled ? 'is-empty' : '',
+                    hideEmpty && !filled && cat.id !== 0 ? 'is-hidden' : '',
+                ].filter(Boolean).join(' ');
                 return `
-                    <details class="tw-category-item" data-id="${cat.id}"${open}>
+                    <details class="${itemCls}" data-id="${cat.id}"${open}>
                         <summary>
                             <span class="tw-category-summary-label">[${cat.id}] ${escapeHtml(cat.name)}</span>
+                            ${isActive ? '<span class="tw-category-summary-active" title="현재 run에서 활성">⚡활성</span>' : ''}
+                            <span class="tw-category-summary-len">${len}자</span>
                             <span class="tw-category-summary-badge ${badgeCls}">${badgeChar}</span>
+                            ${preview ? `<span class="tw-category-summary-preview">${escapeHtml(preview)}</span>` : ''}
                         </summary>
                         <textarea class="tw-category-content" data-id="${cat.id}"
                             placeholder="이 카테고리의 세부 가이드라인을 입력하세요. 비워 두면 주입되지 않습니다."
-                        >${escapeHtml(v.content || '')}</textarea>
+                        >${escapeHtml(content)}</textarea>
                     </details>
                 `;
             }).join('');
@@ -8506,17 +8639,39 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     const cur = loadCategoryGuidelines();
                     cur[id] = { name: getCategoryName(id), content: ta.value };
                     saveCategoryGuidelines(cur);
-                    // 슬롯 채워짐/비어있음 표시 갱신 (요약 영역의 ●/○)
+                    // summary 배지/카운트/미리보기/숨김 갱신
                     const det = ta.closest('details');
                     if (det) {
+                        const filled = (ta.value || '').trim().length > 0;
                         const dot = det.querySelector('.tw-category-summary-badge');
                         if (dot) {
-                            const filled = (ta.value || '').trim().length > 0;
                             dot.textContent = filled ? '●' : '○';
                             dot.classList.toggle('is-filled', filled);
                             dot.classList.toggle('is-empty', !filled);
                         }
+                        const lenEl = det.querySelector('.tw-category-summary-len');
+                        if (lenEl) lenEl.textContent = `${ta.value.length}자`;
+                        const prevEl = det.querySelector('.tw-category-summary-preview');
+                        const previewSrc = (ta.value || '').replace(/\s+/g, ' ').trim();
+                        const preview = previewSrc.length > 60 ? previewSrc.slice(0, 60) + '…' : previewSrc;
+                        if (prevEl) prevEl.textContent = preview;
+                        else if (preview) {
+                            const sumEl = det.querySelector('summary');
+                            if (sumEl) {
+                                const span = document.createElement('span');
+                                span.className = 'tw-category-summary-preview';
+                                span.textContent = preview;
+                                sumEl.appendChild(span);
+                            }
+                        }
+                        det.classList.toggle('is-empty', !filled);
+                        const id2 = Number(ta.dataset.id);
+                        const hideOn = !!(hideEmptyToggle && hideEmptyToggle.checked);
+                        det.classList.toggle('is-hidden', hideOn && !filled && id2 !== 0);
                     }
+                    // 채워짐 카운트 chip 갱신
+                    const fillNow = CATEGORY_CATALOG.reduce((a, c) => a + ((loadCategoryGuidelines()[c.id]?.content || '').trim() ? 1 : 0), 0);
+                    if (filledChip) filledChip.textContent = `채워짐 ${fillNow}/${CATEGORY_CATALOG.length}`;
                 };
                 ta.addEventListener('input', () => {
                     if (saveTimer) clearTimeout(saveTimer);
@@ -8527,6 +8682,32 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     commit();
                 });
             });
+
+            // ---- toolbar 핸들러 (한 번만 바인딩) ----
+            if (!categoriesTab._toolbarBound) {
+                categoriesTab._toolbarBound = true;
+                if (enableToggle) {
+                    enableToggle.addEventListener('change', () => {
+                        saveCategoryGuidelinesEnabled(enableToggle.checked);
+                        if (typeof logActivity === 'function') {
+                            logActivity('config', `카테고리 가이드라인 주입 ${enableToggle.checked ? '활성' : '비활성'}`);
+                        }
+                        toast(enableToggle.checked ? '카테고리 가이드라인 주입을 활성화했습니다.' : '카테고리 가이드라인 주입을 비활성화했습니다. (Phase 3/4+5에 주입되지 않음)', 'info');
+                        refreshCategoryGuidelines();
+                    });
+                }
+                if (hideEmptyToggle) {
+                    hideEmptyToggle.addEventListener('change', () => refreshCategoryGuidelines());
+                }
+                const expandBtn = $('.tw-btn-category-expand-all', categoriesTab);
+                if (expandBtn) expandBtn.addEventListener('click', () => {
+                    $$('.tw-category-item', listEl).forEach(d => { d.open = true; });
+                });
+                const collapseBtn = $('.tw-btn-category-collapse-all', categoriesTab);
+                if (collapseBtn) collapseBtn.addEventListener('click', () => {
+                    $$('.tw-category-item', listEl).forEach(d => { if (d.dataset.id !== '0') d.open = false; });
+                });
+            }
         }
 
         // ==== 시스템 프롬프트 탭 ====
