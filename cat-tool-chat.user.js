@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.30
+// @version      0.7.31
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.30)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.31)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.30';
+    const SCRIPT_VERSION = '0.7.31';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -755,17 +755,33 @@
     //   - {value1}, {0}, {한글}, {value-1}, {user.name} 등 중괄호 플레이스홀더
     //   - %1$s, %2$d, %1$@, %1$i, %1$f 등 위치적 printf (v0.7.25 #C4-P2-22: i/f 추가)
     //   - %@, %s, %d, %i, %f, %05d, %3.2f 등 단순 printf + width spec (v0.7.25 #C4-P2-22)
+    //   - %u, %x, %X, %o, %c, %p, %g, %e 추가 (v0.7.31 #D5-P1-12)
+    //   - %ld, %lld, %lu, %llu 등 long/longlong 수식 (v0.7.31 #D5-P1-12)
     //   - \n, \r, \t 이스케이프 시퀀스
     //   - <br>, <color=...>, <b>, <size=N>, <sprite=N> 등 임의 HTML/Unity rich text 태그
     //   - [color=#...], [b], [url=...], [sprite] 등 임의 BBCode 태그
     const TOKEN_PATTERN = new RegExp(
         '\\{[^{}]+\\}'                  // 중괄호 플레이스홀더
-        + '|%\\d+\\$[sdif@]'           // 위치적 printf (i/f 포함)
-        + '|%[0-9]*(?:\\.[0-9]+)?[sdif@]' // 단순 printf + width/precision (i/f 포함)
+        + '|%\\d+\\$[sdifuxXocpge@]'           // 위치적 printf (v0.7.31 #D5-P1-12: u/x/X/o/c/p/g/e 추가)
+        + '|%[0-9]*(?:\\.[0-9]+)?l{1,2}[diouxX]' // %ld %lld %lu %llu (v0.7.31 #D5-P1-12)
+        + '|%[0-9]*(?:\\.[0-9]+)?[sdifuxXocpge@]' // 단순 printf + width/precision (v0.7.31 #D5-P1-12: u/x/X/o/c/p/g/e 추가)
         + '|\\\\[nrt]'                  // \n \r \t 리터럴
         + '|</?[a-zA-Z][^>]*>'            // 임의 HTML/Unity rich text
         + '|\\[/?[a-zA-Z][^\\]]*\\]'  // 임의 BBCode
     , 'g');
+
+    // v0.7.31 (#D5-P1-13): 순서 있는 플레이스홀더 리스트 (중복 보존).
+    //   extractPlaceholders는 Set 으로 중복을 떨구어 `%s %s` 순서 검사에는 쓰면 안 된다.
+    function listPlaceholders(text) {
+        return String(text || '').match(TOKEN_PATTERN) || [];
+    }
+
+    // v0.7.31 (#D5-P1-16): hanja-like 검사 전 protected token을 제거.
+    //   <color=...>, [color=#...] 같은 BBCode/HTML 태그 속 속성명이
+    //   한자로 오인되는 경우가 있어 false positive가 발생했다.
+    function stripProtectedTokens(text) {
+        return String(text || '').replace(TOKEN_PATTERN, '');
+    }
 
     function extractPlaceholders(text) {
         // presence(존재 여부) 검사용 — 중복 제거된 토큰 집합
@@ -1053,17 +1069,24 @@
 
             // tb terms
             // v0.7.25 (#C4-P2-23): caseSensitive/minLen 옥션 적용. 기본은 기존 동작.
+            // v0.7.31 (#D5-P1-15): tb는 이제 Map<src, target[]>. 다수 target 중 하나라도
+            //   dst에 들어있으면 통과.
             if (tb && tb.size && src) {
                 const haystackSrc = tbCaseSensitive ? src : src.toLowerCase();
                 const haystackDst = tbCaseSensitive ? finalText : finalText.toLowerCase();
                 const missed = [];
-                for (const [srcTerm, dstTerm] of tb) {
-                    if (!srcTerm || !dstTerm) continue;
+                for (const [srcTerm, dstTerms] of tb) {
+                    if (!srcTerm || !Array.isArray(dstTerms) || dstTerms.length === 0) continue;
                     if (srcTerm.length < tbMinLen) continue;
                     const needleSrc = tbCaseSensitive ? srcTerm : srcTerm.toLowerCase();
-                    const needleDst = tbCaseSensitive ? dstTerm : dstTerm.toLowerCase();
-                    if (haystackSrc.includes(needleSrc) && !haystackDst.includes(needleDst)) {
-                        missed.push({ src: srcTerm, expected: dstTerm });
+                    if (!haystackSrc.includes(needleSrc)) continue;
+                    const matched = dstTerms.some(dstTerm => {
+                        if (!dstTerm) return false;
+                        const needleDst = tbCaseSensitive ? dstTerm : dstTerm.toLowerCase();
+                        return haystackDst.includes(needleDst);
+                    });
+                    if (!matched) {
+                        missed.push({ src: srcTerm, expected: dstTerms.join(' / ') });
                     }
                 }
                 if (missed.length) tbTermsMissed.push({ id, terms: missed });
@@ -1122,8 +1145,9 @@
 
         // v0.7.25 (#C4-P2-24): \p{Script=Han}/u로 교체 — CJK Extensions A-G까지 커버.
         //   기존 [\u4e00-\u9fff]는 BMP CJK 일부(Basic)만 감지 가능했다.
+        // v0.7.31 (#D5-P1-16): protected token (BBCode/HTML 태그 속성명)을 제거한 뒤 검사.
         const hanjaLike = translations
-            .filter(item => typeof item.t === 'string' && /\p{Script=Han}/u.test(item.t))
+            .filter(item => typeof item.t === 'string' && /\p{Script=Han}/u.test(stripProtectedTokens(item.t)))
             .map(item => normalizeId(item.id));
 
         // warn-only 추가 검증 (ok에 영향 없음)
@@ -1226,8 +1250,9 @@
         }
 
         // v0.7.25 (#C4-P2-24): \p{Script=Han}/u로 교체 (Phase 4+5).
+        // v0.7.31 (#D5-P1-16): protected token 제거 후 검사.
         const hanjaLike = revisions
-            .filter(item => /\p{Script=Han}/u.test(finalTextById.get(normalizeId(item.id)) || ''))
+            .filter(item => /\p{Script=Han}/u.test(stripProtectedTokens(finalTextById.get(normalizeId(item.id)) || '')))
             .map(item => normalizeId(item.id));
 
         // \uc0ac\uc2e4\uc0c1 no-op\uc744 \uc81c\uc678\ud55c \uc2e4\uc81c \ubcc0\uacbd \uac74\uc218
@@ -6966,14 +6991,23 @@
         // v0.7.16 (#2): warn-only TB 검증에 run.tbSummary (API + visible 합본)를 우선 사용.
         // 수집 시점에 buildBatchTbSummary로 저장해 둔 전체 용어가 있으면 그걸 쓰고,
         // 비어 있으면(과거 run/마이그레이션) DOM의 visible terms로 폴백.
+        // v0.7.31 (#D5-P1-15): 동일 source의 다중 target 보존 — Map<src, target[]>.
+        //   이전엔 Map.set으로 last-write-wins라 같은 source의 두 번째 target만 검사 기준이 됐다.
         const tbTerms = new Map();
-        if (Array.isArray(run.tbSummary) && run.tbSummary.length) {
-            for (const t of run.tbSummary) {
-                if (t && t.source && t.target) tbTerms.set(t.source, t.target);
+        function _addTb(src, dst) {
+            if (!src || !dst) return;
+            const arr = tbTerms.get(src);
+            if (arr) {
+                if (!arr.includes(dst)) arr.push(dst);
+            } else {
+                tbTerms.set(src, [dst]);
             }
+        }
+        if (Array.isArray(run.tbSummary) && run.tbSummary.length) {
+            for (const t of run.tbSummary) _addTb(t?.source, t?.target);
         } else {
             try {
-                for (const [s, d] of extractVisibleTbTerms()) tbTerms.set(s, d);
+                for (const [s, d] of extractVisibleTbTerms()) _addTb(s, d);
             } catch (_) { /* DOM 미준비 — 빈 Map로 진행 */ }
         }
         const opts = { tbTerms };
