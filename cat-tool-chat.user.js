@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.25
+// @version      0.7.26
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.25)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.26)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~46
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~146
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.25';
+    const SCRIPT_VERSION = '0.7.26';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -396,7 +396,15 @@
         _activityRing = [];
         try { localStorage.removeItem(LS_KEYS.ACTIVITY_LOG); } catch {}
     }
-    try { window.tmsActivity = { get: getActivityLog, clear: clearActivityLog, log: logActivity }; } catch {}
+    // v0.7.26 (#C5-P1-18): debug surface opt-out 게이트.
+    //   localStorage.tms_workflow_debug_surface === 'off' 인 경우 window.tmsActivity 노출 생략.
+    //   tmsLog/tmsWorkflow.open 같은 stable surface는 영향 없음 (사용자 docs 호환).
+    try {
+        const debugSurface = (() => { try { return localStorage.getItem('tms_workflow_debug_surface'); } catch { return null; } })();
+        if (debugSurface !== 'off') {
+            window.tmsActivity = { get: getActivityLog, clear: clearActivityLog, log: logActivity };
+        }
+    } catch {}
 
     // v0.7.5: 자체 confirm 모달 — 브라우저 confirm()을 대체. Promise<boolean> 반환.
     // \n 줄바꿈 보존 + 모달 톤 일관성 + Esc/Enter 단축키.
@@ -1746,8 +1754,26 @@
         return count;
     }
 
+    // v0.7.26 (#C5-P1-16): 프롬프트 redact 헬퍼.
+    //   includePrompts: true로 export할 때, 기본은 content를 {redacted:true,length,hash}로 마스킹.
+    //   prompt 원문이 백업 파일/공유 채널로 새는 걸 막는다. 사용자가 raw가 필요하면 명시적으로 redactPromptContent:false 지정.
+    function _redactPromptContent(prompts) {
+        if (!Array.isArray(prompts)) return prompts;
+        return prompts.map((p) => {
+            if (!p || typeof p !== 'object') return p;
+            const content = typeof p.content === 'string' ? p.content : '';
+            const len = content.length;
+            let h = 5381;
+            for (let i = 0; i < len; i++) h = ((h << 5) + h + content.charCodeAt(i)) | 0;
+            const hex = (h >>> 0).toString(16).padStart(8, '0');
+            const { content: _omit, ...rest } = p;
+            return { ...rest, content: { redacted: true, length: len, hash: hex } };
+        });
+    }
+
     // Export: 세션만 / 프롬프트만 / 전체 선택 가능
     // v0.7.8 (#2): includeBatchRuns / includeOverrides 옵션 — 워크스페이스 통째로 백업 가능
+    // v0.7.26 (#C5-P1-16): includePrompts: true일 때 redactPromptContent 기본 true.
     function exportSessionsJson(opts = {}) {
         const {
             includeSessions = true,
@@ -1755,6 +1781,7 @@
             includeBatchRuns = false,
             includeOverrides = false,
             stripRawSegments = true, // batch run의 무거운 raw 섹션 기본 제거
+            redactPromptContent = true, // v0.7.26 #C5-P1-16: 기본 redact, 명시적으로 false 줄 때만 raw
         } = opts;
         const data = {
             version: 3, // v0.7.8: workspace 필드 도입
@@ -1762,7 +1789,11 @@
             schemaVersion: typeof CURRENT_SCHEMA_VERSION !== 'undefined' ? CURRENT_SCHEMA_VERSION : 1,
         };
         if (includeSessions) data.sessions = loadSessions();
-        if (includePrompts) data.prompts = loadPrompts();
+        if (includePrompts) {
+            const raw = loadPrompts();
+            data.prompts = redactPromptContent ? _redactPromptContent(raw) : raw;
+            data.promptsRedacted = !!redactPromptContent;
+        }
         if (includeOverrides) {
             try { data.overrides = loadReviewOverrides(); } catch { data.overrides = {}; }
         }
@@ -7332,6 +7363,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
             // v0.7.17 (#3): 운영 중 원문/대화/프롬프트가 콘솔에 그대로 남는 걸 막는다.
             //   verbose 레벨일 때만 전체 본문 출력, 그 외에는 길이/마스킹 요약만.
+            // v0.7.26 (#C5-P1-17): banner/log prompt 노출 sweep 재확인 — 이 사이트가 원문 노출 가능성이 있는 유일 지점이며 LOG_RANK>=4 가드로 보호됨.
             if (LOG_RANK >= 4) {
                 console.groupCollapsed('[TMS Workflow] prefix_prompt 전송');
                 console.log(prefixPrompt);
