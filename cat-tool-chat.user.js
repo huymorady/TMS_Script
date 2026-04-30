@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.34
+// @version      0.7.35
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.34)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.35)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -31,12 +31,12 @@
     //   §13 batch → chat 시드 (importBatchResultToChat)        ............ ~2775
     //   §14 컨텍스트 수집 / 프롬프트 조립 (§14a/§14b)         ............ ~2860
     //   §15 Batch workflow state + prompt builders             ............ ~2933
-    //   §16 모달 UI (HTML 템플릿 + CSS)                        ............ ~3515
-    //   §17 이벤트 핸들러 (배치/리뷰/세션/워크스페이스)        ............ ~4801
-    //   §18 모달 Show/Hide + 세그먼트 자동 감지                ............ ~7380
-    //   §19 채팅 흐름                                          ............ ~7573
-    //   §20 시스템 프롬프트/설정 패널 (모달 우측)              ............ ~7960
-    //   §21 단축키 등록 (Alt+Z) + 디버그 export                ............ ~9036
+    //   §16 모달 UI (HTML 템플릿 + CSS)                        ............ ~3568
+    //   §17 이벤트 핸들러 (배치/리뷰/세션/워크스페이스)        ............ ~4854
+    //   §18 모달 Show/Hide + 세그먼트 자동 감지                ............ ~7433
+    //   §19 채팅 흐름                                          ............ ~7626
+    //   §20 시스템 프롬프트/설정 패널 (모달 우측)              ............ ~8013
+    //   §21 단축키 등록 (Alt+Z) + 디버그 export                ............ ~9111
     // ========================================================================
     // 버전 주석 정책 (v0.7.15~):
     //   - v0.7.x : 변경 맥락이 살아있을 동안 inline 유지
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.34';
+    const SCRIPT_VERSION = '0.7.35';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -1872,6 +1872,21 @@
             throw new Error('잘못된 형식: sessions/prompts/overrides/batchRuns 중 하나도 없습니다.');
         }
 
+        // v0.7.35 (#D9-P1-4): pre-validation — 저장 전에 포맷 검증을 한근한 다음 저장 시작.
+        //   기존엔 prompts 단계에서 redacted/형식 오류를 throw했는데, 그 시점엔 이미 sessions가 저장되어
+        //   _rollbackImport 호출 없이 부분 적용 상태로 남을 수 있었다. 저장 이전에 괄아서 검증한다.
+        let _validatedPromptList = null;
+        if (restorePrompts && hasPrompts) {
+            if (data.promptsRedacted) {
+                throw new Error('이 백업의 프롬프트 내용은 redacted 상태라 복원할 수 없습니다. 원문 포함 백업을 사용하세요 (export 시 redactPromptContent: false).');
+            }
+            const safe = (data.prompts || []).filter(p => p && typeof p.content === 'string');
+            if (safe.length !== (data.prompts || []).length) {
+                throw new Error(`프롬프트 ${(data.prompts || []).length - safe.length}개가 잘못된 형식(content가 string이 아님)으로 복원 중단.`);
+            }
+            _validatedPromptList = safe;
+        }
+
         let sessionsCount = 0;
         let promptsCount = 0;
         let overridesCount = 0;
@@ -1910,19 +1925,9 @@
         }
 
         if (restorePrompts && hasPrompts) {
-            // v0.7.27 (#D1-P0-6): redacted prompt 복원 차단.
-            //   v0.7.26 #C5-P1-16에서 export 기본값이 redactPromptContent=true로 바뀌면서
-            //   prompt content가 string 대신 {redacted,length,hash} 객체로 백업되는 경우가 생겼다.
-            //   그걸 그대로 저장하면 이후 systemPrompt.trim() / buildPrefixPrompt에서 TypeError.
-            if (data.promptsRedacted) {
-                throw new Error('이 백업의 프롬프트 내용은 redacted 상태라 복원할 수 없습니다. 원문 포함 백업을 사용하세요 (export 시 redactPromptContent: false).');
-            }
-            // 방어적으로 content가 string이 아닌 항목은 걸러낸다.
-            const safe = (data.prompts || []).filter(p => p && typeof p.content === 'string');
-            if (safe.length !== (data.prompts || []).length) {
-                throw new Error(`프롬프트 ${(data.prompts || []).length - safe.length}개가 잘못된 형식(content가 string이 아닔)으로 복원 중단.`);
-            }
-            // v0.7.30 (#D4-P1-5): savePrompts 실패 전파.
+            // v0.7.35 (#D9-P1-4): pre-validation으로 이미 redacted/형식 검증 완료.
+            //   여기서는 저장 및 rollback만 담당.
+            const safe = _validatedPromptList || [];
             const promptsOk = savePrompts(safe);
             if (!promptsOk) {
                 _rollbackImport('savePrompts 실패');
@@ -2162,6 +2167,24 @@
         if (!snap) throw new Error(`slot ${slot} 비어 있음`);
         // v0.7.18 (#3): 복원 시 전체 보존. (#2): segments 누락 run에 플래그.
         const restoredRuns = _markRunsAsRestored({ ...(snap.runs || {}) });
+        // v0.7.35 (#D9-P1-5): _priorSnapshot pattern.
+        //   기존엔 첫 save 실패 후 throw만 했고, 두 번째/세 번째 save 실패는 throw 시점에
+        //   이미 LS가 부분 변경된 상태였다. 사전 스냅 후 어떤 단계 실패든 prior로 되돌린다.
+        const _priorSnapshot = {
+            sessions: sc.sessions ? loadSessions() : null,
+            overrides: sc.overrides ? loadReviewOverrides() : null,
+            batchRuns: sc.runs ? loadBatchRuns() : null,
+        };
+        function _rollbackRestore(reason) {
+            try {
+                if (_priorSnapshot.sessions !== null) saveSessions(_priorSnapshot.sessions);
+                if (_priorSnapshot.overrides !== null) saveReviewOverrides(_priorSnapshot.overrides);
+                if (_priorSnapshot.batchRuns !== null) saveBatchRuns(_priorSnapshot.batchRuns, { skipGc: true });
+                try { logActivity('warn', `IDB restore rollback: ${reason}`); } catch (_) {}
+            } catch (e) {
+                try { logActivity('error', `IDB restore rollback 자체 실패: ${e.message}`); } catch (_) {}
+            }
+        }
         // v0.7.19 (#3): 저장 실패 감지 — skipGc로 11건+ 복원시 quota 가능성 ↑. 실패 시 throw로 호출부에 알림.
         // v0.7.21 (#B3): 부분 복원/부분 손실 방지 — 가장 큰 batchRuns를 먼저 저장해
         //   quota 실패 시 sessions/overrides가 이미 덮이는 일 없이 롤백. 단,
@@ -2172,14 +2195,16 @@
                 runsOk = saveBatchRuns(restoredRuns, { skipGc: true });
                 if (!runsOk) {
                     try { logActivity('error', `IDB 복원(overwrite): batch run 저장 실패 — sessions/overrides 복원 중단 slot=${slot}`, { runs: Object.keys(restoredRuns).length }); } catch (_) {}
-                    throw new Error('batch run 저장 실패 — sessions/overrides는 복원하지 않았습니다. 오래된 run 정리 후 다시 시도하세요.');
+                    _rollbackRestore('saveBatchRuns 실패 (overwrite)');
+                    throw new Error('batch run 저장 실패 — 변경 사항은 롤백되었습니다. 오래된 run 정리 후 다시 시도하세요.');
                 }
             }
             const sOk = sc.sessions ? saveSessions(snap.sessions || {}) : true;
             const oOk = sc.overrides ? saveReviewOverrides(snap.overrides || {}) : true;
             if (!sOk || !oOk) {
                 try { logActivity('error', `IDB 복원(overwrite): sessions/overrides 저장 실패 slot=${slot}`, { sOk, oOk }); } catch (_) {}
-                throw new Error('sessions/overrides 저장 실패 — batch run은 복원되었으나 나머지 독립 복원 실패.');
+                _rollbackRestore('saveSessions/saveReviewOverrides 실패 (overwrite)');
+                throw new Error('sessions/overrides 저장 실패 — 변경 사항은 롤백되었습니다.');
             }
         } else {
             // merge: 슬롯이 가진 키만 덮어씀
@@ -2187,14 +2212,16 @@
                 runsOk = saveBatchRuns({ ...loadBatchRuns(), ...restoredRuns }, { skipGc: true });
                 if (!runsOk) {
                     try { logActivity('error', `IDB 복원(merge): batch run 저장 실패 — sessions/overrides merge 중단 slot=${slot}`, { runs: Object.keys(restoredRuns).length }); } catch (_) {}
-                    throw new Error('batch run 저장 실패 — sessions/overrides는 merge하지 않았습니다. 오래된 run 정리 후 다시 시도하세요.');
+                    _rollbackRestore('saveBatchRuns 실패 (merge)');
+                    throw new Error('batch run 저장 실패 — 변경 사항은 롤백되었습니다. 오래된 run 정리 후 다시 시도하세요.');
                 }
             }
             if (sc.sessions && snap.sessions) {
                 const ok = saveSessions({ ...loadSessions(), ...snap.sessions });
                 if (!ok) {
                     try { logActivity('error', `IDB 복원(merge): sessions 저장 실패 slot=${slot}`); } catch (_) {}
-                    throw new Error('sessions 저장 실패 — batch run은 merge되었으나 sessions 실패.');
+                    _rollbackRestore('saveSessions 실패 (merge)');
+                    throw new Error('sessions 저장 실패 — 변경 사항은 롤백되었습니다.');
                 }
             }
             if (sc.overrides && snap.overrides) {
@@ -2206,7 +2233,8 @@
                 const ok = saveReviewOverrides(merged);
                 if (!ok) {
                     try { logActivity('error', `IDB 복원(merge): overrides 저장 실패 slot=${slot}`); } catch (_) {}
-                    throw new Error('overrides 저장 실패 — batch run/sessions는 merge되었으나 overrides 실패.');
+                    _rollbackRestore('saveReviewOverrides 실패 (merge)');
+                    throw new Error('overrides 저장 실패 — 변경 사항은 롤백되었습니다.');
                 }
             }
         }
@@ -2241,15 +2269,33 @@
                 + '복원하시겠습니까? (취소하면 빈 상태로 진행)',
         });
         if (!ok) return false;
+        // v0.7.35 (#D9-P1-5): _priorSnapshot pattern.
+        //   사전 조건상 LS는 비어 있지만, 호출 사이의 race로 다른 탭/스크립트가 채웠을 수 있다.
+        //   안전하게 prior 캡처 후 어떤 단계 실패든 복원한다.
+        const _priorSnapshot = {
+            sessions: loadSessions(),
+            overrides: loadReviewOverrides(),
+            batchRuns: loadBatchRuns(),
+        };
+        function _rollbackAutoRestore(reason) {
+            try {
+                saveSessions(_priorSnapshot.sessions);
+                saveReviewOverrides(_priorSnapshot.overrides);
+                saveBatchRuns(_priorSnapshot.batchRuns, { skipGc: true });
+                try { logActivity('warn', `IDB auto-restore rollback: ${reason}`); } catch (_) {}
+            } catch (e) {
+                try { logActivity('error', `IDB auto-restore rollback 자체 실패: ${e.message}`); } catch (_) {}
+            }
+        }
         try {
             // v0.7.30 (#D4-P1-5): 자동 복원도 sessions/overrides save 반환값 점검.
             if (snap.sessions) {
                 const sOk = saveSessions(snap.sessions);
-                if (!sOk) throw new Error('sessions 저장 실패 — LS 용량 초과 가능성');
+                if (!sOk) { _rollbackAutoRestore('saveSessions 실패'); throw new Error('sessions 저장 실패 — LS 용량 초과 가능성. 변경 사항은 롤백되었습니다.'); }
             }
             if (snap.overrides) {
                 const oOk = saveReviewOverrides(snap.overrides);
-                if (!oOk) throw new Error('overrides 저장 실패 — LS 용량 초과 가능성');
+                if (!oOk) { _rollbackAutoRestore('saveReviewOverrides 실패'); throw new Error('overrides 저장 실패 — LS 용량 초과 가능성. 변경 사항은 롤백되었습니다.'); }
             }
             // v0.7.18 (#2,#3): 복원본 run에 플래그 + 전체 보존 (최근 10개 잘림 방지)
             // v0.7.19 (#3): 저장 실패 감지
@@ -2257,7 +2303,8 @@
                 const runsOk = saveBatchRuns(_markRunsAsRestored({ ...snap.runs }), { skipGc: true });
                 if (!runsOk) {
                     try { logActivity('error', `IDB auto-restore: batch run 저장 실패 (LS quota?)`, { runs: rCount }); } catch (_) {}
-                    throw new Error('batch run 저장 실패 — LS 용량 초과 가능성');
+                    _rollbackAutoRestore('saveBatchRuns 실패');
+                    throw new Error('batch run 저장 실패 — LS 용량 초과 가능성. 변경 사항은 롤백되었습니다.');
                 }
             }
             toast(`IDB 백업 복원: 세션 ${sCount} / override ${oCount} / run ${rCount}`, 'success');
@@ -8583,7 +8630,18 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     try {
                         // v0.7.30 (#D4-P1-5): triggerBackupAsync + 200ms sleep 대신 createBackupNow await —
                         //   실제로 모듄 backup이 끝난 뒤에만 복원을 진행해서 safety net이 실제로 동작하게 만든다.
-                        try { await createBackupNow('pre-restore'); } catch (be) { dwarn('pre-restore backup 실패', be); }
+                        // v0.7.35 (#D9-P1-7): pre-restore backup 실패는 조용히 삼키지 않고 사용자 confirm으로 승격.
+                        try {
+                            await createBackupNow('pre-restore');
+                        } catch (be) {
+                            dwarn('pre-restore backup 실패', be);
+                            const proceed = await twConfirm({
+                                title: 'pre-restore 백업 실패',
+                                message: `복원 직전 자동 백업을 만들지 못했습니다 (${be.message || be}).\n\nsafety net 없이 그대로 복원을 진행하면 현재 데이터는 되돌릴 수 없습니다.\n\n그래도 계속하시겠습니까?`,
+                                danger: true,
+                            });
+                            if (!proceed) { toast('복원 취소됨 (pre-restore 백업 실패)', 'warn'); return; }
+                        }
                         const r = await restoreFromBackupSlot(slot, 'overwrite');
                         logActivity('restore', `IDB 슬롯 복원`, { slot, sessions: r.sessions, runs: r.runs, overrides: r.overrides });
                         toast(`복원 완료: 세션 ${r.sessions} / run ${r.runs} / override ${r.overrides}`, 'success');
@@ -8612,7 +8670,18 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                     if (!scope) return;
                     try {
                         // v0.7.30 (#D4-P1-5): 부분 복원도 동일하게 사전 백업 await.
-                        try { await createBackupNow('pre-restore'); } catch (be) { dwarn('pre-restore backup 실패', be); }
+                        // v0.7.35 (#D9-P1-7): 부분 복원도 pre-restore backup 실패를 사용자 confirm으로 승격.
+                        try {
+                            await createBackupNow('pre-restore');
+                        } catch (be) {
+                            dwarn('pre-restore backup 실패', be);
+                            const proceed = await twConfirm({
+                                title: 'pre-restore 백업 실패',
+                                message: `부분 복원 직전 자동 백업을 만들지 못했습니다 (${be.message || be}).\n\nsafety net 없이 계속하시겠습니다?`,
+                                danger: true,
+                            });
+                            if (!proceed) { toast('부분 복원 취소됨 (pre-restore 백업 실패)', 'warn'); return; }
+                        }
                         const r = await restoreFromBackupSlot(slot, 'overwrite', scope);
                         const picked = [scope.sessions && '세션', scope.runs && 'run', scope.overrides && 'override'].filter(Boolean).join(' / ');
                         logActivity('restore', `IDB 슬롯 부분 복원`, { slot, picked, sessions: r.sessions, runs: r.runs, overrides: r.overrides });
