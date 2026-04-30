@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.36
+// @version      0.7.37
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.36)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.37)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,7 +48,7 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.36';
+    const SCRIPT_VERSION = '0.7.37';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
@@ -2008,6 +2008,12 @@
                 _rollbackImport('saveBatchRuns 실패');
                 throw new Error('batch run 저장 실패 — LS 용량 초과 가능성. 워크스페이스 탭에서 워래된 run 정리 후 다시 시도하세요. 변경 사항은 롤백되었습니다.');
             }
+            // v0.7.37 (#D11-P3): overwrite import는 기존 runs 집합을 통째로 교체하므로
+            //   사라진 runId를 가리키던 applied-from-batch 기록을 같이 정리.
+            //   merge import는 기존 runs를 보존하므로 orphan이 생기지 않는다.
+            if (!mergeBatchRuns) {
+                try { pruneAppliedFromBatchOrphans(incoming); } catch (e) { dwarn('import: applied orphan 정리 실패', e); }
+            }
             batchRunsCount = Object.keys(data.batchRuns).length;
         }
 
@@ -2236,6 +2242,9 @@
                     _rollbackRestore('saveBatchRuns 실패 (overwrite)');
                     throw new Error('batch run 저장 실패 — 변경 사항은 롤백되었습니다. 오래된 run 정리 후 다시 시도하세요.');
                 }
+                // v0.7.37 (#D11-P3): overwrite는 기존 runs 집합을 통째로 교체하므로
+                //   사라진 runId를 가리키던 applied-from-batch 기록을 같이 정리.
+                try { pruneAppliedFromBatchOrphans(restoredRuns); } catch (e) { dwarn('IDB 복원(overwrite): applied orphan 정리 실패', e); }
             }
             const sOk = sc.sessions ? saveSessions(snap.sessions || {}) : true;
             const oOk = sc.overrides ? saveReviewOverrides(snap.overrides || {}) : true;
@@ -2344,6 +2353,9 @@
                     _rollbackAutoRestore('saveBatchRuns 실패');
                     throw new Error('batch run 저장 실패 — LS 용량 초과 가능성. 변경 사항은 롤백되었습니다.');
                 }
+                // v0.7.37 (#D11-P3): auto-restore도 overwrite와 동일하게 orphan applied 정리.
+                //   사전 LS empty 가드는 sessions/overrides/runs만 보고 applied-from-batch는 안 본다.
+                try { pruneAppliedFromBatchOrphans(snap.runs); } catch (e) { dwarn('IDB auto-restore: applied orphan 정리 실패', e); }
             }
             toast(`IDB 백업 복원: 세션 ${sCount} / override ${oCount} / run ${rCount}`, 'success');
             return true;
@@ -2609,6 +2621,27 @@
         let removed = 0;
         for (const key of Object.keys(map)) {
             if (map[key] && map[key].runId === runId) {
+                delete map[key];
+                removed += 1;
+            }
+        }
+        if (removed > 0) saveAppliedFromBatch(map);
+        return removed;
+    }
+    // v0.7.37 (#D11-P3): restore/import overwrite 후 orphan applied 기록 정리.
+    //   skipGc:true 경로(restoreFromBackupSlot, importSessionsJson, maybeRestoreFromBackup)는
+    //   saveBatchRuns 내부 GC가 돌지 않아 이전 runId를 참조하던 applied-from-batch 항목이
+    //   orphan으로 남는다. 새 runs 키 집합만 살리고 나머지는 정리한다.
+    function pruneAppliedFromBatchOrphans(allowedRunIds) {
+        const allowed = (allowedRunIds instanceof Set)
+            ? allowedRunIds
+            : new Set(Array.isArray(allowedRunIds) ? allowedRunIds : Object.keys(allowedRunIds || {}));
+        const map = loadAppliedFromBatch();
+        let removed = 0;
+        for (const key of Object.keys(map)) {
+            const rid = map[key]?.runId;
+            // runId가 비어있는 legacy 항목은 그대로 둔다 (어떤 run 소속인지 알 수 없음).
+            if (rid && !allowed.has(rid)) {
                 delete map[key];
                 removed += 1;
             }
@@ -5445,6 +5478,15 @@
         }
     }
 
+    // v0.7.37 (#D11-P2): 정상 종료(탭 닫기/새로고침/네비게이션) 시 lease를 즉시 해제.
+    //   안 그러면 BATCH_LEASE_TTL_MS(15s) 동안 다른 탭이 "이미 batch 작업 중 (다른 탭)" 으로
+    //   차단된다. unload 직전 finally가 안 도는 케이스(예: phase 실행 중 탭 닫기)도 같이 보호.
+    try {
+        window.addEventListener('beforeunload', () => {
+            try { _clearBatchLease(_tabId); } catch (_) {}
+        });
+    } catch (_) {}
+
     // 검증 객체에서 실패 사유를 짧은 토큰 배열로 추출. 간단 표시용.
     function summarizeValidationIssues(validation) {
         if (!validation) return [];
@@ -7189,6 +7231,12 @@
             appendBatchLog(`备注 있는 세그먼트 ${Object.keys(notesByStringId).length}개 수집`);
 
             const storageSnapshot = await fetchSavedResultSnapshot(storageStringId);
+            // v0.7.37 (#D11-P1): 수집 단계에서도 fail-closed로 baseline 오염 차단.
+            //   fetchOk=false면 raw=''이 되어 initialStorageRaw가 빈 문자열로 고정 →
+            //   이후 phase 실행에서 stale/false-positive 판단의 원인이 된다.
+            if (!storageSnapshot.fetchOk) {
+                throw new Error('storage cell snapshot 조회 실패 — segment id 불일치 또는 서버 오류. 페이지 새로고침 후 재시도하세요.');
+            }
             const tbSummary = buildBatchTbSummary(segments);
             Object.assign(batchRun, {
                 status: 'ready',
@@ -7450,7 +7498,13 @@
 
         try {
             appendBatchLog(`storageStringId ${run.storageStringId} 결과 다시 읽기 시작`);
-            const { raw } = await fetchSavedResultSnapshot(run.storageStringId);
+            // v0.7.37 (#D11-P1): refetch도 D7과 동일하게 fail-closed.
+            //   segment id 불일치/서버 오류로 seg=null이면 raw=''이되어
+            //   stale 검사를 우회하고 staleCandidates 끌새 자리를 잡을 수 있다.
+            const { raw, fetchOk } = await fetchSavedResultSnapshot(run.storageStringId);
+            if (!fetchOk) {
+                throw makeWorkflowError('storage cell snapshot 조회 실패 — segment id 불일치 또는 서버 오류. 페이지 새로고침 후 재시도하세요.', 'SNAPSHOT_FAIL');
+            }
             const savedIssue = classifySavedResult(raw);
             if (savedIssue) {
                 throw makeWorkflowError(savedIssue.message, savedIssue.type);
@@ -9261,7 +9315,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
     }
 
     console.log('%c[TMS Workflow v' + SCRIPT_VERSION + '] 로드됨. Alt+Z로 모달 오픈 · 워크스페이스 탭에 📜 Activity / 🚨 위험 영역 카드 포함', 'background:#4ade80;color:#000;padding:2px 6px;border-radius:3px;font-weight:600');
-    console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / window.tmsLog("verbose") · window.tmsActivity는 localStorage.tms_workflow_debug_surface=on 시 노출lStorage.tms_workflow_debug_surface=on 시 노출', 'color:#888');
+    console.log('%c[TMS Workflow] 진단: window.tmsWorkflow.open() / window.tmsLog("verbose") · window.tmsActivity는 localStorage.tms_workflow_debug_surface=on 시 노출', 'color:#888');
     // v0.7.12: 활성 인스턴스가 정확히 어떤 버전인지 확인할 수 있도록 window 노출
     try { window.tmsWorkflow = window.tmsWorkflow || {}; window.tmsWorkflow.version = SCRIPT_VERSION; } catch (_) {}
 })();
