@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TMS CAT Tool - 대화형 번역 워크플로우
 // @namespace    https://github.com/huymorady/TMS_Script
-// @version      0.7.47
+// @version      0.7.48
 // @description  Alt+Z로 대화형 AI 번역 워크플로우 모달 오픈 (TMS의 prefix_prompt_tran API 활용)
 // @match        https://tms.skyunion.net/*
 // @updateURL    https://raw.githubusercontent.com/huymorady/TMS_Script/main/cat-tool-chat.user.js
@@ -14,7 +14,7 @@
     'use strict';
 
     // ========================================================================
-    // 📑 모듈 ToC (v0.7.47)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
+    // 📑 모듈 ToC (v0.7.48)  —  대략적 라인 범위 (편집 후 ±10줄 오차 가능)
     // ------------------------------------------------------------------------
     //   §1  상수 & 설정 (LS_KEYS, SCHEMA, BACKUP, ...)        ............  ~48
     //   §2  유틸리티 (lsGet/Set, escapeHtml, twConfirm, ...)  ............ ~151
@@ -48,14 +48,11 @@
     // §1  상수 & 설정
     // ========================================================================
     // @version 헤더와 동기화. 콘솔 banner / 진단 출력의 단일 소스.
-    const SCRIPT_VERSION = '0.7.47';
+    const SCRIPT_VERSION = '0.7.48';
 
     const LS_KEYS = {
         SYSTEM_PROMPTS: 'tms_workflow_system_prompts_v1',
-        ACTIVE_PROMPT_ID: 'tms_workflow_active_prompt_v1', // legacy: v0.4.0 마이그레이션 폴백용. 신규 코드는 CHAT/BATCH ID를 사용.
-        CHAT_ACTIVE_PROMPT_ID: 'tms_workflow_chat_active_prompt_v1',
-        BATCH_ACTIVE_PROMPT_ID: 'tms_workflow_batch_active_prompt_v1',
-        PROMPT_LOCK_LINKED: 'tms_workflow_prompt_lock_v1',
+        ACTIVE_PROMPT_ID: 'tms_workflow_active_prompt_v1', // 시스템 프롬프트 활성 ID (채팅 탭에서만 사용; 워크플로우는 Phase 슬롯 사용).
         SESSIONS: 'tms_workflow_sessions_v1',
         MODEL: 'tms_workflow_model_v1',
         MODAL_POS: 'tms_workflow_modal_pos_v1',
@@ -1808,10 +1805,11 @@
         ];
         if (includePrompts) {
             targetKeys.push(LS_KEYS.SYSTEM_PROMPTS);
-            targetKeys.push(LS_KEYS.CHAT_ACTIVE_PROMPT_ID);
-            targetKeys.push(LS_KEYS.BATCH_ACTIVE_PROMPT_ID);
-            targetKeys.push(LS_KEYS.PROMPT_LOCK_LINKED);
             targetKeys.push(LS_KEYS.ACTIVE_PROMPT_ID);
+            // v0.7.48 cleanup: 제거된 legacy LS 키도 잘주 광쭐 정리 대상에 포함.
+            targetKeys.push('tms_workflow_chat_active_prompt_v1');
+            targetKeys.push('tms_workflow_batch_active_prompt_v1');
+            targetKeys.push('tms_workflow_prompt_lock_v1');
         }
         for (const k of targetKeys) {
             try {
@@ -2744,50 +2742,19 @@
         return lines.slice(startIdx, endIdx).join('\n').trim();
     }
 
-    // ----- 활성 프롬프트 ID: 채팅/배치 분리 (v0.4.0+) -----
-    // 기존 단일 ACTIVE_PROMPT_ID에서 마이그레이션. 한 번만 실행하면 충분.
-    function migrateActivePromptIdsIfNeeded() {
-        const chatId = lsGet(LS_KEYS.CHAT_ACTIVE_PROMPT_ID, null);
-        const batchId = lsGet(LS_KEYS.BATCH_ACTIVE_PROMPT_ID, null);
-        if (chatId !== null && batchId !== null) return; // 이미 마이그레이션 완료
-
-        const legacyId = lsGet(LS_KEYS.ACTIVE_PROMPT_ID, 'default');
-        if (chatId === null) lsSet(LS_KEYS.CHAT_ACTIVE_PROMPT_ID, legacyId);
-        if (batchId === null) lsSet(LS_KEYS.BATCH_ACTIVE_PROMPT_ID, legacyId);
+    // ----- 활성 프롬프트 ID (v0.7.48: 채팅 단일 ID로 일원화) -----
+    // workflow(Phase 실행) 경로는 더 이상 이 프롬프트를 읽지 않는다 (Phase 슬롯 + Frame 사용).
+    // 활성 프롬프트는 채팅 탭에서만 쓰인다.
+    function getActivePromptId() {
+        return lsGet(LS_KEYS.ACTIVE_PROMPT_ID, 'default');
     }
-    migrateActivePromptIdsIfNeeded();
-
-    function getChatActivePromptId() {
-        return lsGet(LS_KEYS.CHAT_ACTIVE_PROMPT_ID, null)
-            || lsGet(LS_KEYS.ACTIVE_PROMPT_ID, 'default');
+    function setActivePromptId(id) {
+        lsSet(LS_KEYS.ACTIVE_PROMPT_ID, id);
     }
-    function setChatActivePromptId(id) {
-        lsSet(LS_KEYS.CHAT_ACTIVE_PROMPT_ID, id);
-    }
-    function getBatchActivePromptId() {
-        return lsGet(LS_KEYS.BATCH_ACTIVE_PROMPT_ID, null)
-            || lsGet(LS_KEYS.ACTIVE_PROMPT_ID, 'default');
-    }
-    function setBatchActivePromptId(id) {
-        lsSet(LS_KEYS.BATCH_ACTIVE_PROMPT_ID, id);
-    }
-    function getChatActivePrompt() {
+    function getActivePrompt() {
         const prompts = loadPrompts();
-        const id = getChatActivePromptId();
+        const id = getActivePromptId();
         return prompts.find(p => p.id === id) || prompts[0];
-    }
-    function getBatchActivePrompt() {
-        const prompts = loadPrompts();
-        const id = getBatchActivePromptId();
-        return prompts.find(p => p.id === id) || prompts[0];
-    }
-
-    // 잠금: ON이면 채팅/배치 활성 ID가 같이 움직임 (실시간 동기화)
-    function getPromptLockLinked() {
-        return !!lsGet(LS_KEYS.PROMPT_LOCK_LINKED, false);
-    }
-    function setPromptLockLinked(linked) {
-        lsSet(LS_KEYS.PROMPT_LOCK_LINKED, !!linked);
     }
 
     function getSelectedModel() {
@@ -4135,10 +4102,6 @@
         <div class="tw-batch-input-wrap">
             <div class="tw-input-controls">
                 <label class="tw-ctrl">
-                    배치 프롬프트:
-                    <select class="tw-prompt-select tw-batch-prompt-select"></select>
-                </label>
-                <label class="tw-ctrl">
                     배치 모델:
                     <select class="tw-model-select tw-batch-model-select"></select>
                 </label>
@@ -4892,43 +4855,7 @@
 .tw-settings-tab.active { background: #2a2a2a; color: #4ade80; border-color: #4ade80; }
 .tw-settings-content { flex: 1; display: flex; gap: 12px; overflow: hidden; }
 .tw-settings-tab-prompts { flex-direction: column; }
-.tw-settings-prompt-toolbar {
-    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    padding: 8px 10px; background: #252525; border-radius: 6px;
-    flex-shrink: 0;
-}
-.tw-prompt-lock-label {
-    display: flex; align-items: center; gap: 6px;
-    font-size: 12px; color: #e0e0e0; cursor: pointer;
-    user-select: none;
-}
-.tw-prompt-lock-label input[type="checkbox"] { accent-color: #4ade80; cursor: pointer; }
-.tw-prompt-lock-hint { color: #888; font-size: 11px; }
-.tw-settings-prompt-body { flex: 1; display: flex; gap: 12px; overflow: hidden; min-height: 0; }
-.tw-settings-list { width: 200px; background: #252525; border-radius: 6px; padding: 8px;
-    overflow-y: auto; }
-.tw-settings-list-item {
-    padding: 6px 10px; cursor: pointer; border-radius: 4px; margin-bottom: 2px;
-    font-size: 12px; color: #ccc;
-    display: flex; align-items: center; gap: 6px;
-}
-.tw-settings-list-item:hover { background: #2a2a2a; }
-.tw-settings-list-item.active { background: #4ade80; color: #000; font-weight: 500; }
-.tw-prompt-list-name {
-    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.tw-prompt-badges {
-    display: inline-flex; gap: 2px; flex-shrink: 0; font-size: 11px;
-}
-.tw-prompt-badge {
-    display: inline-block; line-height: 1;
-}
-.tw-settings-editor { flex: 1; display: flex; flex-direction: column; gap: 8px; }
-.tw-prompt-header-row { display: flex; gap: 8px; align-items: center; }
-.tw-prompt-name {
-    flex: 1; background: #1a1a1a; color: #e0e0e0; border: 1px solid #3a3a3a;
-    padding: 6px 10px; border-radius: 4px; font-size: 13px;
-}
+.tw-settings-prompt-
 .tw-prompt-content {
     flex: 1; background: #1a1a1a; color: #e0e0e0; border: 1px solid #3a3a3a;
     padding: 10px; border-radius: 4px; font-size: 12px; font-family: monospace;
@@ -5422,41 +5349,19 @@
     function renderAllPromptSelects(root = modalEl) {
         if (!root) return;
         $$('.tw-chat-prompt-select', root).forEach(selectEl => renderChatPromptSelect(selectEl));
-        $$('.tw-batch-prompt-select', root).forEach(selectEl => renderBatchPromptSelect(selectEl));
     }
 
     function renderAllModelSelects(root = modalEl) {
         $$('.tw-model-select', root).forEach(selectEl => renderModelSelect(selectEl));
     }
 
-    // 채팅 드롭다운 변경 → 채팅 활성 ID 저장. 잠금 ON이면 배치도 같이.
+    // v0.7.48: 채팅 드롭다운 변경 → 활성 ID 저장. 배치 동기화는 제거됨.
     function syncChatPromptSelects(promptId) {
-        setChatActivePromptId(promptId);
+        setActivePromptId(promptId);
         if (!modalEl) return;
         $$('.tw-chat-prompt-select', modalEl).forEach(selectEl => {
             selectEl.value = promptId;
         });
-        if (getPromptLockLinked()) {
-            setBatchActivePromptId(promptId);
-            $$('.tw-batch-prompt-select', modalEl).forEach(selectEl => {
-                selectEl.value = promptId;
-            });
-        }
-    }
-
-    // 배치 드롭다운 변경 → 배치 활성 ID 저장. 잠금 ON이면 채팅도 같이.
-    function syncBatchPromptSelects(promptId) {
-        setBatchActivePromptId(promptId);
-        if (!modalEl) return;
-        $$('.tw-batch-prompt-select', modalEl).forEach(selectEl => {
-            selectEl.value = promptId;
-        });
-        if (getPromptLockLinked()) {
-            setChatActivePromptId(promptId);
-            $$('.tw-chat-prompt-select', modalEl).forEach(selectEl => {
-                selectEl.value = promptId;
-            });
-        }
     }
 
     function syncModelSelects(model) {
@@ -5478,21 +5383,11 @@
     function renderChatPromptSelect(selectEl) {
         if (!selectEl) return;
         const prompts = loadPrompts();
-        const activeId = getChatActivePromptId();
+        const activeId = getActivePromptId();
         selectEl.innerHTML = prompts.map(p =>
             `<option value="${escapeHtml(String(p.id))}" ${p.id === activeId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
         ).join('');
         selectEl.onchange = () => syncChatPromptSelects(selectEl.value);
-    }
-
-    function renderBatchPromptSelect(selectEl) {
-        if (!selectEl) return;
-        const prompts = loadPrompts();
-        const activeId = getBatchActivePromptId();
-        selectEl.innerHTML = prompts.map(p =>
-            `<option value="${escapeHtml(String(p.id))}" ${p.id === activeId ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
-        ).join('');
-        selectEl.onchange = () => syncBatchPromptSelects(selectEl.value);
     }
 
     // ========================================================================
@@ -6210,19 +6105,13 @@
         renderReviewTable();
     }
 
-    // 사용 모델/프롬프트 미니 표시
+    // 사용 모델 미니 표시 (v0.7.48: 배치 활성 프롬프트 표시 제거 — Phase 슬롯 사용)
     function renderBatchConfigRow(run) {
         const el = $('.tw-batch-config-row', modalEl);
         if (!el) return;
         const model = (run && run.model) || (typeof getSelectedModel === 'function' ? getSelectedModel() : '');
-        let promptName = '';
-        try {
-            const p = getBatchActivePrompt();
-            promptName = p?.name || p?.id || '';
-        } catch (_) { /* noop */ }
         const items = [];
         if (model) items.push({ k: '모델', v: String(model) });
-        if (promptName) items.push({ k: '프롬프트', v: String(promptName) });
         if (run) {
             items.push({ k: '파일', v: `proj ${run.projectId || '?'} / file ${run.fileId || '?'} / lang ${run.languageId || '?'}` });
             if (run.page || run.pageSize) items.push({ k: '페이지', v: `${run.page || '?'} / ${run.pageSize || '?'}` });
@@ -8490,7 +8379,7 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
         try {
             // 프롬프트 조립
-            const activePrompt = getChatActivePrompt();
+            const activePrompt = getActivePrompt();
             const systemPrompt = activePrompt?.content || '';
             const segmentCtx = buildSegmentContext(requestSegment);
 
@@ -8774,25 +8663,11 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         <button class="tw-btn tw-btn-ghost tw-btn-settings-close">닫기</button>
     </div>
     <div class="tw-settings-content tw-settings-tab-prompts">
-        <div class="tw-settings-prompt-toolbar">
-            <label class="tw-prompt-lock-label">
-                <input type="checkbox" class="tw-prompt-lock-toggle">
-                <span>채팅 · 배치 프롬프트 동기화 (잠금)</span>
-            </label>
-            <span class="tw-prompt-lock-hint">체크 시 한쪽 변경이 양쪽에 반영됩니다.</span>
-        </div>
         <div class="tw-settings-prompt-body">
             <div class="tw-settings-list"></div>
             <div class="tw-settings-editor">
                 <div class="tw-prompt-header-row">
-                    <input type="text" class="tw-prompt-name" placeholder="프롬프트 이름">
-                    <button class="tw-btn tw-btn-ghost tw-btn-settings-new">+ 새 프롬프트</button>
-                </div>
-                <textarea class="tw-prompt-content" placeholder="시스템 프롬프트 내용을 입력하세요 (예: v3.0 프롬프트)"></textarea>
-                <div class="tw-settings-buttons">
-                    <button class="tw-btn tw-btn-ghost tw-btn-settings-delete">🗑️ 삭제</button>
-                    <button class="tw-btn tw-btn-primary tw-btn-settings-save" style="margin-left:auto">💾 저장</button>
-                </div>
+                    <input type="text" 
             </div>
         </div>
     </div>
@@ -9320,27 +9195,10 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
         }
 
         // ==== 시스템 프롬프트 탭 ====
-        // 잠금 토글: 채팅·배치 활성 프롬프트 동기화
-        const lockToggle = $('.tw-prompt-lock-toggle', overlay);
-        if (lockToggle) {
-            lockToggle.checked = getPromptLockLinked();
-            lockToggle.addEventListener('change', () => {
-                const linked = lockToggle.checked;
-                setPromptLockLinked(linked);
-                if (linked) {
-                    // 활성화 시점: 채팅 ID를 기준으로 양쪽 통일 (드롭다운 즉시 반영)
-                    const chatId = getChatActivePromptId();
-                    syncChatPromptSelects(chatId);
-                    toast('채팅·배치 프롬프트가 동기화되었습니다.', 'success');
-                } else {
-                    toast('동기화가 해제되었습니다. 양쪽 프롬프트를 따로 선택할 수 있습니다.', 'info');
-                }
-                refresh(); // 뱃지 다시 그리기
-            });
-        }
+        // v0.7.48: 채팅·배치 동기화 잠금 토글 제거 (배치 경로는 Phase 슬롯 사용).
 
-        // 편집 진입 시 기본으로 보여줄 프롬프트: 채팅 활성 프롬프트 기준
-        let currentEditingId = getChatActivePromptId();
+        // 편집 진입 시 기본으로 보여줄 프롬프트: 활성 프롬프트 기준
+        let currentEditingId = getActivePromptId();
 
         const listEl = $('.tw-settings-list', overlay);
         const nameInput = $('.tw-prompt-name', overlay);
@@ -9348,13 +9206,11 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
         function refresh() {
             const prompts = loadPrompts();
-            const chatActiveId = getChatActivePromptId();
-            const batchActiveId = getBatchActivePromptId();
+            const activeId = getActivePromptId();
             listEl.innerHTML = prompts.map(p => {
-                const badges = [];
-                if (p.id === chatActiveId) badges.push('<span class="tw-prompt-badge tw-prompt-badge-chat" title="채팅 탭에서 활성">💬</span>');
-                if (p.id === batchActiveId) badges.push('<span class="tw-prompt-badge tw-prompt-badge-batch" title="배치 탭에서 활성">📦</span>');
-                const badgeHtml = badges.length ? `<span class="tw-prompt-badges">${badges.join('')}</span>` : '';
+                const badgeHtml = p.id === activeId
+                    ? '<span class="tw-prompt-badges"><span class="tw-prompt-badge tw-prompt-badge-chat" title="채팅 탭에서 활성">💬</span></span>'
+                    : '';
                 return `<div class="tw-settings-list-item ${p.id === currentEditingId ? 'active' : ''}"
                               data-id="${escapeHtml(String(p.id))}">
                           <span class="tw-prompt-list-name">${escapeHtml(p.name)}</span>
@@ -9414,15 +9270,13 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
                 return;
             }
 
-            // 삭제 대상이 채팅·배치에서 활성인지 점검
-            const activeIn = [];
-            if (getChatActivePromptId() === currentEditingId) activeIn.push('채팅');
-            if (getBatchActivePromptId() === currentEditingId) activeIn.push('배치');
+            // v0.7.48: 활성 프롬프트는 단일이므로 채팅 활성 여부만 점검
+            const isActive = getActivePromptId() === currentEditingId;
 
             const targetName = nameInput.value || '(이름 없음)';
             let confirmMsg = `'${targetName}' 프롬프트를 삭제하시겠습니까?`;
-            if (activeIn.length) {
-                confirmMsg = `⚠️ '${targetName}' 프롬프트는 현재 ${activeIn.join('과 ')} 탭에서 활성입니다.\n` +
+            if (isActive) {
+                confirmMsg = `⚠️ '${targetName}' 프롬프트는 현재 채팅 탭에서 활성입니다.\n` +
                     `삭제하면 첫 번째 프롬프트로 자동 전환됩니다.\n\n` +
                     `계속 삭제하시겠습니까?`;
             }
@@ -9436,18 +9290,15 @@ ${label ? `<div class="tw-msg-role">${label}</div>` : ''}
 
             const filtered = prompts.filter(x => x.id !== currentEditingId);
             savePrompts(filtered);
-            // 채팅·배치 활성 ID가 삭제 대상이면 각각 첫 번째 프롬프트로 폴백
-            if (getChatActivePromptId() === currentEditingId) {
-                setChatActivePromptId(filtered[0].id);
-            }
-            if (getBatchActivePromptId() === currentEditingId) {
-                setBatchActivePromptId(filtered[0].id);
+            // 활성 ID가 삭제 대상이면 첫 번째 프롬프트로 폴백
+            if (getActivePromptId() === currentEditingId) {
+                setActivePromptId(filtered[0].id);
             }
             currentEditingId = filtered[0].id;
             refresh();
             // 폴백된 활성 ID가 메인 모달의 드롭다운에도 반영되도록
             renderAllPromptSelects(modalEl);
-            toast(activeIn.length ? '삭제됨. 활성 프롬프트가 변경되었습니다.' : '삭제됨', 'success');
+            toast(isActive ? '삭제됨. 활성 프롬프트가 변경되었습니다.' : '삭제됨', 'success');
         });
 
         // ==== 세션 관리 탭 ====
